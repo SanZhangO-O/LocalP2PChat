@@ -1,0 +1,15 @@
+PyQt6>=6.6
+opencv-python>=4.8
+numpy>=1.24
+# 端到端加密：所有网络传输（群组、直聊、mesh、文件、通话媒体）通过
+# P-256 ECDH 握手 + AES-256-GCM 加密（与安卓版互通）。依赖 cryptography
+# 提供 AES-GCM / ECDH / ECDSA（pbkdf2/hkdf/hmac 用标准库实现）。
+cryptography>=42.0
+# 摄像头采集兜底：当 OpenCV 的 Windows 相机后端无法枚举设备时（例如存在
+# VTubeStudioCam 等虚拟摄像头驱动，或使用 Microsoft Store 版 Python），
+# 程序会改用 ffmpeg DirectShow 采集。安装本包可自带现代 ffmpeg 二进制；
+# 未安装时自动使用系统 PATH 上的 ffmpeg（无 ffmpeg 则退回合成测试画面）。
+imageio-ffmpeg>=0.4.9
+# 音频采集/播放：优先使用 sounddevice（PortAudio），QtMultimedia 作为未安装
+# sounddevice 时的兜底（部分机器 QtMultimedia 无可用后端，播放会"假成功"）。
+sounddevice>=0.4.6

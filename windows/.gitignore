@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+data/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# one-off adb debugging scripts and UI dumps
+tests/_probe*.py
+tests/_drive_join*.py
+tests/adb_*.py
+tests/_raw_*.py
+tests/_*.xml
+docs/_*.xml
+ui_dump.xml
+
+# camera-capture screenshots (privacy: they show the local room/face)
+docs/*.png
+docs/*.jpg
+
