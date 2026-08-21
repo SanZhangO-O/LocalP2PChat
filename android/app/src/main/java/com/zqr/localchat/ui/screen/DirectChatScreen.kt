@@ -92,7 +92,12 @@ fun DirectChatScreen(
             )
         }
     ) { padding ->
-        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .consumeWindowInsets(padding)
+        ) {
             if (!connected) {
                 // clear disconnected-state feedback, mirroring the group chat
                 // banner: sending still works — messages queue as pending and

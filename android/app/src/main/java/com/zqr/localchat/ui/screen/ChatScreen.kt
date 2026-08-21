@@ -132,7 +132,7 @@ fun ChatScreen(
                 tonalElevation = 3.dp,
                 shadowElevation = 8.dp
             ) {
-                Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding()) {
+                Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding()) {
                     if (connectionLost) {
                         Text(
                             text = "与群组的连接已断开，消息无法发送",
@@ -146,8 +146,7 @@ fun ChatScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp)
-                            .imePadding(),
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.Bottom
                     ) {
                     IconButton(
