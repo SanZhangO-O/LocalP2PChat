@@ -180,6 +180,7 @@ object CallManager {
 
     /** Single writer for the media socket: audio first, video in the gaps. */
     private var senderThread: Thread? = null
+    private var watchdogThread: Thread? = null
     @Volatile
     private var running = false
 
@@ -685,31 +686,40 @@ object CallManager {
     }
 
     private fun startEngines() {
-        val ctx = ChatApp.instance
-        if (videoEngine == null) {
-            videoEngine = VideoEngine(
-                ctx,
-                lifecycleOwner,
-                ::onLocalJpeg,
-                ::onLocalPreview,
-                onUnavailable = {
-                    _events.tryEmit("摄像头不可用，对方将看到黑屏（通话仍可进行）")
-                },
-                usingFront = { _usingFrontCamera.value },
-                onSwitchFailed = {
-                    // the requested camera could not be bound; fall back to back
-                    _usingFrontCamera.value = false
-                    _events.tryEmit("无法切换摄像头")
-                }
-            )
-            videoEngine?.start()
+        // Atomic with reset/stopEngines: the engines hold the mic and camera.
+        // An engine created for a call that already ended — or a second engine
+        // created concurrently by the accept loop and the call_answer signal
+        // racing past the old unlocked null-check — would never be stopped,
+        // so its AudioRecord keeps the mic in use and the status-bar mic
+        // indicator never clears.
+        synchronized(lock) {
+            if (!running || _state.value !is CallState.Active) return
+            val ctx = ChatApp.instance
+            if (videoEngine == null) {
+                videoEngine = VideoEngine(
+                    ctx,
+                    lifecycleOwner,
+                    ::onLocalJpeg,
+                    ::onLocalPreview,
+                    onUnavailable = {
+                        _events.tryEmit("摄像头不可用，对方将看到黑屏（通话仍可进行）")
+                    },
+                    usingFront = { _usingFrontCamera.value },
+                    onSwitchFailed = {
+                        // the requested camera could not be bound; fall back to back
+                        _usingFrontCamera.value = false
+                        _events.tryEmit("无法切换摄像头")
+                    }
+                )
+                videoEngine?.start()
+            }
+            if (audioEngine == null) {
+                audioEngine = AudioEngine(ctx, ::onLocalAudio)
+                audioEngine?.start()
+            }
+            startSender()
+            startVideoWatchdog()
         }
-        if (audioEngine == null) {
-            audioEngine = AudioEngine(ctx, ::onLocalAudio)
-            audioEngine?.start()
-        }
-        startSender()
-        startVideoWatchdog()
     }
 
     /**
@@ -751,7 +761,8 @@ object CallManager {
      * never drops with "no signal".
      */
     private fun startVideoWatchdog() {
-        Thread {
+        if (watchdogThread?.isAlive == true) return
+        watchdogThread = Thread {
             try {
                 while (running) {
                     Thread.sleep(2000)
@@ -779,11 +790,19 @@ object CallManager {
     }
 
     private fun stopEngines() {
-        videoEngine?.stop()
-        videoEngine = null
-        audioEngine?.stop()
-        audioEngine = null
-        stopSender()
+        val video: VideoEngine?
+        val audio: AudioEngine?
+        synchronized(lock) {
+            video = videoEngine
+            audio = audioEngine
+            videoEngine = null
+            audioEngine = null
+            stopSender()
+        }
+        // Stop outside the lock: AudioEngine.stop() joins its capture and
+        // playback threads and must not block call signaling.
+        video?.stop()
+        audio?.stop()
     }
 
     // ------------------------------------------------------------- media I/O
@@ -808,7 +827,9 @@ object CallManager {
      *  audio queue times out — audio is produced every 20ms for the whole
      *  call (silence frames included), so a blocking poll would starve video
      *  entirely and the peer would never receive frames. The video source is
-     *  throttled to ~10fps, so at most one frame is pending per ~100ms. */
+     *  throttled to ~10fps, so at most one frame is pending per ~100ms.
+     *
+     *  Must be called with [lock] held so the isAlive guard is atomic. */
     private fun startSender() {
         if (senderThread?.isAlive == true) return
         senderThread = Thread {
@@ -1321,7 +1342,13 @@ object CallManager {
                             if (!waitForPreroll()) break
                             primed = true
                         }
-                        var chunk = playQueue.poll()
+                        // Timed poll (not a blocking take) so stop() can join
+                        // this thread without relying on interruption.
+                        var chunk = try {
+                            playQueue.poll(50, TimeUnit.MILLISECONDS)
+                        } catch (e: InterruptedException) {
+                            break
+                        }
                         if (chunk == null) {
                             // underrun: insert a short silence so the track does
                             // not stall, then re-prime so we do not drift far
@@ -1367,19 +1394,29 @@ object CallManager {
         fun stop() {
             stopped = true
             playQueue.clear()
+            // recorder.stop() unblocks a capture thread parked inside read().
+            // The recorder must be released ONLY after that thread has left
+            // read(): releasing an AudioRecord during a pending read is
+            // undefined and can leave the microphone noted as in use — the
+            // system mic indicator then never disappears after the call.
             runCatching { recorder?.stop() }
+            runCatching { track?.stop() }
+            joinQuietly(captureThread)
+            joinQuietly(playThread)
             runCatching { recorder?.release() }
             recorder = null
-            runCatching { track?.stop() }
             runCatching { track?.release() }
             track = null
-            captureThread?.interrupt()
-            playThread?.interrupt()
             runCatching {
                 val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 am.abandonAudioFocus(null)
                 am.mode = AudioManager.MODE_NORMAL
             }
+        }
+
+        private fun joinQuietly(thread: Thread?) {
+            if (thread == null) return
+            runCatching { thread.join(1500) }
         }
     }
 }
