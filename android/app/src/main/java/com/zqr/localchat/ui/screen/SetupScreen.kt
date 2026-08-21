@@ -30,20 +30,59 @@ internal const val DEFAULT_GROUP_PORT = Constants.TCP_PORT
 internal data class ParsedHostPort(val host: String, val port: Int)
 
 /**
+ * Normalizes the full-width punctuation and digits a Chinese IME produces
+ * (：．。０-９) to their ASCII equivalents. Without this, an address typed with
+ * the IME in Chinese/full-width punctuation mode is saved verbatim and can
+ * never connect (Windows parity: ChatViewModel._parse_host_port).
+ */
+internal fun normalizeAddressInput(input: String): String {
+    val sb = StringBuilder(input.length)
+    for (ch in input) {
+        sb.append(
+            when (ch) {
+                '：' -> ':'
+                '．', '。' -> '.'
+                '，' -> ','
+                '　' -> ' '
+                in '０'..'９' -> '0' + (ch - '０')
+                else -> ch
+            }
+        )
+    }
+    return sb.toString().trim()
+}
+
+/**
+ * True for a plausible IPv4 dotted quad or DNS hostname. All-digit but
+ * non-IPv4 inputs ("127001", "999") are rejected — they are what a mangled
+ * IP entry looks like and would only ever fail to connect.
+ */
+internal fun isValidHost(host: String): Boolean {
+    if (host.isEmpty() || host.length > 253) return false
+    val parts = host.split(".")
+    if (parts.all { p -> p.isNotEmpty() && p.all { it in '0'..'9' } }) {
+        return parts.size == 4 && parts.all { it.toInt() in 0..255 }
+    }
+    val label = Regex("^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$")
+    return parts.all { it.isNotEmpty() && label.matches(it) }
+}
+
+/**
  * Parses a host input that accepts either "192.168.1.100" or "192.168.1.100:9999".
- * Splits at the last ':' — a trailing all-digit segment is treated as the port,
- * anything else is kept as part of the host. A missing port falls back to
- * [DEFAULT_GROUP_PORT] (9999).
+ * Full-width IME input is normalized first (see [normalizeAddressInput]);
+ * splitting then happens at the last ':' — a trailing all-digit segment is
+ * treated as the port, anything else is kept as part of the host. A missing
+ * port falls back to [DEFAULT_GROUP_PORT] (9999).
  */
 internal fun parseHostPort(input: String): ParsedHostPort {
-    val text = input.trim()
+    val text = normalizeAddressInput(input)
     val idx = text.lastIndexOf(':')
     if (idx >= 0 && idx < text.lastIndex) {
-        val tail = text.substring(idx + 1)
+        val tail = text.substring(idx + 1).trim()
         if (tail.isNotEmpty() && tail.all { it.isDigit() }) {
             val port = tail.toIntOrNull()
             if (port != null && port > 0) {
-                return ParsedHostPort(text.substring(0, idx), port)
+                return ParsedHostPort(text.substring(0, idx).trim(), port)
             }
         }
     }

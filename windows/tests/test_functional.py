@@ -942,6 +942,57 @@ class ViewModelFlowTest(unittest.TestCase):
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0][1], "\u738b\u4e94")
 
+    def test_add_direct_contact_normalizes_and_validates(self):
+        """Regression: adding a member by IP must NORMALIZE full-width IME
+        punctuation (a Chinese IME emits \uff1a/\uff0e/\u3002) and REJECT
+        mangled endpoints. Before the fix any non-empty junk was accepted as
+        a "contact" that showed in the member list but could never connect —
+        reported as "adding a peer by IP has no effect"."""
+        network_module.TCP_PORT = 10036
+        vm = make_vm(_fresh_db("lc_test_addip.db"))
+        self._vms = [vm]
+
+        # full-width digits + ideographic/full-stop dots + full-width colon
+        fw = (
+            "\uff11\uff19\uff12\u3002\uff11\uff16\uff18\uff0e\uff10"
+            "\u3002\uff11\uff19\uff11\uff1a\uff19\uff19\uff19\uff19"
+        )
+        self.assertTrue(vm.add_direct_contact(fw, ""))
+        contact = vm.direct_contacts_list()[-1]
+        self.assertEqual(contact.ip_address, "192.168.0.191")
+        self.assertEqual(contact.port, 9999)
+        self.assertEqual(contact.id, "ip:192.168.0.191:9999")
+
+        # spaces around host and port are tolerated
+        self.assertTrue(vm.add_direct_contact(" 192.168.0.192 : 10000 ", ""))
+        contact = vm.direct_contacts_list()[-1]
+        self.assertEqual((contact.ip_address, contact.port), ("192.168.0.192", 10000))
+
+        # bare IP gets the default program port; a hostname stays allowed
+        self.assertTrue(vm.add_direct_contact("192.168.0.193", ""))
+        contact = vm.direct_contacts_list()[-1]
+        self.assertEqual((contact.ip_address, contact.port), ("192.168.0.193", 10036))
+        self.assertTrue(vm.add_direct_contact("mypc", ""))
+
+        # mangled / out-of-range endpoints are rejected, not silently added
+        before = len(vm.direct_contacts_list())
+        bad_inputs = [
+            "",
+            "   ",
+            "127001",           # dots lost
+            "192.168.0",        # too few octets
+            "1.2.3",
+            "192.168.0.300",    # octet out of range
+            "999",
+            "192.168.0.1:0",    # port out of range
+            "192.168.0.1:70000",
+            "192.168.0.1:abc",
+            "host name!",       # space / '!' are not hostname chars
+        ]
+        for bad in bad_inputs:
+            self.assertFalse(vm.add_direct_contact(bad, ""), f"must reject {bad!r}")
+        self.assertEqual(len(vm.direct_contacts_list()), before)
+
 
 if __name__ == "__main__":
     unittest.main()

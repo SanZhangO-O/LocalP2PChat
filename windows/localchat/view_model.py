@@ -1,4 +1,5 @@
 import json
+import re
 import socket
 import threading
 import uuid
@@ -356,6 +357,33 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
 
     # ------------------------------------------------------ direct member chat
 
+    # Full-width punctuation / digits a Chinese IME produces (：．。０-９...):
+    # typed addresses must be normalized to their ASCII equivalents or the
+    # contact is saved with an endpoint that can never connect (the row looks
+    # fine in the member list, then silently never reaches the peer).
+    _FULLWIDTH_MAP = str.maketrans(
+        {
+            "：": ":",
+            "．": ".",
+            "。": ".",
+            "，": ",",
+            "　": " ",
+            "０": "0",
+            "１": "1",
+            "２": "2",
+            "３": "3",
+            "４": "4",
+            "５": "5",
+            "６": "6",
+            "７": "7",
+            "８": "8",
+            "９": "9",
+        }
+    )
+
+    # hostname label: alnum, inner hyphens, not starting/ending with '-'
+    _HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$")
+
     def _load_direct_contacts(self) -> list:
         raw = self.store.get_setting("direct_contacts", "")
         if not raw:
@@ -448,7 +476,11 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
 
     def add_direct_contact(self, ip_port: str, name: str) -> bool:
         ip, parsed_port = self._parse_host_port(ip_port)
-        if not ip:
+        # validate: a syntactically broken endpoint (mangled IP, bad port)
+        # used to be accepted silently — the member row then appeared in the
+        # list but could never connect, which looks like "adding by IP has
+        # no effect". Reject it here; the dialog surfaces 地址无效.
+        if not ip or not self._is_valid_host(ip) or not 1 <= parsed_port <= 65535:
             return False
         contact = Peer(
             id=f"ip:{ip}:{parsed_port}",
@@ -842,12 +874,30 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         return None
 
     def _parse_host_port(self, host: str) -> tuple:
-        host = host.strip()
+        """Parse "ip" / "ip:port" input. Normalizes the full-width
+        punctuation and digits a Chinese IME emits (：．。０-９) to ASCII
+        first, so an address typed with the IME in Chinese/full-width
+        punctuation mode still yields a connectable endpoint."""
+        host = host.translate(self._FULLWIDTH_MAP).strip()
         if ":" in host:
             head, _, tail = host.rpartition(":")
+            tail = tail.strip()
             if tail.isdigit():
-                return head, int(tail)
+                return head.strip(), int(tail)
         return host, network_module.TCP_PORT
+
+    @classmethod
+    def _is_valid_host(cls, host: str) -> bool:
+        """A plausible IPv4 dotted quad or DNS hostname. All-digit but
+        non-IPv4 inputs ("127001", "999", "1.2.3") are rejected: they are
+        what a mangled IP entry looks like and would only ever fail to
+        connect."""
+        if not host or len(host) > 253:
+            return False
+        parts = host.split(".")
+        if all(p.isascii() and p.isdigit() for p in parts):
+            return len(parts) == 4 and all(0 <= int(p) <= 255 for p in parts)
+        return all(parts) and all(cls._HOST_LABEL_RE.match(p) for p in parts)
 
     def _active_p2p(self) -> Optional[P2PManager]:
         if self.active_group_id is None:

@@ -43,6 +43,7 @@ import com.zqr.localchat.network.NetworkPacket
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.network.Protocol
 import com.zqr.localchat.network.Wire
+import com.zqr.localchat.ui.screen.isValidHost
 import com.zqr.localchat.ui.screen.parseHostPort
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -237,7 +238,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun addDirectContact(ipPort: String, name: String): Boolean {
         val parsed = parseHostPort(ipPort)
-        if (parsed.host.isBlank()) return false
+        // validate: a syntactically broken endpoint (mangled IP, bad port)
+        // used to be accepted silently — the member row then appeared in the
+        // list but could never connect, which looks like "adding by IP has
+        // no effect". Reject it here; the UI surfaces 地址无效 (Windows
+        // parity).
+        if (!isValidHost(parsed.host) || parsed.port !in 1..65535) return false
         val nick = name.trim().ifBlank { parsed.host }
         DirectChatManager.addContact(
             DirectChatManager.Contact("ip:${parsed.host}:${parsed.port}", nick, parsed.host, parsed.port)
