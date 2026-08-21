@@ -388,7 +388,7 @@ object Handshake {
             Log.w(TAG, "direct handshake: initiator signature invalid")
             return null
         }
-        if (expectedPeerId != null && !DeviceIdentity.checkPeer(expectedPeerId, start.ident!!)) {
+        if (expectedPeerId != null && !DeviceIdentity.checkPeer(expectedPeerId, start.ident!!, remember = false)) {
             onIdentityMismatch?.invoke()
             return null
         }
@@ -480,15 +480,31 @@ object DeviceIdentity {
      * remembered key for [peerId] (or was just remembered), false when the
      * peer's identity CHANGED — treat as a possible man-in-the-middle.
      */
-    fun checkPeer(peerId: String, identB64: String): Boolean {
+    fun checkPeer(peerId: String, identB64: String, remember: Boolean = true): Boolean {
         if (peerId.isBlank()) return true
         val ctx = appContext ?: return true
         val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val known = prefs.getString(KEY_PEER_PREFIX + peerId, null)
         if (known == null) {
-            prefs.edit().putString(KEY_PEER_PREFIX + peerId, identB64).apply()
+            if (remember) {
+                prefs.edit().putString(KEY_PEER_PREFIX + peerId, identB64).apply()
+            }
             return true
         }
         return known == identB64
+    }
+
+    /**
+     * True when [peerId] already has a remembered identity key (pure lookup,
+     * no TOFU side effects). Callers use it to distinguish "the handshake
+     * proved a KNOWN key" (an address change is then multi-homing or DHCP
+     * churn, not impersonation) from first contact, where the address
+     * binding must still be enforced strictly.
+     */
+    fun hasPeer(peerId: String): Boolean {
+        if (peerId.isBlank()) return false
+        val ctx = appContext ?: return false
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .contains(KEY_PEER_PREFIX + peerId)
     }
 }

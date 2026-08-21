@@ -5,8 +5,8 @@
 ## 目录结构
 
 ```
-├── android/   # Android 版(本仓库当前代码)
-└── windows/   # Windows 版(预留位置)
+├── android/   # Android 版（Kotlin + Compose）
+└── windows/   # Windows 版（PyQt6，已实现）
 ```
 
 ## Android 版
@@ -17,4 +17,8 @@
 
 ## Windows 版
 
-- 预留位置 `windows/`,待放入 Windows 桌面版本。
+- 完整 Windows 桌面版位于 `windows/`，基于 PyQt6，功能与 Android 端互通。
+
+## 版本兼容说明
+
+- 通话功能要求 **两端（Android 与 Windows）均为最新版本**：媒体通道建立时需完成 `call_media_hello` 校验，旧版本客户端无法与本版本通话（表现为"对方未接听/媒体通道校验失败"）；聊天、文件传输与群组功能不受影响。升级后如通话异常，请确认对方也已升级。

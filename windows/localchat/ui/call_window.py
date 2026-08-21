@@ -141,6 +141,7 @@ class CallWindow(QDialog):
         self._audio_muted = False
         self._video_muted = False
         self._connected_at = None
+        self._close_handled = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -257,6 +258,14 @@ class CallWindow(QDialog):
         self.close()
 
     def closeEvent(self, event):
+        # Closing the window (including the title-bar X) ends the call instead
+        # of leaving camera/mic/media running invisibly in the background.
+        if self._close_handled:
+            super().closeEvent(event)
+            return
+        self._close_handled = True
+        if self._call_manager.state != "idle":
+            self._call_manager.hangup()
         self._call_manager.remote_frame.disconnect(self._on_remote_frame)
         self._call_manager.local_frame.disconnect(self._on_local_frame)
         self._call_manager.state_changed.disconnect(self._on_state_changed)

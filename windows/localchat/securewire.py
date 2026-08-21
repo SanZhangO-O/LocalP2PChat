@@ -470,7 +470,9 @@ class Handshake:
             return None
         if not verify(initiator_ident, transcript_hash, their_sig):
             return None
-        if expected_peer_id and not DeviceIdentity.check_peer(expected_peer_id, start.ident):
+        if expected_peer_id and not DeviceIdentity.check_peer(
+            expected_peer_id, start.ident, remember=False
+        ):
             if on_identity_mismatch is not None:
                 try:
                     on_identity_mismatch()
@@ -605,17 +607,52 @@ class DeviceIdentity:
             return "????"
 
     @classmethod
-    def check_peer(cls, peer_id: str, ident_b64: str) -> bool:
-        """TOFU check (and first-contact remember): True when [ident_b64] is
-        the remembered key for [peer_id] (or was just remembered), False when
-        the peer's identity CHANGED — treat as a possible man-in-the-middle."""
+    def forget_peer(cls, peer_id: str) -> None:
+        """Drop the remembered identity for [peer_id]. Used when a group member
+        list authoritatively changes a peer's endpoint: the old first-contact
+        TOFU binding was made against an impostor (or a stale address) and must
+        not cause a false MITM rejection when the real member connects.
+
+        TRUST NOTE: the group member list is produced by the group HOST, so
+        this deliberately lets the host reset TOFU bindings for member ids.
+        A malicious host could use that to un-bind a member before relaying
+        its traffic; this is accepted because the host already controls
+        routing and addressing for its groups — the device identity store
+        only defends against peers OUTSIDE the host's control."""
+        if not peer_id:
+            return
+        with cls._lock:
+            if cls._peers.pop(peer_id, None) is not None and cls.current is not None:
+                cls._save(cls.current)
+
+    @classmethod
+    def has_peer(cls, peer_id: str) -> bool:
+        """True when [peer_id] already has a remembered identity key (pure
+        lookup, no TOFU side effects). Callers use it to distinguish "the
+        handshake proved a KNOWN key" (an address change is then multi-homing
+        or DHCP churn, not impersonation) from first contact, where the
+        address binding must still be enforced strictly."""
+        if not peer_id:
+            return False
+        with cls._lock:
+            return peer_id in cls._peers
+
+    @classmethod
+    def check_peer(cls, peer_id: str, ident_b64: str, remember: bool = True) -> bool:
+        """TOFU check (and first-contact remember) when [remember] is true;
+        when false, an unknown peer is accepted but NOT persisted — callers
+        use that to delay binding until an application-level challenge (e.g.
+        call_media_hello) has proven the connection belongs to the expected
+        call."""
         if not peer_id:
             return True
         with cls._lock:
             known = cls._peers.get(peer_id)
             if known is None:
-                cls._peers[peer_id] = ident_b64
-                if cls.current is not None:
-                    cls._save(cls.current)
+                if remember:
+                    cls._peers[peer_id] = ident_b64
+                    if cls.current is not None:
+                        cls._save(cls.current)
+                    return True
                 return True
             return known == ident_b64

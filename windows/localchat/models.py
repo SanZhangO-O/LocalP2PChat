@@ -178,14 +178,20 @@ class CallInfo:
 
     @staticmethod
     def from_dict(d: dict) -> "CallInfo":
+        accepted = d.get("accepted", True)
+        audio_enabled = d.get("audioEnabled", True)
+        if not isinstance(accepted, bool):
+            raise ValueError("call field accepted must be a boolean")
+        if not isinstance(audio_enabled, bool):
+            raise ValueError("call field audioEnabled must be a boolean")
         return CallInfo(
             call_id=str(d.get("callId", "")),
             caller_id=str(d.get("callerId", "")),
             caller_name=str(d.get("callerName", "")),
             callee_id=str(d.get("calleeId", "")),
             media_port=int(d.get("mediaPort", 0)),
-            accepted=bool(d.get("accepted", True)),
-            audio_enabled=bool(d.get("audioEnabled", True)),
+            accepted=accepted,
+            audio_enabled=audio_enabled,
         )
 
 

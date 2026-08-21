@@ -31,6 +31,7 @@ import com.zqr.localchat.crypto.Crypto
 import com.zqr.localchat.data.CallInfo
 import com.zqr.localchat.data.Peer
 import com.zqr.localchat.network.Handshake
+import com.zqr.localchat.network.DeviceIdentity
 import com.zqr.localchat.network.NetworkPacket
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.network.RawLineIn
@@ -250,6 +251,7 @@ object CallManager {
         localName: String
     ) {
         if (call.mediaPort <= 0 || call.callerId.isEmpty()) return
+        if (call.calleeId != localId) return
         synchronized(lock) {
             if (_state.value !is CallState.Idle) {
                 // busy: decline directly to the offerer
@@ -280,6 +282,8 @@ object CallManager {
         // The media socket may already have activated the call (see
         // acceptLoop); the answer is then redundant confirmation.
         synchronized(lock) {
+            // An answer is addressed to the original caller — this node.
+            if (call.callerId != myCallerId) return
             val cur = _state.value
             val curCallId = (cur as? CallState.Outgoing)?.callId
                 ?: (cur as? CallState.Incoming)?.callId
@@ -297,6 +301,8 @@ object CallManager {
 
     private fun onCallReject(call: CallInfo) {
         synchronized(lock) {
+            // Only the call's original caller (this node) may be rejected.
+            if (call.callerId != myCallerId) return
             val cur = _state.value
             if (cur !is CallState.Outgoing || cur.callId != call.callId) return
             reset()
@@ -306,6 +312,8 @@ object CallManager {
 
     private fun onCallFailed(call: CallInfo) {
         synchronized(lock) {
+            // Only the call's original caller (this node) receives failures.
+            if (call.callerId != myCallerId) return
             val cur = _state.value
             if (cur !is CallState.Outgoing || cur.callId != call.callId) return
             reset()
@@ -318,6 +326,8 @@ object CallManager {
         val srv: ServerSocket?
         val sock: Socket?
         synchronized(lock) {
+            // A hangup must come from a participant of THIS node's call.
+            if (call.callerId != myCallerId && call.calleeId != myCallerId) return
             val cur = _state.value
             val curCallId = (cur as? CallState.Outgoing)?.callId
                 ?: (cur as? CallState.Incoming)?.callId
@@ -440,6 +450,21 @@ object CallManager {
                         _events.tryEmit("安全警告：对方媒体身份验证失败，通话已结束")
                     }
                 )
+                  // Bind this TCP connection to the call before activating it.
+                  // The media port is reachable by anyone on the LAN; without
+                  // this, a random device could complete the identity handshake
+                  // and make the caller's phone ring/activate.
+                  wire.sendPacket(
+                      NetworkPacket(
+                          type = "call_media_hello",
+                          call = CallInfo(
+                              callId = currentCallId,
+                              callerId = peerId,
+                              callerName = peerName,
+                              calleeId = myCallerId
+                          )
+                      )
+                  )
                 val handoff: Boolean
                 synchronized(lock) {
                     val cur = _state.value
@@ -581,24 +606,21 @@ object CallManager {
     }
 
     private fun acceptLoop(server: ServerSocket, currentCallId: String) {
+        var accepted: Socket? = null
+        var handedOff = false
         try {
             server.soTimeout = RING_TIMEOUT_MS.toInt()
             val sock = server.accept()
+            accepted = sock
             sock.tcpNoDelay = true
-            var activate = false
-            synchronized(lock) {
-                val cur = _state.value
-                // The callee connects only after accepting, so a connected
-                // media socket IS the answer: activate immediately (the
-                // call_answer packet becomes redundant confirmation).
-                if (cur is CallState.Outgoing && cur.callId == currentCallId) {
-                    mediaSocket = sock
-                    _state.value = CallState.Active(cur.peerId, cur.peerName, cur.callId)
-                    activate = true
-                }
-            }
-            if (!activate) {
-                runCatching { sock.close() }
+            // The media port is reachable by anyone on the LAN: NEVER activate
+            // on the bare TCP accept. Activation happens only after the
+            // identity handshake AND call_media_hello below prove this
+            // connection belongs to the current call (parity with the Windows
+            // _accept_loop, which also validates before emitting the socket).
+            sock.soTimeout = 10_000
+            val pre = _state.value
+            if (pre !is CallState.Outgoing || pre.callId != currentCallId) {
                 return
             }
             // Identity handshake on the media socket: the callee (initiator)
@@ -623,6 +645,40 @@ object CallManager {
                 return
             }
             mediaKey = wire.sessionKey
+              val hello = wire.recvPacket()
+              val helloCall = hello?.call
+              if (hello?.type != "call_media_hello" || helloCall == null ||
+                  helloCall.callId != currentCallId ||
+                  helloCall.callerId != myCallerId ||
+                  helloCall.calleeId != peerId
+              ) {
+                  endCall("媒体通道校验失败，通话已结束", isError = true)
+                  return
+              }
+              // Deferred TOFU binding: acceptDirect ran with remember=false, so
+              // only a connection that proved knowledge of the callId is bound
+              // to the expected peer identity.
+              if (expectedPeer != null) {
+                  DeviceIdentity.checkPeer(expectedPeer, secured.peerIdent!!)
+              }
+            // Everything verified: hand the socket over and go active NOW
+            // (the callee only connects after accepting, so this connection
+            // IS the answer; the call_answer packet is redundant confirmation).
+            val activate: Boolean
+            synchronized(lock) {
+                val cur = _state.value
+                if (cur is CallState.Outgoing && cur.callId == currentCallId) {
+                    mediaSocket = sock
+                    _state.value = CallState.Active(cur.peerId, cur.peerName, cur.callId)
+                    activate = true
+                } else {
+                    activate = false
+                }
+            }
+            if (!activate) {
+                return
+            }
+            handedOff = true
             if (!startEnginesSafe()) {
                 endCall("通话组件启动失败，请重试", isError = true)
                 return
@@ -638,6 +694,13 @@ object CallManager {
             _events.tryEmit("对方未接听")
         } catch (e: Exception) {
             // server closed (call cancelled)
+        } finally {
+            // Before activation the socket is not tracked by any field, so
+            // every bail-out path (verification failure, stale call state,
+            // exception) must close it here or it leaks.
+            if (!handedOff) {
+                runCatching { accepted?.close() }
+            }
         }
     }
 

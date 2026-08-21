@@ -471,7 +471,7 @@ class ChatPage(QWidget):
         if gid is None:
             return True
         p2p = self.vm.group_p2p_map.get(gid)
-        return p2p is None or p2p.connection_lost
+        return p2p is None or self.vm.active_connection_lost()
 
     def _show_send_blocked(self):
         self.count_label.setText("消息未发送：已断开连接")

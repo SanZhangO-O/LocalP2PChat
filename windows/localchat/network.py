@@ -1,3 +1,4 @@
+import ipaddress
 import logging
 import os
 import queue
@@ -63,6 +64,19 @@ MAX_CHUNK_WIRE = CHUNK_SIZE + 12 + 16
 
 GCM_MIN_FRAME = 12 + 16
 
+
+
+def _configure_server_socket(srv: socket.socket) -> None:
+    """Apply platform-appropriate exclusive-bind options to a LISTENING socket.
+
+    On Windows SO_REUSEADDR has hijack semantics, so prefer
+    SO_EXCLUSIVEADDRUSE there; on POSIX keep the normal SO_REUSEADDR behavior
+    used by tests and quick restarts.
+    """
+    if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
 def numeric_group_id_of(group_name: str, fingerprint: str) -> str:
     """Stable 8-digit numeric id for a group: FNV-1a hash of the machine
@@ -228,6 +242,8 @@ def _download_file_offer(file_info: FileInfo, target_path: str) -> tuple:
     calling thread. Returns (ok: bool, message: str). The meta line and every
     chunk are decrypted with the per-file key from the (encrypted) offer; any
     tampering or key mismatch aborts."""
+    if file_info.file_size < 0:
+        return False, "文件大小无效"
     if file_info.file_size > MAX_DOWNLOAD_BYTES:
         return False, f"文件过大（超过 {MAX_DOWNLOAD_BYTES // 1024 // 1024} MB 限制）"
     try:
@@ -266,6 +282,8 @@ def _download_file_offer(file_info: FileInfo, target_path: str) -> tuple:
             return False, "无效的响应"
         if meta.type != "file_meta" or meta.file_info is None:
             return False, "无效的响应"
+        if meta.file_info.file_size < 0:
+            return False, "文件大小无效"
         if meta.file_info.file_id != file_info.file_id:
             return False, "文件不匹配"
         # The streamed size is governed by whichever declared size is SMALLER:
@@ -305,12 +323,12 @@ def _download_file_offer(file_info: FileInfo, target_path: str) -> tuple:
                 except Exception:
                     return False, "文件数据校验失败（可能被篡改）"
                 received += len(plain)
-                if expected > 0 and received > expected:
+                if received > expected:
                     return False, f"文件大小不符（已接收 {received} 字节，超过声明大小）"
                 if received > MAX_DOWNLOAD_BYTES:
                     return False, f"文件超过 {MAX_DOWNLOAD_BYTES // 1024 // 1024} MB 限制"
                 f.write(plain)
-        if expected > 0 and received != expected:
+        if received != expected:
             return False, f"文件不完整（{received}/{expected} 字节）"
         os.replace(tmp_path, target_path)
         return True, ""
@@ -355,6 +373,10 @@ class HostGroupServer:
     explicit [shutdown]).
     """
 
+    MAX_ACTIVE_CONNECTIONS = 256
+    HANDSHAKE_RATE_LIMIT = 60
+    HANDSHAKE_RATE_WINDOW = 60.0
+
     def __init__(self, port: int):
         self.port = port
         self._groups: Dict[str, "P2PManager"] = {}
@@ -363,6 +385,8 @@ class HostGroupServer:
         self._server_socket: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self.error: Optional[str] = None
+        self._active_handlers = 0
+        self._handshake_attempts: Dict[str, list] = {}
         # The direct-chat manager that auto-accepts secured direct sessions
         # (set by the ViewModel; every device runs it so members can pull up
         # 1:1 chats with no confirmation).
@@ -452,10 +476,32 @@ class HostGroupServer:
 
     # ------------------------------------------------------------- server
 
+    def _allow_handshake(self, ip: str) -> bool:
+        """Cheap token bucket that stops one LAN host from forcing unbounded
+        PBKDF2 handshakes / thread spawns. Legitimate group traffic is far
+        below the limit (60 handshakes/minute/IP)."""
+        now = time.monotonic()
+        with self._lock:
+            attempts = self._handshake_attempts.setdefault(ip, [])
+            attempts[:] = [
+                ts for ts in attempts if now - ts < self.HANDSHAKE_RATE_WINDOW
+            ]
+            if len(attempts) >= self.HANDSHAKE_RATE_LIMIT:
+                return False
+            attempts.append(now)
+            return True
+
+    def _handle_guarded(self, sock: socket.socket) -> None:
+        try:
+            self._handle(sock)
+        finally:
+            with self._lock:
+                self._active_handlers = max(0, self._active_handlers - 1)
+
     def _server_loop(self) -> None:
         try:
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            _configure_server_socket(srv)
             srv.bind(("0.0.0.0", self.port))
             srv.listen(16)
             srv.settimeout(1.0)
@@ -469,7 +515,7 @@ class HostGroupServer:
             return
         while not self._stop_event.is_set():
             try:
-                client, _ = srv.accept()
+                client, client_addr = srv.accept()
             except socket.timeout:
                 continue
             except OSError:
@@ -478,7 +524,23 @@ class HostGroupServer:
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
-            _spawn(self._handle, client)
+            ip = client_addr[0] if client_addr else ""
+            if ip and not self._allow_handshake(ip):
+                self._safe_close(client)
+                continue
+            with self._lock:
+                if self._active_handlers >= self.MAX_ACTIVE_CONNECTIONS:
+                    self._safe_close(client)
+                    continue
+                self._active_handlers += 1
+            try:
+                _spawn(self._handle_guarded, client)
+            except Exception:
+                # thread spawn failed (e.g. process thread limit): undo the
+                # reservation or the cap leaks one slot per failure
+                with self._lock:
+                    self._active_handlers = max(0, self._active_handlers - 1)
+                self._safe_close(client)
         try:
             srv.close()
         except OSError:
@@ -1250,12 +1312,23 @@ class P2PManager:
                 except Exception:
                     pass
         elif packet.type in CALL_PACKET_TYPES:
-            # The host only delivers call packets to the addressed member, so
-            # anything arriving here is for this node; double-check the id.
-            if packet.call is None:
+            # Call packets are never broadcast on the relay path: a client only
+            # accepts packets explicitly addressed to this node and whose
+            # callId/participant fields are consistent with its role.
+            call = packet.call
+            if call is None:
                 return
-            if packet.target_id is not None and packet.target_id != self.my_id:
+            if packet.target_id != self.my_id:
                 return
+            if packet.type == "call_offer":
+                if call.callee_id != self.my_id:
+                    return
+            elif packet.type in ("call_answer", "call_reject", "call_failed"):
+                if call.caller_id != self.my_id:
+                    return
+            elif packet.type == "call_hangup":
+                if call.caller_id != self.my_id and call.callee_id != self.my_id:
+                    return
             self._dispatch_call(packet)
         # "pong": traffic only; keeps the read loop alive
 
@@ -1324,20 +1397,42 @@ class P2PManager:
         call = packet.call
         if call is None:
             return
-        if packet.type in ("call_offer", "call_failed"):
+        if packet.type == "call_offer":
             if call.caller_id != sender_id:
-                logger.warning("drop call %s from %s: callerId mismatch", packet.type, sender_id)
+                logger.warning("drop call_offer from %s: callerId mismatch", sender_id)
                 return
-        elif packet.type in ("call_answer", "call_reject"):
+            expected_target = call.callee_id
+        elif packet.type in ("call_answer", "call_reject", "call_failed"):
             if call.callee_id != sender_id:
                 logger.warning("drop call %s from %s: calleeId mismatch", packet.type, sender_id)
                 return
+            expected_target = call.caller_id
         elif packet.type == "call_hangup":
             if call.caller_id != sender_id and call.callee_id != sender_id:
                 logger.warning("drop call_hangup from %s: not a call participant", sender_id)
                 return
+            expected_target = (
+                call.callee_id if sender_id == call.caller_id else call.caller_id
+            )
+        else:
+            return
         target_id = packet.target_id
-        if target_id is None or target_id == self.my_id:
+        if target_id is not None and target_id != expected_target:
+            logger.warning(
+                "drop call %s: targetId %r does not match expected %r",
+                packet.type, target_id, expected_target,
+            )
+            return
+        if target_id is None:
+            if expected_target != self.my_id:
+                logger.warning(
+                    "drop call %s: missing targetId but expected %r is not this host",
+                    packet.type, expected_target,
+                )
+                return
+            self._dispatch_call(packet)
+            return
+        if target_id == self.my_id:
             self._dispatch_call(packet)
             return
         with self._lock:
@@ -1500,6 +1595,8 @@ class P2PManager:
         the raw download stream."""
         if not path:
             return None
+        if not os.path.isfile(path):
+            return None
         try:
             file_size = os.path.getsize(path)
             file_name = os.path.basename(path)
@@ -1592,7 +1689,7 @@ class P2PManager:
     def _server_loop(self) -> None:
         try:
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            _configure_server_socket(srv)
             srv.bind(("0.0.0.0", self.port))
             srv.listen(16)
             srv.settimeout(1.0)
@@ -1756,7 +1853,10 @@ class DirectChatManager:
         self._chat_endpoints: Dict[str, str] = {}
         # Keys with a redial loop currently running.
         self._redial_loops: set = set()
-        self._redial_guard = threading.Lock()
+        # RLock (not Lock): the redial loop's finally may re-enter
+        # _ensure_redial_loop while still holding this guard to relaunch for a
+        # message that raced with loop shutdown.
+        self._redial_guard = threading.RLock()
         # Call-signaling bridge: callable(packet) invoked on the session read
         # thread for call_* packets that involve this node (Android parity —
         # direct calls ride the session socket, not the host relay).
@@ -1832,7 +1932,22 @@ class DirectChatManager:
                 ):
                     del self._contacts[old_id]
                     changed = True
+            old_same_id = self._contacts.get(contact.id)
             if self._contacts.get(contact.id) != contact:
+                if (
+                    old_same_id is not None
+                    and old_same_id.ip_address
+                    and contact.ip_address
+                    and old_same_id.ip_address != contact.ip_address
+                ):
+                    # A peer's endpoint changed via a trusted group membership
+                    # update; the old TOFU binding may have been created by an
+                    # impostor, so it must not block the real peer later.
+                    # NOTE this hands the group HOST the power to reset TOFU
+                    # bindings for member ids — accepted because the host
+                    # already controls routing/addressing for its groups (see
+                    # DeviceIdentity.forget_peer).
+                    DeviceIdentity.forget_peer(contact.id)
                 self._contacts[contact.id] = contact
                 changed = True
         if changed:
@@ -2009,8 +2124,59 @@ class DirectChatManager:
         if peer is None or peer.id == self._my_id:
             self._safe_close(sock)
             return
+        # Identity-first: when the handshake already proves the peer's KNOWN
+        # long-term key, the peer is authenticated by CRYPTOGRAPHY — an
+        # address mismatch is then multi-homing (VPN/second NIC) or DHCP
+        # churn, not impersonation, and must not block the session. The
+        # address binding below therefore only guards FIRST CONTACT (unknown
+        # identity), where an attacker claiming another member's UUID could
+        # otherwise poison the TOFU map before the real member ever connects.
+        identity_proven = (
+            peer_ident is not None
+            and DeviceIdentity.has_peer(peer.id)
+            and DeviceIdentity.check_peer(peer.id, peer_ident, remember=False)
+        )
+        if not identity_proven:
+            # Bind the hello to the TCP peer that actually dialed us.
+            # Loopback is exempt: a 127.x source is necessarily THIS machine
+            # (tests, local dev; the dialer advertises its LAN address but
+            # connects over loopback), never a LAN impostor.
+            try:
+                actual_ip = sock.getpeername()[0]
+            except OSError:
+                actual_ip = ""
+            try:
+                from_loopback = ipaddress.ip_address(actual_ip).is_loopback
+            except ValueError:
+                from_loopback = False
+            if (
+                not from_loopback
+                and actual_ip
+                and peer.ip_address
+                and actual_ip != peer.ip_address
+            ):
+                self._emit_event(
+                    f"安全警告：{peer.name} 声称的地址与连接来源不一致，连接已拒绝"
+                )
+                self._safe_close(sock)
+                return
+            with self._lock:
+                existing = self._contacts.get(peer.id)
+            if (
+                existing is not None
+                and existing.ip_address
+                and peer.ip_address
+                and existing.ip_address != peer.ip_address
+            ):
+                self._emit_event(
+                    f"安全警告：{peer.name} 的地址与已知成员不一致，连接已拒绝"
+                )
+                self._safe_close(sock)
+                return
         # TOFU: a changed identity key for a KNOWN peer id means someone is
-        # impersonating or intercepting it — refuse the session.
+        # impersonating or intercepting it — refuse the session. (For an
+        # unknown peer this is also the moment the key gets remembered: the
+        # address binding above has already passed.)
         if peer_ident and not DeviceIdentity.check_peer(peer.id, peer_ident):
             self._emit_event(
                 f"安全警告：{peer.name} 的设备身份发生变化，连接已拒绝（可能存在中间人攻击）"
@@ -2206,7 +2372,8 @@ class DirectChatManager:
             q.extend(restored)
         for m in restored:
             self._set_pending(peer_id, m.id, True)
-        self._ensure_redial_loop(peer_id)
+        if not self._stop_event.is_set():
+            self._ensure_redial_loop(peer_id)
 
     def _merge_chat_state(self, from_key: str, to_key: str) -> None:
         """Merge one chat key's in-memory state (list + outbox) into another
@@ -2280,6 +2447,8 @@ class DirectChatManager:
         parity). Requires a live session (files cannot queue offline)."""
         if not path:
             return None
+        if not os.path.isfile(path):
+            return None
         try:
             file_size = os.path.getsize(path)
             file_name = os.path.basename(path)
@@ -2326,9 +2495,27 @@ class DirectChatManager:
             file_info=file_info,
         )
         self._append_message(peer_id, msg)
-        self._put_send(session, NetworkPacket(type="file_message", message=msg))
+        self._put_send(
+            session,
+            NetworkPacket(type="file_message", message=msg),
+            on_failed=lambda: self._fail_file_send(peer_id, file_id),
+        )
         self._spawn(self._direct_file_server_loop, file_id, srv, path, file_size, file_key)
         return msg
+
+    def _fail_file_send(self, peer_id: str, file_id: str) -> None:
+        """A file_message never made it onto the wire: close its download
+        server and remove the local bubble so the UI cannot claim it was
+        delivered."""
+        with self._lock:
+            srv = self._file_servers.pop(file_id, None)
+        if srv is not None:
+            try:
+                srv.close()
+            except OSError:
+                pass
+        self._remove_message(peer_id, file_id)
+        self._emit_event("文件发送失败，请重试")
 
     def download_file(self, file_info: FileInfo, target_path: str) -> tuple:
         """Download a file offered via [file_info] to [target_path]. Blocks the
@@ -2487,6 +2674,17 @@ class DirectChatManager:
                 self._run_send_cb(on_sent)
         except Exception:
             pass
+        finally:
+            # Session closed/replaced between enqueue and write: don't strand
+            # items in a queue nobody drains. Running on_failed restores chat
+            # messages to the outbox as pending and fails file offers cleanly.
+            if not session["alive"]:
+                while True:
+                    try:
+                        _, _, pending_cb = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    self._run_send_cb(pending_cb)
 
     def _read_loop(self, session: dict) -> None:
         try:
@@ -2538,14 +2736,22 @@ class DirectChatManager:
                     if target is not None and target.sender_id == sender:
                         self._remove_message(peer_id, packet.message_id)
                 elif packet.type in CALL_PACKET_TYPES:
-                    # 1:1 session: call signaling must involve this member
-                    # (self-initiated calls come back as answer/reject with our
-                    # own id in callerId)
+                    # 1:1 session: call signaling must involve THIS member and
+                    # the packet's sender role must match the linked peer.
                     call = packet.call
                     if call is None:
                         continue
                     if call.caller_id != self._my_id and call.callee_id != self._my_id:
                         continue
+                    if packet.type == "call_offer":
+                        if call.caller_id != peer_id or call.callee_id != self._my_id:
+                            continue
+                    elif packet.type in ("call_answer", "call_reject", "call_failed"):
+                        if call.callee_id != peer_id or call.caller_id != self._my_id:
+                            continue
+                    elif packet.type == "call_hangup":
+                        if call.caller_id != peer_id and call.callee_id != peer_id:
+                            continue
                     handler = self.on_call_signal
                     if handler is not None:
                         try:
@@ -2707,6 +2913,14 @@ class GroupMeshManager:
                 state["messages"] = sorted(history, key=lambda m: m.timestamp)
         for peer in peers:
             self.add_peer(group_id, peer)
+
+    def update_local_port(self, group_id: str, port: int) -> None:
+        """Update the advertised local port after a settings change. Existing
+        links keep working; new mesh links and reconnects use the new port."""
+        with self._lock:
+            state = self._groups.get(group_id)
+            if state is not None and state.get("my_peer") is not None:
+                state["my_peer"].port = port
 
     def leave_group(self, group_id: str) -> None:
         with self._lock:
@@ -2972,6 +3186,7 @@ class GroupMeshManager:
             time.sleep(self.RETRY_INTERVAL)
 
     def _try_connect(self, group_id: str, peer: Peer) -> Optional[dict]:
+        sock = None
         try:
             sock = socket.create_connection((peer.ip_address, peer.port), timeout=8)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -2982,6 +3197,7 @@ class GroupMeshManager:
                 password = state["password"] if state is not None else ""
             if my_peer is None:
                 self._safe_close(sock)
+                sock = None
                 return None
             # password-bound secured handshake: mesh traffic (chat + history +
             # deletes) is encrypted, and both sides prove group membership.
@@ -2995,6 +3211,7 @@ class GroupMeshManager:
             ack = wire.recv_packet()
             if ack is None or ack.type != "mesh_ack" or ack.peer is None:
                 self._safe_close(sock)
+                sock = None
                 return None
             return {
                 "peer_id": peer.id,
@@ -3004,6 +3221,8 @@ class GroupMeshManager:
                 "alive": True,
             }
         except Exception:
+            if sock is not None:
+                self._safe_close(sock)
             return None
 
     def _register_link(self, state: dict, peer: Peer, sock, wire: Wire) -> None:
@@ -3058,7 +3277,14 @@ class GroupMeshManager:
                     if packet.message_id and packet.sender_id:
                         self._handle_delete_incoming(group_id, link, packet.message_id, packet.sender_id)
                 elif packet.type == "history_reply":
-                    self._handle_incoming(group_id, packet.messages or [])
+                    # History legitimately contains messages from many senders,
+                    # but each message must still be well-formed and bounded.
+                    valid_history = [
+                        m for m in (packet.messages or [])
+                        if m.sender_id and is_valid_content(m.content)
+                    ]
+                    if valid_history:
+                        self._handle_incoming(group_id, valid_history)
                 elif packet.type == "mesh_announce" and packet.peer is not None:
                     self.add_peer(group_id, packet.peer)
                 elif packet.type == "ping":

@@ -397,8 +397,44 @@ object DirectChatManager {
             closeSocket(socket)
             return
         }
+
+        // Identity-first: when the handshake already proves the peer's KNOWN
+        // long-term key, the peer is authenticated by CRYPTOGRAPHY — an
+        // address mismatch is then multi-homing (VPN/second NIC) or DHCP
+        // churn, not impersonation, and must not block the session. The
+        // address binding below only guards FIRST CONTACT (unknown identity),
+        // where an attacker claiming another member's UUID could otherwise
+        // poison the TOFU map before the real member ever connects.
+        val identityProven = peerIdent != null &&
+            DeviceIdentity.hasPeer(peer.id) &&
+            DeviceIdentity.checkPeer(peer.id, peerIdent!!, remember = false)
+        if (!identityProven) {
+            val actualIp = runCatching { socket.inetAddress?.hostAddress }.getOrNull() ?: ""
+            // Loopback is exempt: a 127.x source is necessarily THIS device
+            // (the dialer may advertise its LAN address while connecting over
+            // loopback), never a LAN impostor. IPv4-only, matching the rest
+            // of the stack (AF_INET sockets).
+            val fromLoopback = actualIp.startsWith("127.")
+            if (!fromLoopback && actualIp.isNotEmpty() && peer.ipAddress.isNotEmpty() &&
+                actualIp != peer.ipAddress
+            ) {
+                _events.tryEmit("安全警告：${peer.name} 声称的地址与连接来源不一致，连接已拒绝")
+                closeSocket(socket)
+                return
+            }
+            val existing = _contacts.value[peer.id]
+            if (existing != null && existing.ip.isNotEmpty() && peer.ipAddress.isNotEmpty() &&
+                existing.ip != peer.ipAddress
+            ) {
+                _events.tryEmit("安全警告：${peer.name} 的地址与已知成员不一致，连接已拒绝")
+                closeSocket(socket)
+                return
+            }
+        }
         // TOFU: a changed identity key for a KNOWN peer id means someone is
-        // impersonating or intercepting it — refuse the session.
+        // impersonating or intercepting it — refuse the session. (For an
+        // unknown peer this is also the moment the key gets remembered: the
+        // address binding above has already passed.)
         if (peerIdent != null && !DeviceIdentity.checkPeer(peer.id, peerIdent)) {
             _events.tryEmit("安全警告：${peer.name} 的设备身份发生变化，连接已拒绝（可能存在中间人攻击）")
             closeSocket(socket)
@@ -754,11 +790,19 @@ object DirectChatManager {
                         }
                     }
                     in CALL_PACKET_TYPES -> {
-                        // 1:1 session: call signaling must involve this member
-                        // (self-initiated calls come back as answer/reject with
-                        // our own id in callerId)
+                        // 1:1 session: call signaling must involve THIS member
+                        // and the packet's sender role must match the linked
+                        // peer (parity with the Windows _read_loop checks).
                         val call = packet.call ?: continue
                         if (call.callerId != myId && call.calleeId != myId) continue
+                        when (packet.type) {
+                            "call_offer" ->
+                                if (call.callerId != s.peerId || call.calleeId != myId) continue
+                            "call_answer", "call_reject", "call_failed" ->
+                                if (call.calleeId != s.peerId || call.callerId != myId) continue
+                            "call_hangup" ->
+                                if (call.callerId != s.peerId && call.calleeId != s.peerId) continue
+                        }
                         onCallSignal?.invoke(packet)
                     }
                     "ping" -> runCatching { s.wire.sendPacket(NetworkPacket(type = "pong")) }

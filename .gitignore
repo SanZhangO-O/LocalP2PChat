@@ -1,0 +1,23 @@
+# Windows
+windows/build/
+windows/dist/
+windows/data/
+windows/*.db
+windows/*.lock
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.spec~
+
+# Android
+android/app/build/
+android/.gradle/
+android/local.properties
+android/app/release/
+
+# IDE
+.idea/
+.vscode/
+*.iml

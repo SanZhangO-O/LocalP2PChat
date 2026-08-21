@@ -50,7 +50,7 @@ from .aec import Aec
 from .crypto import GCM_NONCE_LEN, aes_gcm_decrypt, aes_gcm_encrypt
 from .models import CallInfo, NetworkPacket
 from .network import _read_raw_line, make_wire
-from .securewire import Handshake, Protocol, Wire
+from .securewire import DeviceIdentity, Handshake, Protocol, Wire
 
 logger = __import__("logging").getLogger(__name__)
 
@@ -155,6 +155,7 @@ class CallManager(QObject):
     _sig_media_ended = pyqtSignal(str)  # read loop ended: reason
     _sig_connect_failed = pyqtSignal(str)
     _sig_ring_timeout = pyqtSignal(str)  # call_id
+    _sig_shutdown_engines = pyqtSignal()  # worker -> GUI thread teardown
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -233,6 +234,7 @@ class CallManager(QObject):
         self._sig_media_ended.connect(self._on_media_ended)
         self._sig_connect_failed.connect(self._on_connect_failed)
         self._sig_ring_timeout.connect(self._on_ring_timeout)
+        self._sig_shutdown_engines.connect(self._shutdown_engines)
         self.remote_audio.connect(self._on_remote_audio)
 
     # ------------------------------------------------------------- public API
@@ -364,6 +366,8 @@ class CallManager(QObject):
             ip = self._peer_ip
             port = self._media_port
             peer_id = self._peer_id
+            peer_name = self._peer_name
+            my_id = self._my_id
         if not ip or port <= 0:
             self._reject_flow("通话信息无效")
             return
@@ -393,6 +397,20 @@ class CallManager(QObject):
                     ),
                 )
                 key = wire.session_key
+                # Bind this TCP connection to the call: a random LAN device
+                # must not activate the caller's media port just by completing
+                # a first-contact identity handshake.
+                wire.send_packet(
+                    NetworkPacket(
+                        type="call_media_hello",
+                        call=CallInfo(
+                            call_id=call_id,
+                            caller_id=peer_id,
+                            caller_name=peer_name,
+                            callee_id=my_id,
+                        ),
+                    )
+                )
             except OSError as e:
                 run_catching_close(sock)
                 self._sig_connect_failed.emit(f"{ip}:{port}（{e}）")
@@ -526,6 +544,11 @@ class CallManager(QObject):
                        my_id: str, my_name: str) -> None:
         if call.media_port <= 0 or not call.caller_id:
             return
+        # An offer must actually be addressed to THIS device. Host routing and
+        # direct-session validation already filter most spoofed targets; this
+        # is the last line of defense before the UI rings.
+        if call.callee_id != my_id:
+            return
         with self._lock:
             if self._state != STATE_IDLE:
                 # busy: reply to the offerer directly (this call is not ours)
@@ -557,7 +580,7 @@ class CallManager(QObject):
         # The media socket may have already activated the call (see
         # _on_media_socket); the answer is then redundant confirmation.
         with self._lock:
-            if call.call_id != self._call_id:
+            if call.call_id != self._call_id or call.caller_id != self._my_id:
                 return
             if self._state == STATE_OUTGOING:
                 self._state = STATE_ACTIVE
@@ -569,19 +592,27 @@ class CallManager(QObject):
 
     def _on_call_reject(self, call) -> None:
         with self._lock:
+            if call.caller_id != self._my_id:
+                return
             if self._state == STATE_OUTGOING and call.call_id == self._call_id:
+                server = self._media_server
                 self._reset()
             else:
                 return
+        run_catching_close(server)
         self.state_changed.emit(STATE_IDLE, "", "")
         self.call_ended.emit("对方拒绝了通话")
 
     def _on_call_failed(self, call) -> None:
         with self._lock:
+            if call.caller_id != self._my_id:
+                return
             if self._state == STATE_OUTGOING and call.call_id == self._call_id:
+                server = self._media_server
                 self._reset()
             else:
                 return
+        run_catching_close(server)
         self.state_changed.emit(STATE_IDLE, "", "")
         self.call_error.emit(
             "通话建立失败：对方无法连接本机的媒体端口。\n"
@@ -590,7 +621,7 @@ class CallManager(QObject):
 
     def _on_call_hangup(self, call) -> None:
         with self._lock:
-            if call.call_id != self._call_id or self._state == STATE_IDLE:
+            if call.call_id != self._call_id or self._state == STATE_IDLE or (call.caller_id != self._my_id and call.callee_id != self._my_id):
                 return
             was_ringing = self._state in (STATE_INCOMING, STATE_OUTGOING)
             server = self._media_server
@@ -740,6 +771,25 @@ class CallManager(QObject):
             if secured is None:
                 raise OSError("media handshake rejected")
             key = wire.session_key
+            # Application-layer call binding: the media port is TCP-public,
+            # so only a peer that can produce the callId (sent encrypted in
+            # call_offer) may turn this connection into an active call.
+            hello = wire.recv_packet()
+            if hello is None or hello.type != "call_media_hello" or hello.call is None:
+                raise OSError("missing call_media_hello")
+            if (
+                hello.call.call_id != call_id
+                or hello.call.caller_id != self._my_id
+                or hello.call.callee_id != peer_id
+            ):
+                raise OSError("call_media_hello mismatch")
+            if peer_id and not peer_id.startswith("ip:") and not DeviceIdentity.check_peer(
+                peer_id, secured.peer_ident
+            ):
+                self.call_error.emit(
+                    "安全警告：对方媒体身份验证失败，通话已结束"
+                )
+                raise OSError("media identity changed")
         except socket.timeout:
             run_catching_close(sock)
             self._sig_ring_timeout.emit(call_id)
@@ -877,8 +927,17 @@ class CallManager(QObject):
     # ------------------------------------------------------------ capture
 
     def _start_capture(self) -> None:
-        if self._capture_thread is not None:
-            return
+        # A previous capture loop may still be winding down (shutdown joins
+        # it only briefly to keep the GUI responsive): make sure it has fully
+        # left its `while not stop_event.is_set()` loop BEFORE clearing the
+        # shared stop event, or the old loop would resurrect next to the new
+        # one and keep the camera open. Once past its loop condition the old
+        # thread only runs cleanup (camera release) and cannot resurrect.
+        thread = self._capture_thread
+        if thread is not None:
+            self._stop_event.set()
+            thread.join(timeout=1.5)
+            self._capture_thread = None
         self._stop_event.clear()
         self._capture_thread = threading.Thread(
             target=self._video_capture_loop, daemon=True
@@ -1027,7 +1086,11 @@ class CallManager(QObject):
                 time.sleep(VIDEO_INTERVAL)
         finally:
             self._close_capture()
-            self._capture_thread = None
+            # Only drop the reference when it still points to THIS thread: a
+            # straggler from a previous call must not clobber the field after
+            # a new capture thread has already been registered.
+            if self._capture_thread is threading.current_thread():
+                self._capture_thread = None
 
     # ------------------------------------------------- ffmpeg capture fallback
 
@@ -1580,7 +1643,7 @@ class CallManager(QObject):
         run_catching_close(server)
         run_catching_close(sock)
         if threading.current_thread() is not threading.main_thread():
-            QTimer.singleShot(0, self._shutdown_engines)
+            self._sig_shutdown_engines.emit()
         else:
             self._shutdown_engines()
         self.call_ended.emit(reason)
@@ -1588,13 +1651,19 @@ class CallManager(QObject):
 
     def _shutdown_engines(self) -> None:
         """Stop capture/audio resources. Runs on the GUI thread (deferred via
-        a single-shot timer when the call ended on a worker thread)."""
+        a queued signal when the call ended on a worker thread)."""
         self._stop_event.set()
         self._stop_audio()
         thread = self._capture_thread
-        self._capture_thread = None
         if thread is not None:
-            thread.join(timeout=1.0)
+            # The loop polls the stop event at least once per video interval
+            # (~80 ms); a short join catches the common case without stalling
+            # the GUI.
+            thread.join(timeout=0.05)
+            if not thread.is_alive():
+                self._capture_thread = None
+            # else: keep the reference so _start_capture can join the
+            # straggler — and leave the stop event SET so the loop exits.
         # stop the media sender and drop queued frames
         self._send_stop.set()
         for q in (self._audio_send_q, self._video_send_q):
@@ -1604,7 +1673,14 @@ class CallManager(QObject):
             except queue.Empty:
                 pass
         self._send_thread = None
-        self._stop_event.clear()
+        # NEVER clear the stop event while the capture loop may still be
+        # sleeping inside its `while not stop_event.is_set()` check: clearing
+        # it would resurrect the loop (camera stays on, _capture_thread is
+        # already None so nothing ever joins it). It is cleared here only once
+        # the thread has really exited; _start_capture joins any lingering
+        # thread before clearing it for a new call.
+        if thread is None or not thread.is_alive():
+            self._stop_event.clear()
 
 
 def run_catching_close(sock) -> None:

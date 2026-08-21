@@ -268,13 +268,39 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         return self.port
 
     def set_nickname(self, name: str) -> None:
-        """Persist the display nickname (used by new group/direct-chat
-        sessions)."""
+        """Persist the display nickname and apply it to every live session so
+        new direct chats, calls and group joins immediately use the new name."""
         nick = name.strip()
         if not nick:
             return
         self.nickname = nick
         self.store.set_setting("nickname", nick)
+        self.direct.configure(
+            self._device_id(), nick, get_local_ip_address(), self.port,
+            saved_contacts=self.direct.contacts_list(),
+        )
+        for p2p in self.group_p2p_map.values():
+            p2p.my_name = nick
+        for p2p in (self.pending_p2p, self.setup_p2p):
+            if p2p is not None:
+                p2p.my_name = nick
+        if self.active_group_id is not None:
+            self.active_my_name = nick
+        # Keep persisted per-group display names aligned too.
+        for meta in self.groups:
+            self.store.upsert_group(
+                SavedGroup(
+                    group_id=meta.group_id,
+                    group_name=meta.group_name,
+                    is_host=meta.is_host,
+                    host_ip=meta.host_ip,
+                    host_port=meta.host_port,
+                    my_name=nick,
+                    member_count=meta.member_count,
+                    last_message=meta.last_message,
+                    last_message_time=meta.last_message_time,
+                )
+            )
 
     def can_create_group(self) -> bool:
         # multiple groups are supported; creating is always allowed
@@ -288,6 +314,35 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             return
         self.port = port
         self.store.set_setting("port", str(port))
+        # Every live/queued group manager advertises the local listening port;
+        # update all of them so join_ack/mesh advertisements never carry the
+        # stale pre-change port.
+        for p2p in self.group_p2p_map.values():
+            p2p.port = port
+        for p2p in (self.pending_p2p, self.setup_p2p):
+            if p2p is not None:
+                p2p.port = port
+        for gid, p2p in self.group_p2p_map.items():
+            if not p2p.is_host:
+                self.mesh.update_local_port(gid, port)
+        # Persist the new host port immediately (otherwise a restart reverts
+        # host groups to the old value loaded from the database).
+        for meta in self.groups:
+            if meta.is_host:
+                meta.host_port = port
+                self.store.upsert_group(
+                    SavedGroup(
+                        group_id=meta.group_id,
+                        group_name=meta.group_name,
+                        is_host=True,
+                        host_ip=meta.host_ip or get_local_ip_address(),
+                        host_port=port,
+                        my_name=meta.my_name,
+                        member_count=meta.member_count,
+                        last_message=meta.last_message,
+                        last_message_time=meta.last_message_time,
+                    )
+                )
         # rebind for host groups AND direct member chats (every device listens)
         self.host_server.restart(port)
         self.direct.configure(
@@ -560,7 +615,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         group's history."""
         if p2p.is_host:
             return
-        my_peer = Peer(p2p.my_id, p2p.my_name or "用户", get_local_ip_address(), self.port)
+        my_peer = Peer(p2p.my_id, p2p.my_name or "用户", get_local_ip_address(), p2p.port)
         seen = {}
         for peer in list(p2p.peers.values()) + self._load_group_peers(group_id):
             seen[peer.id] = peer
@@ -722,6 +777,18 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         saved = self.store.get_messages_for_group("direct:" + to_id)
         if not saved:
             self._seed_direct_history(to_id)
+        # saved_messages has a FK to saved_groups; ensure the destination
+        # placeholder row exists before moving rows, or move_messages aborts.
+        target_contact = next(
+            (c for c in self.direct.contacts_list() if c.id == to_id), None
+        )
+        self.store.upsert_group(
+            SavedGroup(
+                group_id="direct:" + to_id,
+                group_name=(target_contact.name if target_contact else to_id),
+                is_host=False,
+            )
+        )
         self.store.move_messages("direct:" + from_id, "direct:" + to_id)
         self.store.delete_group("direct:" + from_id)
         self.direct_chat_migrated.emit(from_id, to_id)
@@ -1405,6 +1472,11 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                         self.store.delete_message(gid, mid)
             new_messages = [m for m in msgs if m.id not in persisted]
             if new_messages:
+                # Keep the mesh history state complete even when the message
+                # arrived over the host relay: later mesh backfills must include
+                # it for members that were offline at send time.
+                for m in new_messages:
+                    self.mesh.note_message(gid, m)
                 incoming = [m for m in new_messages if not m.is_from_me]
                 if gid != self.active_group_id and incoming:
                     if meta is not None:
@@ -1491,7 +1563,6 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 self.pending_p2p = None
                 self.pending_group_id = None
                 self.group_p2p_map[gid] = p2p
-                self._setup_group_mesh(gid, p2p)
                 meta = self._find_group(gid)
                 if meta is None:
                     meta = GroupMeta(
@@ -1526,6 +1597,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 if p2p.join_id:
                     self.store.set_setting(f"group_join_id_{gid}", p2p.join_id)
                 self._load_and_replay_messages(gid, p2p)
+                # Enter the mesh AFTER replaying persisted history so the mesh
+                # state seeds with the full local history and can backfill it
+                # to members that come online later.
+                self._setup_group_mesh(gid, p2p)
                 self.setup_p2p = None
                 self.groups_changed.emit()
                 self.status_message.emit("已成功加入群组")

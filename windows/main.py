@@ -16,10 +16,22 @@ from localchat.view_model import ChatViewModel
 
 
 def base_dir() -> str:
-    """Directory that holds the app's mutable data. Next to the exe when
-    frozen (sys.executable), next to this file when running from source."""
+    """Directory that holds the app's mutable data. Portable by default (next
+    to the exe / source file); falls back to %LOCALAPPDATA%\\LocalChat when the
+    exe directory is not writable (e.g. installed under Program Files)."""
     if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
+        exe_dir = os.path.dirname(sys.executable)
+        if os.access(exe_dir, os.W_OK):
+            return exe_dir
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            path = os.path.join(local, "LocalChat")
+            try:
+                os.makedirs(path, exist_ok=True)
+                return path
+            except OSError:
+                pass
+        return exe_dir
     return os.path.dirname(os.path.abspath(__file__))
 
 

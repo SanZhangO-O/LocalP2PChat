@@ -847,10 +847,19 @@ class P2PManager(
             }
             "pong" -> { /* traffic only; keeps the read loop alive */ }
             in CALL_PACKET_TYPES -> {
-                // The host only delivers call packets to the addressed member,
-                // so anything arriving here is for this node; double-check id.
-                if (packet.call == null) return
-                if (packet.targetId != null && packet.targetId != myId) return
+                // Call packets are never broadcast on the relay path: a client
+                // only accepts packets explicitly addressed to this node and
+                // whose participant fields are consistent with its role
+                // (parity with the Windows P2PManager checks).
+                val call = packet.call ?: return
+                if (packet.targetId != myId) return
+                when (packet.type) {
+                    "call_offer" -> if (call.calleeId != myId) return
+                    "call_answer", "call_reject", "call_failed" ->
+                        if (call.callerId != myId) return
+                    "call_hangup" ->
+                        if (call.callerId != myId && call.calleeId != myId) return
+                }
                 callSignalListener?.invoke(packet)
             }
         }
@@ -898,33 +907,52 @@ class P2PManager(
 
     /**
      * Host-side routing for call signaling: validate the sender identity and
-     * deliver the packet either locally (the host is the peer) or to the
-     * addressed member's socket (never broadcast).
+     * the packet's targetId against the participant implied by the sender's
+     * role, then deliver the packet either locally (the host is the peer) or
+     * to the addressed member's socket (never broadcast). Parity with the
+     * Windows P2PManager._route_call_packet.
      */
     private fun routeCallPacket(packet: NetworkPacket, senderId: String) {
         val call = packet.call ?: return
+        val expectedTarget: String
         when (packet.type) {
-            "call_offer", "call_failed" -> {
+            "call_offer" -> {
                 if (call.callerId != senderId) {
-                    Log.w(TAG, "drop ${packet.type} from $senderId: callerId mismatch")
+                    Log.w(TAG, "drop call_offer from $senderId: callerId mismatch")
                     return
                 }
+                expectedTarget = call.calleeId
             }
-            "call_answer", "call_reject" -> {
+            "call_answer", "call_reject", "call_failed" -> {
                 if (call.calleeId != senderId) {
                     Log.w(TAG, "drop ${packet.type} from $senderId: calleeId mismatch")
                     return
                 }
+                expectedTarget = call.callerId
             }
             "call_hangup" -> {
                 if (call.callerId != senderId && call.calleeId != senderId) {
                     Log.w(TAG, "drop call_hangup from $senderId: not a participant")
                     return
                 }
+                expectedTarget = if (senderId == call.callerId) call.calleeId else call.callerId
             }
+            else -> return
         }
         val targetId = packet.targetId
-        if (targetId == null || targetId == myId) {
+        if (targetId != null && targetId != expectedTarget) {
+            Log.w(TAG, "drop ${packet.type}: targetId $targetId does not match expected $expectedTarget")
+            return
+        }
+        if (targetId == null) {
+            if (expectedTarget != myId) {
+                Log.w(TAG, "drop ${packet.type}: missing targetId but expected $expectedTarget is not this host")
+                return
+            }
+            callSignalListener?.invoke(packet)
+            return
+        }
+        if (targetId == myId) {
             callSignalListener?.invoke(packet)
             return
         }
