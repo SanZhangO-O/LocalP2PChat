@@ -559,9 +559,16 @@ object CallManager {
         _events.tryEmit("已挂断")
     }
 
-    fun endIfOn(identity: Any, reason: String) {
+    /**
+     * End a call when its signaling transport is no longer usable. Direct-chat
+     * sessions share one [identity], so [peerId] additionally scopes a direct
+     * session-close event to the call participant; an unrelated contact
+     * reconnecting must not tear down this call.
+     */
+    fun endIfOn(identity: Any, reason: String, peerId: String? = null) {
         synchronized(lock) {
             if (_state.value is CallState.Idle || this.identity !== identity) return
+            if (peerId != null && this.peerId != peerId) return
         }
         endCall(reason)
     }

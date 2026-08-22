@@ -894,9 +894,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
         }
-        // A dead direct session ends any call still riding it.
-        DirectChatManager.onSessionClosed = { _ ->
-            CallManager.endIfOn(DirectChatManager, "连接已断开")
+        // A dead direct session ends only a call with that same peer. The
+        // manager owns every direct contact, so another contact reconnecting
+        // must not hang up an active call.
+        DirectChatManager.onSessionClosed = { peerId ->
+            CallManager.endIfOn(DirectChatManager, "连接已断开", peerId)
         }
         // A session established by the OTHER side must be persisted too:
         // without this, messages received in a chat the local user never
