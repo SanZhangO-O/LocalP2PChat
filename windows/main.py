@@ -41,26 +41,113 @@ def _instance_name() -> str:
     return "LocalChat-" + getpass.getuser()
 
 
+def acquire_named_mutex(data_dir: str):
+    """Native named-mutex single-instance gate (second layer under QLockFile).
+
+    Creates (or detects) a Windows kernel mutex named per-user + per-data-dir,
+    so the granularity matches QLockFile: two users or two data dirs may run
+    their own instances; a second process on the SAME data dir is rejected.
+    The kernel releases the mutex automatically when the holding process dies
+    (including a hard crash or kill), so a stale lock can never block a
+    restart.
+
+    Returns a HANDLE for the process to keep alive, the string "exists" when
+    another instance already holds the lock, or None when the mutex could not
+    be created (never blocks the app on exotic environments)."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    import hashlib
+    from ctypes import wintypes
+
+    digest = hashlib.sha1(
+        os.path.normcase(os.path.abspath(data_dir)).encode("utf-8")
+    ).hexdigest()[:16]
+    user = getpass.getuser()
+    names = [f"Global\\LocalChat-{user}-{digest}",
+             f"Local\\LocalChat-{user}-{digest}"]
+    ERROR_ALREADY_EXISTS = 183
+
+    kernel32 = ctypes.windll.kernel32
+    CreateMutexW = kernel32.CreateMutexW
+    CreateMutexW.restype = wintypes.HANDLE
+    CreateMutexW.argtypes = [
+        wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR,
+    ]
+    CloseHandle = kernel32.CloseHandle
+    CloseHandle.argtypes = [wintypes.HANDLE]
+    GetLastError = kernel32.GetLastError
+
+    for name in names:
+        try:
+            handle = CreateMutexW(None, False, name)
+            if not handle:
+                continue
+            if GetLastError() == ERROR_ALREADY_EXISTS:
+                CloseHandle(handle)
+                return "exists"
+            return handle
+        except Exception:
+            continue
+    return None
+
+
+def _wake_existing_instance() -> None:
+    """A second launch on the same data dir: ask the first instance to show
+    itself (best-effort), then exit."""
+    sock = QLocalSocket()
+    sock.connectToServer(_instance_name())
+    if sock.waitForConnected(1000):
+        sock.disconnectFromServer()
+    else:
+        QMessageBox.warning(
+            None, "LocalChat", "LocalChat 已经在运行中。\n请查看系统托盘图标。"
+        )
+
+
+def release_named_mutex(handle) -> None:
+    """Release a handle from [acquire_named_mutex]. No-op on non-Windows /
+    None (a failed acquire never blocked the app, so there is nothing to
+    release)."""
+    if handle is None or os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        ctypes.windll.kernel32.CloseHandle(
+            ctypes.c_void_p(handle)
+        )
+    except Exception:
+        pass
+
+
 def acquire_single_instance(data_dir: str):
     """Single-instance gate.
 
-    Returns (lock, server) when this process is the first instance, or None
-    when another instance is already running (best-effort: asks it to bring
-    its window to the front). QLockFile is the authoritative gate — on Windows
-    it is a real OS file lock that the kernel releases automatically when the
-    holding process dies, so a crashed instance never blocks a restart.
+    Returns (lock, server, mutex) when this process is the first instance, or
+    None when another instance is already running (best-effort: asks it to
+    bring its window to the front). A native named mutex is the first check
+    (kernel object, released automatically on process death); QLockFile
+    remains the authoritative gate that the wake-up QLocalServer is tied to —
+    on Windows it is a real OS file lock that the kernel releases
+    automatically when the holding process dies, so a crashed instance never
+    blocks a restart.
     """
+    # Create the mutex exactly once: the handle is the process's hold on the
+    # kernel object (kept alive by main()'s frame). Re-acquiring here would
+    # both leak the first handle and return "exists" — the second call can
+    # never produce a fresh handle for the SAME process's own mutex.
+    mutex = acquire_named_mutex(data_dir)
+    if mutex == "exists":
+        _wake_existing_instance()
+        return None
     lock = QLockFile(os.path.join(data_dir, "localchat.lock"))
     if not lock.tryLock(100):
-        # already running: ask the first instance to show itself, then exit
-        sock = QLocalSocket()
-        sock.connectToServer(_instance_name())
-        if sock.waitForConnected(1000):
-            sock.disconnectFromServer()
-        else:
-            QMessageBox.warning(
-                None, "LocalChat", "LocalChat 已经在运行中。\n请查看系统托盘图标。"
-            )
+        # a same-data-dir instance started between the mutex check and here:
+        # this process exits right away, so give the kernel object back
+        release_named_mutex(mutex)
+        _wake_existing_instance()
         return None
 
     # best-effort channel so a second launch can wake this window; on Windows
@@ -69,7 +156,7 @@ def acquire_single_instance(data_dir: str):
     server = QLocalServer()
     QLocalServer.removeServer(_instance_name())
     server.listen(_instance_name())
-    return lock, server
+    return lock, server, mutex
 
 
 def _install_ctrl_c_handler(app, window) -> None:
@@ -135,7 +222,7 @@ def main() -> int:
     guard = acquire_single_instance(data_dir)
     if guard is None:
         return 0
-    lock, single = guard  # kept alive by main()'s frame for the whole run
+    lock, single, mutex = guard  # kept alive by main()'s frame for the whole run
 
     store = ChatStore(os.path.join(data_dir, "localchat.db"))
 

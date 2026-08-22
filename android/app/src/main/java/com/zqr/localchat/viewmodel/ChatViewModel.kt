@@ -133,6 +133,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         .map { map -> map.values.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.name }) }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
+    /** Pending contact requests (the "message box"): incoming first-contact
+     *  and re-add attempts parked for the user to accept or ignore. */
+    val directContactRequests: StateFlow<List<DirectChatManager.ContactRequest>> =
+        DirectChatManager.contactRequests
+
     /** Last message per member, for conversation previews on the home page. */
     val directLastMessages: StateFlow<Map<String, ChatMessage>> = DirectChatManager.lastMessages
 
@@ -250,13 +255,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             "ip:${parsed.host}:${parsed.port}", nick, parsed.host, parsed.port
         )
         DirectChatManager.addContact(contact)
+        // addContact keeps the REAL-id contact when this endpoint is already
+        // known (a manual placeholder must not clobber it): dial the stored
+        // contact, not the placeholder, so the session keys under the real
+        // id (Windows parity)
+        val effective = DirectChatManager.contacts.value.values.firstOrNull {
+            it.ip == parsed.host && it.port == parsed.port
+        } ?: contact
         // A manual add is an explicit user action: dial LOUD right away
         // (startChat's default). The presence sweep also picks the new
         // contact up, but it is deliberately silent — without this loud
         // dial, adding an unreachable member gives NO feedback at all.
         // Success: "已连接 X" toast; failure: the reason toast.
+        if (DirectChatManager.aliveSessions.value.contains(effective.id)) {
+            // already connected (re-adding an existing member): the dial
+            // short-circuits with no event, so surface the state here —
+            // without this, the second add silently does nothing
+            DirectChatManager.emitEvent("已连接 ${effective.name}")
+            return true
+        }
         DirectChatManager.startChat(
-            Peer(contact.id, contact.name, contact.ip, contact.port)
+            Peer(effective.id, effective.name, effective.ip, effective.port)
         ) { }
         return true
     }
@@ -268,6 +287,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         DirectChatManager.closeChat(id)
         DirectChatManager.removeContact(id)
     }
+
+    /** Accept a parked contact request: adds the member (clearing any
+     *  removal marks) and dials it back. */
+    fun acceptContactRequest(id: String) = DirectChatManager.acceptContactRequest(id)
+
+    /** Ignore a parked contact request: drops the box entry; the peer is
+     *  never auto-added, and a later retry simply re-parks it. */
+    fun ignoreContactRequest(id: String) = DirectChatManager.ignoreContactRequest(id)
 
     /** A direct chat's key moved from a "ip:..." placeholder to the real
      *  device id: swap the observer job, move persisted rows, and tell the
@@ -450,6 +477,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         runCatching {
             directContactsPrefs.edit()
                 .putString("direct_removed_marks", directJson.encodeToString(RemovedMarks(ids, endpoints)))
+                .apply()
+        }
+    }
+
+    /** The request box persisted by a previous process: unanswered requests
+     *  must still be answerable after a restart. */
+    private fun loadDirectContactRequests(): List<DirectChatManager.ContactRequest> {
+        val raw = directContactsPrefs.getString("direct_contact_requests", null)
+            ?: return emptyList()
+        return runCatching {
+            directJson.decodeFromString<List<DirectChatManager.ContactRequest>>(raw)
+        }.getOrDefault(emptyList())
+    }
+
+    private fun saveDirectContactRequests(requests: List<DirectChatManager.ContactRequest>) {
+        runCatching {
+            directContactsPrefs.edit()
+                .putString("direct_contact_requests", directJson.encodeToString(requests))
                 .apply()
         }
     }
@@ -824,6 +869,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // the user deleted (marks carry id + endpoint + removal time)
         val (removedIds, removedEndpoints) = loadDirectRemovedMarks()
         DirectChatManager.restoreRemovedMarks(removedIds, removedEndpoints)
+        // unanswered contact requests survive a restart too: they are the
+        // user's pending decisions, not transient state
+        DirectChatManager.restoreContactRequests(loadDirectContactRequests())
         DirectChatManager.configure(
             myId = ChatApp.savedDeviceId(getApplication()),
             myName = ChatApp.savedNickname(getApplication()).ifBlank { "用户" },
@@ -868,6 +916,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             DirectChatManager.contacts.collect { contacts ->
                 saveDirectContacts(contacts.values.toList())
+            }
+        }
+        viewModelScope.launch {
+            DirectChatManager.contactRequests.collect { requests ->
+                saveDirectContactRequests(requests)
             }
         }
 

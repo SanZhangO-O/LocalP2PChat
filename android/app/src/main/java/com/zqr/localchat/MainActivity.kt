@@ -196,6 +196,7 @@ fun LocalChatApp(viewModel: ChatViewModel = viewModel()) {
     val directContacts by viewModel.directContacts.collectAsState()
     val directLastMessages by viewModel.directLastMessages.collectAsState()
     val directAliveSessions by viewModel.directAliveSessions.collectAsState()
+    val directContactRequests by viewModel.directContactRequests.collectAsState()
 
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(lifecycleOwner) {
@@ -364,6 +365,7 @@ fun LocalChatApp(viewModel: ChatViewModel = viewModel()) {
         Screen.MemberList -> {
             MemberListScreen(
                 contacts = directContacts,
+                requests = directContactRequests,
                 lastMessages = directLastMessages,
                 onOpenGroups = { currentScreenName = Screen.GroupList.name },
                 onOpenSettings = {
@@ -383,7 +385,9 @@ fun LocalChatApp(viewModel: ChatViewModel = viewModel()) {
                     }
                 },
                 onAddContact = viewModel::addDirectContact,
-                onRemoveContact = viewModel::removeDirectContact
+                onRemoveContact = viewModel::removeDirectContact,
+                onAcceptRequest = viewModel::acceptContactRequest,
+                onIgnoreRequest = viewModel::ignoreContactRequest
             )
         }
         Screen.DirectChat -> {

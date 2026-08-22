@@ -36,8 +36,11 @@ import kotlin.concurrent.thread
 /**
  * Direct member-to-member chat: the management unit is the member, not the
  * group. Picking a member immediately pulls up a 1:1 chat over a direct TCP
- * connection; the other side auto-accepts (no confirmation) as long as the
- * app is running and listening on the program-wide port.
+ * connection; a KNOWN member (by device id or endpoint) is auto-accepted as
+ * long as the app is running and listening on the program-wide port. A FIRST
+ * CONTACT is never silently dropped OR silently accepted: the request lands
+ * in the contact-request message box ([contactRequests]) for the user to
+ * accept or ignore, and the dialer is told so via "direct_pending".
  *
  * Handshake (see SecureWire.kt): the connection starts with an identity
  * handshake — ephemeral ECDH signed by both devices' long-term identity
@@ -152,6 +155,7 @@ object DirectChatManager {
     /** Wakes the presence loop between sweeps (announce events coalesce). */
     private val presenceWake = Semaphore(1)
     private val presenceGuard = Any()
+    @Volatile
     private var presenceStarted = false
 
     /** Contacts a presence dial is currently in flight for (dedupes sweeps
@@ -181,6 +185,32 @@ object DirectChatManager {
      *  thread. */
     @Volatile
     var onRemovedMarksChanged: (() -> Unit)? = null
+
+    // --------------------------------------------------------- request box
+
+    /** An incoming contact request parked for the user to accept or ignore.
+     *  [fromRemoved] marks a request from a member the local user removed
+     *  (its re-add attempts must stay visible too — nothing is dropped
+     *  silently). */
+    @Serializable
+    data class ContactRequest(
+        val id: String,
+        val name: String,
+        val ip: String,
+        val port: Int,
+        val fromRemoved: Boolean = false,
+        val timestamp: Long = 0L
+    )
+
+    /** Box capacity: a LAN scanner hammering the port must not be able to
+     *  grow the box without bound. Oldest entries fall off. */
+    private const val REQUEST_BOX_MAX = 50
+
+    private val _contactRequests = MutableStateFlow<List<ContactRequest>>(emptyList())
+
+    /** Pending contact requests, newest last. The ViewModel persists this
+     *  list; the member page renders it as the request message box. */
+    val contactRequests: StateFlow<List<ContactRequest>> = _contactRequests.asStateFlow()
 
     /** Outbound file servers keyed by fileId; each offers one file until its
      *  accept loop ends (timeout, socket close or explicit removal). */
@@ -227,6 +257,12 @@ object DirectChatManager {
     private val _events = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val events: SharedFlow<String> = _events.asSharedFlow()
 
+    /** Emit a transient user-facing event (toast). Used by the ViewModel
+     *  for surface-level confirmations (e.g. "已连接 X" on a re-add). */
+    fun emitEvent(text: String) {
+        _events.tryEmit(text)
+    }
+
     @Volatile
     private var myId = ""
     @Volatile
@@ -248,6 +284,35 @@ object DirectChatManager {
         // identity + saved contacts ready: the app is ONLINE the moment it
         // starts, so announce to every saved contact right away
         announceOnline()
+    }
+
+    /** TEST-ONLY: wipe all in-memory state. The JVM unit tests share this
+     *  singleton process, so each test must start from a clean slate. */
+    fun resetForTest() {
+        myId = ""; myName = ""; myIp = ""; myPort = 0
+        _contacts.value = emptyMap()
+        _contactRequests.value = emptyList()
+        _aliveSessions.value = emptySet()
+        _lastMessages.value = emptyMap()
+        removedIds.clear()
+        removedEndpoints.clear()
+        removedEndpointById.clear()
+        chatEndpoints.clear()
+        outbox.clear()
+        redialLoops.clear()
+        messageStates.clear()
+        fileServers.values.forEach { runCatching { it.close() } }
+        fileServers.clear()
+        sessions.values.forEach { runCatching { closeSocket(it.socket) } }
+        sessions.clear()
+        presenceDialing.clear()
+        // stop a lingering presence loop (it re-checks the flag every sweep)
+        // and drain wake permits so the next test's announce starts fresh
+        synchronized(presenceGuard) {
+            presenceStarted = false
+        }
+        while (presenceWake.tryAcquire()) {
+        }
     }
 
     /** Local device id (set by [configure]); used by call signaling. */
@@ -304,10 +369,19 @@ object DirectChatManager {
         unmark(contact.id, contact.ip.takeIf { it.isNotBlank() }?.let { "$it:${contact.port}" })
         _contacts.update { map ->
             // dedupe by endpoint: a manually added placeholder (id from ip)
-            // is replaced by the real contact once a handshake reveals the id
+            // is replaced by the real contact once a handshake reveals the
+            // id. The reverse must NOT happen: a manual "ip:..." add of an
+            // endpoint already known under its REAL device id keeps the real
+            // contact — clobbering it would orphan the chat history keyed by
+            // the real id ("re-adding my contact by IP wiped it").
             var next = map
             for (old in map.values) {
                 if (old.ip == contact.ip && old.port == contact.port && old.id != contact.id) {
+                    if (contact.id.startsWith("ip:") && !old.id.startsWith("ip:")) {
+                        // keep the known real contact; the re-add already
+                        // cleared the removal marks above
+                        return@update map
+                    }
                     next = next - old.id
                 }
             }
@@ -374,6 +448,77 @@ object DirectChatManager {
             if (removedEndpoints[ep]?.let { now - it < REMOVED_MARK_TTL_MS } == true) return true
         }
         return false
+    }
+
+    /** Park an incoming request in the message box. Deduped by device id AND
+     *  by endpoint (a placeholder-era peer re-requesting from a new address
+     *  must not stack two rows); only a NEW entry raises the user-facing
+     *  event, so a peer's presence sweep re-dialing every minute cannot
+     *  toast in a loop. */
+    fun recordContactRequest(peer: Peer, fromRemoved: Boolean) {
+        val entry = ContactRequest(
+            id = peer.id,
+            name = peer.name,
+            ip = peer.ipAddress,
+            port = peer.port,
+            fromRemoved = fromRemoved,
+            timestamp = System.currentTimeMillis()
+        )
+        fun sameBoxSlot(other: ContactRequest) =
+            other.id == entry.id || (other.ip == entry.ip && other.port == entry.port)
+        // CAS loop: the "is this NEW?" decision must be atomic with the box
+        // update (two concurrent identical dials could otherwise both pass
+        // the check and double-toast; the box itself would stay sane).
+        while (true) {
+            val current = _contactRequests.value
+            val isNew = current.none(::sameBoxSlot)
+            val next = (current.filterNot(::sameBoxSlot) + entry).takeLast(REQUEST_BOX_MAX)
+            if (_contactRequests.compareAndSet(current, next)) {
+                if (isNew) {
+                    val suffix = if (fromRemoved) "（已移除的成员）" else ""
+                    _events.tryEmit("${peer.name} 请求添加你为成员$suffix")
+                }
+                return
+            }
+        }
+    }
+
+    /** The user accepted a request: add the member (clearing any removal
+     *  marks — acceptance is the explicit un-block) and announce right away;
+     *  the presence sweep dials the fresh contact immediately (quiet). A
+     *  failed dial just means the peer went offline — the sweep retries and
+     *  both outboxes flush on the next session. */
+    fun acceptContactRequest(requestId: String) {
+        val req = _contactRequests.value.firstOrNull { it.id == requestId } ?: return
+        _contactRequests.update { list -> list.filterNot { it.id == requestId } }
+        addContact(Contact(req.id, req.name, req.ip, req.port))
+        _events.tryEmit("已添加 ${req.name}")
+        announceOnline()
+    }
+
+    /** The user ignored a request: drop the entry. The peer is never
+     *  auto-added, so no removal mark is needed; if it insists, its next
+     *  dial simply re-parks the (single, deduped) entry. */
+    fun ignoreContactRequest(requestId: String) {
+        _contactRequests.update { list -> list.filterNot { it.id == requestId } }
+    }
+
+    /** Restore the request box persisted by a previous process (startup).
+     *  Deduped by id AND endpoint — the same slot semantics the live box
+     *  uses — against BOTH the live rows and the saved list, so a stale
+     *  saved row cannot sit beside its live replacement. */
+    fun restoreContactRequests(saved: List<ContactRequest>) {
+        if (saved.isEmpty()) return
+        _contactRequests.update { list ->
+            val live = list
+            var kept = emptyList<ContactRequest>()
+            for (r in saved) {
+                val taken = live.any { it.id == r.id || (it.ip == r.ip && it.port == r.port) } ||
+                    kept.any { it.id == r.id || (it.ip == r.ip && it.port == r.port) }
+                if (!taken) kept = kept + r
+            }
+            (live + kept).takeLast(REQUEST_BOX_MAX)
+        }
     }
 
     // -------------------------------------------------------------- messages
@@ -478,6 +623,16 @@ object DirectChatManager {
             )
             wire.sendPacket(NetworkPacket(type = Protocol.DIRECT_HELLO, peer = myPeer()))
             val ack = wire.recvPacket() ?: throw IllegalStateException("no direct_ack")
+            if (ack.type == Protocol.DIRECT_PENDING) {
+                // The peer parked our request in its message box: this is
+                // NOT a failure. Tell the user (loud dials) their request
+                // awaits confirmation instead of a refused/unreachable
+                // reason; the session comes up when they accept.
+                if (!quiet) {
+                    _events.tryEmit("已向 ${peer.name} 发送连接请求，等待对方在其设备上确认")
+                }
+                return null // finally closes the socket
+            }
             if (ack.type != Protocol.DIRECT_ACK || ack.peer == null) {
                 throw IllegalStateException("bad direct_ack")
             }
@@ -528,9 +683,14 @@ object DirectChatManager {
         }
     }
 
-    /** Listener side: a secured direct_hello arrived on the shared port —
-     *  auto-accept, no confirmation needed (the handshake already
-     *  authenticated the dialer's identity key). */
+    /** Listener side: a secured direct_hello arrived on the shared port.
+     *  A KNOWN member (device id or endpoint) is auto-accepted — the
+     *  handshake already authenticated the dialer's identity key. A FIRST
+     *  CONTACT (unknown id AND endpoint) or a member the local user REMOVED
+     *  is never silently dropped: the request is parked in the message box
+     *  ([contactRequests]) for the user to accept or ignore, and the dialer
+     *  is told via "direct_pending" so its side shows "waiting for
+     *  confirmation" instead of a failure. */
     fun handleDirectHello(socket: Socket, wire: Wire, hello: NetworkPacket, peerIdent: String?) {
         val peer = hello.peer
         if (peer == null || peer.id == myId) {
@@ -538,9 +698,16 @@ object DirectChatManager {
             return
         }
 
-        // A contact the local user REMOVED must not be resurrected by the
-        // peer's presence redial (peers announce forever now): silently drop.
-        if (isRemoved(peer)) {
+        // First contact / removed member -> the request box. Nothing here is
+        // dropped silently: the box entry is visible (deduped, one row per
+        // peer, one event per NEW entry) and the dialer gets a definitive
+        // "pending" answer instead of a hung-up connection.
+        val removed = isRemoved(peer)
+        val known = _contacts.value.containsKey(peer.id) ||
+            _contacts.value.any { (_, c) -> c.ip == peer.ipAddress && c.port == peer.port }
+        if (removed || !known) {
+            recordContactRequest(peer, fromRemoved = removed)
+            runCatching { wire.sendPacket(NetworkPacket(type = Protocol.DIRECT_PENDING)) }
             closeSocket(socket)
             return
         }
@@ -721,6 +888,7 @@ object DirectChatManager {
 
     private fun presenceLoop() {
         while (true) {
+            if (!presenceStarted) return  // resetForTest stopped the loop
             try {
                 dialDeadContacts()
             } catch (e: Exception) {
@@ -831,6 +999,14 @@ object DirectChatManager {
             mergeChatState(alias, realId)
             chatEndpoints.remove(alias)
             onChatMigrated?.invoke(alias, realId)
+        }
+        // The endpoint now belongs to [realId]: drop a manually added
+        // "ip:<endpoint>" placeholder CONTACT for it. addContact's dedupe
+        // cannot do this when the peer advertises a DIFFERENT local IP
+        // (multi-homed / DHCP churn) — the placeholder then survived every
+        // handshake as a duplicate member row that dialed forever.
+        if (_contacts.value.containsKey("ip:$endpoint")) {
+            _contacts.update { it - "ip:$endpoint" }
         }
     }
 

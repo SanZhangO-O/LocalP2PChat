@@ -42,6 +42,13 @@ app = QApplication([])
 from localchat.call import CallManager, STATE_ACTIVE, STATE_IDLE, STATE_INCOMING
 from localchat.network import P2PListener, P2PManager
 
+# the production app loads the device identity in the ViewModel; without it the
+# media identity handshake is rejected with "对方身份无效" before the call
+# can activate
+import tempfile
+from localchat.securewire import DeviceIdentity
+DeviceIdentity.ensure_loaded(tempfile.mkdtemp())
+
 class L(P2PListener):
     pass
 
@@ -114,6 +121,10 @@ from PyQt6.QtWidgets import QApplication
 app = QApplication([])
 from localchat.call import CallManager, CH_AUDIO, STATE_ACTIVE, STATE_IDLE
 from localchat.network import P2PListener, P2PManager
+
+import tempfile
+from localchat.securewire import DeviceIdentity
+DeviceIdentity.ensure_loaded(tempfile.mkdtemp())
 
 class L(P2PListener):
     pass

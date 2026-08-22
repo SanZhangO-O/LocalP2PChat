@@ -84,6 +84,11 @@ class Protocol:
     DIRECT_HELLO = "direct_hello"
     DIRECT_ACK = "direct_ack"
 
+    # The listener parked the dialer's request in its contact-request
+    # message box instead of accepting: the dialer surfaces "waiting for
+    # confirmation" instead of a failure.
+    DIRECT_PENDING = "direct_pending"
+
 
 INFO_SESSION = b"localchat-session-v1"
 INFO_DIRECT = b"lc-direct-v1"

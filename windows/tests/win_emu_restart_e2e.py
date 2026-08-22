@@ -23,6 +23,9 @@ from PyQt6.QtWidgets import QApplication
 
 from localchat.storage import ChatStore
 from localchat.view_model import ChatViewModel
+from win_emu_e2e import (  # reuse the adb/UI helpers from the engine E2E
+    adb_ok, launch_app, tap_node_wait, wait_listener,
+)
 
 HOST_FWD_PORT = int(os.environ.get("HOST_FWD_PORT", "10099"))
 WIN_PORT = 9999
@@ -46,6 +49,12 @@ def make_vm(store, data_dir, app):
 
 
 def main() -> int:
+    # deterministic baseline on the emulator: fresh app data, app up
+    adb_ok("shell", "pm", "clear", "com.zqr.localchat")
+    launch_app()
+    if not wait_listener(30):
+        print("WARN: guest listener not confirmed, continuing", flush=True)
+
     tmp = os.path.join(tempfile.gettempdir(), "lc_win_emu_restart")
     os.makedirs(tmp, exist_ok=True)
     db = os.path.join(tmp, "a.db")
@@ -68,8 +77,12 @@ def main() -> int:
     print("win id:", vm1.direct.my_id_value, flush=True)
     ok = vm1.add_direct_contact(f"127.0.0.1:{HOST_FWD_PORT}", EMU_NICK)
     print("add ->", ok, flush=True)
+    # the Android side parks the first-contact request in its message box:
+    # accept it on the emulator so the handshake can complete
+    print("accepting the request in the emulator's request box", flush=True)
+    tap_node_wait(text="接受", timeout=30)
     real = None
-    deadline = time.time() + 60
+    deadline = time.time() + 120
     while time.time() < deadline:
         pump(app, 0.2)
         real = next((c.id for c in vm1.direct_contacts_list()
@@ -100,6 +113,13 @@ def main() -> int:
         raise RuntimeError("no contacts restored after restart")
     if not any(c.id == real for c in contacts):
         raise RuntimeError("real-id contact not persisted")
+    # presence re-dial direction is deterministic (the smaller device id
+    # dials) and the host cannot reach the emulator's advertised 10.0.2.15;
+    # nudge the session over the adb-forwarded loopback like a user
+    # reopening the chat would (dial is unconditional, presence keeps
+    # repairing afterwards on its own schedule)
+    from localchat.models import Peer
+    vm2.direct.start_chat(Peer(real, "EmuPhone", "127.0.0.1", HOST_FWD_PORT), quiet=True)
     # presence announce should re-establish without opening any chat
     alive = False
     deadline = time.time() + 90

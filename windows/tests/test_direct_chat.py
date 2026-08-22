@@ -74,6 +74,11 @@ class DirectChatTest(unittest.TestCase):
         self.a = DirectChatManager()
         self.a.attach(self.rec_a)
         self.a.configure("dev-A", "\u5c0fA", "127.0.0.1", self.PORT)  # 小A
+        # The receiving side (B) already knows A BY ITS ADVERTISED identity
+        # (a saved contact / previous acceptance): a FIRST contact would be
+        # parked in B's request box instead of auto-accepted, and these tests
+        # exercise the established-session flows, not the request box.
+        self.b.add_contact(self.a.my_peer())
 
     def tearDown(self):
         self.a.shutdown()

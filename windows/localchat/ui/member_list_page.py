@@ -21,10 +21,58 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..models import Peer
+from ..models import ContactRequest, Peer
 from ..view_model import ChatViewModel
 from .theme import ERROR, PRIMARY, TEXT_SUBTLE
 from .widgets import AvatarLabel, Toast, format_message_time
+
+
+class RequestCard(QFrame):
+    """A parked contact request: who wants in, with accept / ignore buttons."""
+
+    def __init__(self, request: ContactRequest, on_accept=None, on_ignore=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("card")
+        self.setStyleSheet(
+            "#card { background-color: rgba(103, 80, 164, 0.14); "
+            "border: 1px solid rgba(103, 80, 164, 0.35); }"
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 10)
+        layout.setSpacing(8)
+
+        top = QHBoxLayout()
+        top.setSpacing(12)
+        top.addWidget(AvatarLabel(request.name, 42, 16))
+        info = QVBoxLayout()
+        info.setSpacing(1)
+        name_label = QLabel(request.name)
+        name_label.setStyleSheet("font-size: 15px; font-weight: 600; color: #1C1B1F;")
+        info.addWidget(name_label)
+        ip_label = QLabel(f"{request.ip}:{request.port}")
+        ip_label.setObjectName("faint")
+        info.addWidget(ip_label)
+        hint = QLabel(
+            "已移除的成员请求重新添加" if request.from_removed else "请求添加你为成员"
+        )
+        hint.setStyleSheet(f"font-size: 12px; color: {ERROR};")
+        info.addWidget(hint)
+        top.addLayout(info, 1)
+        layout.addLayout(top)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        ignore_btn = QPushButton("忽略")
+        ignore_btn.setObjectName("ghost")
+        ignore_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ignore_btn.clicked.connect(on_ignore)
+        buttons.addWidget(ignore_btn)
+        accept_btn = QPushButton("接受")
+        accept_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        accept_btn.clicked.connect(on_accept)
+        buttons.addWidget(accept_btn)
+        layout.addLayout(buttons)
 
 
 class ContactRow(QFrame):
@@ -126,6 +174,7 @@ class MemberListPage(QWidget):
 
         self.vm.direct_contacts_signal.connect(self.refresh)
         self.vm.direct_messages_signal.connect(self._on_direct_messages_changed)
+        self.vm.direct_requests_signal.connect(self.refresh)
         self.refresh()
 
     def _on_direct_messages_changed(self, peer_id: str):
@@ -133,12 +182,46 @@ class MemberListPage(QWidget):
         self.refresh()
 
     def refresh(self):
+        requests = self.vm.direct_requests_list()
         contacts = self.vm.direct_contacts_list()
         self.list.clear()
-        self.list.setVisible(bool(contacts))
-        self.empty_label.setVisible(not contacts)
-        if not contacts:
-            return
+        empty = not requests and not contacts
+        self.list.setVisible(not empty)
+        self.empty_label.setVisible(empty)
+        if requests:
+            header = QLabel("联系人请求（{}）\n等待你确认的添加请求".format(len(requests)))
+            header.setObjectName("faint")
+            header.setStyleSheet(
+                f"font-size: 13px; font-weight: 600; color: {PRIMARY}; "
+                "padding: 4px 2px 2px 2px;"
+            )
+            head_item = QListWidgetItem()
+            head_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            head_item.setSizeHint(header.sizeHint())
+            self.list.addItem(head_item)
+            self.list.setItemWidget(head_item, header)
+            for request in requests:
+                item = QListWidgetItem()
+                card = RequestCard(
+                    request,
+                    on_accept=lambda rid=request.id: self.vm.accept_contact_request(rid),
+                    on_ignore=lambda rid=request.id: self.vm.ignore_contact_request(rid),
+                )
+                item.setSizeHint(card.sizeHint())
+                self.list.addItem(item)
+                self.list.setItemWidget(item, card)
+        if contacts:
+            header = QLabel("成员")
+            header.setObjectName("faint")
+            header.setStyleSheet(
+                f"font-size: 13px; font-weight: 600; color: {TEXT_SUBTLE}; "
+                f"padding: {'12px 2px 2px 2px' if requests else '4px 2px 2px 2px'};"
+            )
+            head_item = QListWidgetItem()
+            head_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            head_item.setSizeHint(header.sizeHint())
+            self.list.addItem(head_item)
+            self.list.setItemWidget(head_item, header)
         for contact in contacts:
             item = QListWidgetItem()
             row = ContactRow(

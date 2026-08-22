@@ -66,6 +66,11 @@ object Protocol {
     /** Direct chats / call media: the inner packet identifying the dialer. */
     const val DIRECT_HELLO = "direct_hello"
     const val DIRECT_ACK = "direct_ack"
+
+    /** The listener parked the dialer's request in its contact-request
+     *  message box instead of accepting: the dialer surfaces "waiting for
+     *  confirmation" instead of a failure. */
+    const val DIRECT_PENDING = "direct_pending"
 }
 
 class WireException(message: String, cause: Throwable? = null) : Exception(message, cause)

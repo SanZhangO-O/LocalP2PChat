@@ -24,13 +24,20 @@ pure-ASCII on disk but produces the correct text at runtime.
 import os
 import socket
 import sys
+import threading
 import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from localchat.models import Peer
-from localchat.network import DirectChatManager, HostGroupServer
+from localchat.models import ContactRequest, Peer, NetworkPacket
+from localchat.network import (
+    DirectChatManager,
+    HostGroupServer,
+    _read_line_bounded,
+    make_wire,
+)
+from localchat.securewire import Handshake, Protocol
 from tests.fake_peer import install_identity
 
 A_ID = "zzz-A"  # larger id: never dials, only accepts
@@ -83,8 +90,14 @@ class DirectPresenceTest(unittest.TestCase):
 
     def test_announce_establishes_session_without_chat(self):
         """No chat is ever opened: once B (the dialer) knows A, the presence
-        sweep alone must bring up a live session BOTH ways."""
+        sweep alone must bring up a live session BOTH ways. A knows B too
+        (both sides have each other as members — a first contact is parked in
+        the request box, not accepted)."""
         self.b.add_contact(self.peer_a)
+        # A already knows B BY ITS ADVERTISED identity (a group sync / manual add
+        # stores the LAN address): a loopback-stored contact would trip the
+        # first-contact address binding and be refused
+        self.a.add_contact(self.b.my_peer())
         self.assertTrue(
             wait_until(lambda: self.b.is_chat_alive(A_ID)),
             "B must see A online via presence alone",
@@ -106,6 +119,10 @@ class DirectPresenceTest(unittest.TestCase):
         (B re-dials within one sweep), so the assertion is session
         REPLACEMENT, not an observable offline gap."""
         self.b.add_contact(self.peer_a)
+        # A already knows B BY ITS ADVERTISED identity (a group sync / manual add
+        # stores the LAN address): a loopback-stored contact would trip the
+        # first-contact address binding and be refused
+        self.a.add_contact(self.b.my_peer())
         self.assertTrue(wait_until(lambda: self.b.is_chat_alive(A_ID)))
         self.assertTrue(wait_until(lambda: self.a.is_chat_alive(B_ID)))
         with self.b._lock:
@@ -145,7 +162,10 @@ class DirectPresenceTest(unittest.TestCase):
         self.a.REDIAL_LIFETIME = 0.4
         # B's app is "not running": its shared listener drops direct hellos
         self.server_b.direct_manager = None
-        self.a.add_contact(self.peer_b)
+        # A already knows B BY ITS ADVERTISED identity (a group sync / manual add
+        # stores the LAN address): a loopback-stored contact would trip the
+        # first-contact address binding and be refused
+        self.a.add_contact(self.b.my_peer())
         self.assertTrue(
             self.a.send_message(B_ID, "\u665a\u5230\u7684\u95ee\u5019")  # 晚到的问候
         )
@@ -180,8 +200,15 @@ class DirectPresenceTest(unittest.TestCase):
 
     def test_removed_contact_not_resurrected_by_announce(self):
         """A removes B; B (the dialer) keeps announcing forever. The announce
-        must NOT resurrect B in A's contact list nor open a session."""
+        must NOT resurrect B in A's contact list nor open a session — the
+        dial lands in A's contact-request box (flagged as re-adding a
+        REMOVED member), never silently resurrected and never silently
+        dropped."""
         self.b.add_contact(self.peer_a)
+        # A already knows B BY ITS ADVERTISED identity (a group sync / manual add
+        # stores the LAN address): a loopback-stored contact would trip the
+        # first-contact address binding and be refused
+        self.a.add_contact(self.b.my_peer())
         self.assertTrue(wait_until(lambda: self.a.is_chat_alive(B_ID)))
 
         # the real removal flow: close the session, then drop the contact
@@ -199,6 +226,13 @@ class DirectPresenceTest(unittest.TestCase):
             self.a.is_chat_alive(B_ID),
             "no session may exist for a removed contact",
         )
+        self.assertTrue(
+            any(
+                r.id == B_ID and r.from_removed
+                for r in self.a.contact_requests()
+            ),
+            "the removed member's dial must be parked in the request box",
+        )
 
     def test_readding_contact_accepts_announce_again(self):
         """Re-adding clears the removal mark: B's very next announce must
@@ -207,6 +241,10 @@ class DirectPresenceTest(unittest.TestCase):
         removal recorded that, DHCP churn changes it again) — the id->endpoint
         link must clear BOTH marks, else B's announces stay blocked."""
         self.b.add_contact(self.peer_a)
+        # A already knows B BY ITS ADVERTISED identity (a group sync / manual add
+        # stores the LAN address): a loopback-stored contact would trip the
+        # first-contact address binding and be refused
+        self.a.add_contact(self.b.my_peer())
         self.assertTrue(wait_until(lambda: self.a.is_chat_alive(B_ID)))
         with self.a._lock:
             marked_endpoint = self.a._removed_id_endpoint.get(B_ID, "")
@@ -226,6 +264,101 @@ class DirectPresenceTest(unittest.TestCase):
         )
         self.assertTrue(wait_until(lambda: self.b.is_chat_alive(A_ID)))
 
+    def test_manual_placeholder_readd_keeps_real_contact(self):
+        """Regression: a manual "ip:..." add of an endpoint already known
+        under its REAL device id must keep the real contact. The endpoint
+        dedupe used to let the placeholder clobber the real one, orphaning
+        the chat history keyed by the real id; with the peer offline nothing
+        ever migrated it back."""
+        # real contact known, session up (A knows B too: both sides recognize
+        # each other, so the re-add tests the contact-record dedupe only)
+        self.b.add_contact(self.peer_a)
+        # A already knows B BY ITS ADVERTISED identity (a group sync / manual add
+        # stores the LAN address): a loopback-stored contact would trip the
+        # first-contact address binding and be refused
+        self.a.add_contact(self.b.my_peer())
+        self.assertTrue(wait_until(lambda: self.b.is_chat_alive(A_ID)))
+
+        # manual re-add by IP of the endpoint AS STORED (the handshake may
+        # have re-pointed it at the peer's advertised address): must be a
+        # no-op on the contact record — real survives, no placeholder row
+        stored = next(c for c in self.b.contacts_list() if c.id == A_ID)
+        endpoint = f"{stored.ip_address}:{stored.port}"
+        self.b.add_contact(Peer(f"ip:{endpoint}", "manual",
+                                stored.ip_address, stored.port))
+        ids = [c.id for c in self.b.contacts_list()]
+        self.assertEqual(ids, [A_ID], "real contact must survive the re-add")
+        self.assertTrue(self.b.is_chat_alive(A_ID), "session untouched")
+
+    def test_placeholder_at_dialed_endpoint_merges_into_real(self):
+        """Regression (duplicate member rows): a peer's ADVERTISED address
+        may differ from the address the user typed (multi-homed / DHCP
+        churn). The manual "ip:..." placeholder then landed BESIDE the known
+        real contact and survived every handshake — a duplicate row dialing
+        forever, splitting the chat identity. Once the placeholder's dial
+        completes the handshake, the placeholder row must MERGE into the
+        real contact (single row, session keyed under the real id)."""
+        # B knows A's real id; the session re-points the stored contact at
+        # A's ADVERTISED address (the machine's LAN IP, not 127.0.0.1).
+        # A knows B too, so the merged dial is accepted on A.
+        self.b.add_contact(self.peer_a)
+        # A already knows B BY ITS ADVERTISED identity (a group sync / manual add
+        # stores the LAN address): a loopback-stored contact would trip the
+        # first-contact address binding and be refused
+        self.a.add_contact(self.b.my_peer())
+        self.assertTrue(wait_until(lambda: self.b.is_chat_alive(A_ID)))
+        stored = next(c for c in self.b.contacts_list() if c.id == A_ID)
+        self.assertNotEqual(
+            stored.ip_address,
+            "127.0.0.1",
+            "test setup: advertised address must differ from the dial address",
+        )
+
+        # manual add of the peer's OTHER address (loopback): placeholder row
+        # appears next to the real one and the sweep dials it
+        placeholder_id = f"ip:127.0.0.1:{self.PORT_A}"
+        self.b.add_contact(Peer(placeholder_id, "manual", "127.0.0.1", self.PORT_A))
+        self.assertIn(placeholder_id, [c.id for c in self.b.contacts_list()])
+
+        # the handshake reveals the real id: the placeholder row must merge
+        # away — exactly one row left, keyed under the real id
+        self.assertTrue(
+            wait_until(
+                lambda: placeholder_id
+                not in [c.id for c in self.b.contacts_list()]
+            ),
+            "the placeholder row must merge into the real contact",
+        )
+        self.assertEqual([c.id for c in self.b.contacts_list()], [A_ID])
+        self.assertTrue(self.b.is_chat_alive(A_ID), "session alive under real id")
+
+    def test_handshake_revealed_contact_replaces_placeholder(self):
+        """The legitimate placeholder replacement: B first knows A only as a
+        manually added "ip:..." placeholder; once a handshake reveals the
+        real id, the real contact replaces the placeholder (original dedupe
+        intent — must keep working after the re-add fix)."""
+        placeholder = Peer(
+            f"ip:127.0.0.1:{self.PORT_A}", "manual", "127.0.0.1", self.PORT_A
+        )
+        self.b.add_contact(placeholder)
+        # A recognizes B (the real id appears in the hello's peer field, and
+        # A knows that member): the placeholder dial is accepted on A and the
+        # handshake merges it into the real contact on B.
+        # A already knows B BY ITS ADVERTISED identity (a group sync / manual add
+        # stores the LAN address): a loopback-stored contact would trip the
+        # first-contact address binding and be refused
+        self.a.add_contact(self.b.my_peer())
+        self.assertTrue(
+            wait_until(lambda: self.b.is_chat_alive(A_ID)),
+            "placeholder dials and the handshake must establish the session",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: [c.id for c in self.b.contacts_list()] == [A_ID]
+            ),
+            "placeholder replaced by the real id",
+        )
+
     def test_concurrent_dials_serialize_to_one_session(self):
         """Regression (mismatched session pairs): an explicit dial racing the
         presence sweep used to establish TWO sessions whose "replace the old
@@ -238,6 +371,10 @@ class DirectPresenceTest(unittest.TestCase):
         import threading
 
         self.b.add_contact(self.peer_a)  # B's presence sweep starts dialing
+        # A already knows B BY ITS ADVERTISED identity (a group sync / manual add
+        # stores the LAN address): a loopback-stored contact would trip the
+        # first-contact address binding and be refused
+        self.a.add_contact(self.b.my_peer())  # A knows B: the dials are accepted
         # hammer concurrent explicit dials on top of the presence dial
         results = []
 
@@ -295,12 +432,16 @@ class DirectPresenceTest(unittest.TestCase):
         _, reason = failures[0]
         self.assertIn("被拒绝", reason, f"reason should explain refusal: {reason}")
 
-    def test_manual_add_loud_when_peer_drops_hello(self):
-        """The nastiest silent case: the peer IS running (handshake succeeds)
-        but drops the hello because the local user is on ITS removal list.
-        The loud dial must surface a reason that mentions removal — before,
-        this mapped to a misleading '网络不可达' or vanished silently."""
+    def test_removed_members_dial_parks_in_request_box(self):
+        """A is on B's removal list (B removed A as an "ip:..." placeholder
+        whose real id was never learned). A dials B: the request must NOT be
+        silently dropped and must NOT be silently accepted — it lands in B's
+        contact-request box flagged from_removed, and A is told "等待对方确认"
+        (an EVENT, not a connect failure)."""
         failures = []
+        events = []
+        self.b._mark_removed(A_ID, f"127.0.0.1:{self.PORT_A}")
+        self.a.on_event = events.append
 
         from localchat.network import DirectChatListener
 
@@ -308,20 +449,135 @@ class DirectPresenceTest(unittest.TestCase):
             def direct_connect_failed(self, peer, reason):
                 failures.append(reason)
 
-        # B marks A's endpoint as removed BEFORE any contact exists between
-        # the two (A's id was never learned on B, e.g. A was removed as an
-        # "ip:..." placeholder)
-        self.b._mark_removed(A_ID, f"127.0.0.1:{self.PORT_A}")
         self.a.attach(Rec())
         result = self.a.start_chat(self.peer_b, quiet=False)
-        self.assertIsNone(result, "a dropped hello must fail the dial")
+        self.assertIsNone(result, "a parked request is not a session")
+        self.assertFalse(failures, "parked must not surface as a failure")
         self.assertTrue(
-            wait_until(lambda: len(failures) == 1), "the drop must be surfaced"
+            wait_until(
+                lambda: any(
+                    r.id == A_ID and r.from_removed
+                    for r in self.b.contact_requests()
+                )
+            ),
+            "the removed member's dial must park in B's request box",
         )
-        self.assertIn(
-            "\u88ab\u5bf9\u65b9\u79fb\u9664",  # 被对方移除
-            failures[0],
-            f"reason should mention removal: {failures[0]!r}",
+        self.assertTrue(
+            wait_until(lambda: any("\u7b49\u5f85\u5bf9\u65b9" in e for e in events)),
+            f"dialer must surface the waiting event: {events}",
+        )
+
+    def test_first_contact_parks_and_accept_connects(self):
+        """Full first-contact flow over a real network: B dials A whom A has
+        never met — no session, the request parks in A's box, B is told
+        "等待对方确认". When A ACCEPTS, the member is added (no removal marks
+        anywhere) and B's presence sweep re-dials into a live session; a
+        message A queued meanwhile flushes over it (both outboxes work)."""
+        self.b.add_contact(self.peer_a)
+        # B's own presence sweep keeps re-dialing A in parallel (quiet): the
+        # box dedupes those dials, so they neither stack rows nor re-toast.
+
+        self.assertFalse(
+            any(r.id == B_ID for r in self.a.contact_requests()),
+            "box starts empty",
+        )
+        failures = []
+        from localchat.network import DirectChatListener
+
+        class Rec(DirectChatListener):
+            def direct_connect_failed(self, peer, reason):
+                failures.append(reason)
+
+        self.a.attach(Rec())
+        result = self.b.start_chat(self.peer_a, quiet=False)
+        self.assertIsNone(result, "first contact must not open a session")
+        self.assertFalse(self.b.is_chat_alive(A_ID))
+        self.assertFalse(failures, "pending must not surface as a failure")
+        self.assertTrue(
+            wait_until(lambda: any(r.id == B_ID for r in self.a.contact_requests())),
+            "the first contact must park in A's request box",
+        )
+        req = next(
+            r for r in self.a.contact_requests() if r.id == B_ID
+        )
+        self.assertFalse(req.from_removed, "first contact is not a re-add")
+        self.assertEqual(req.name, NAME_B)
+
+        self.a.accept_contact_request(B_ID)
+        self.assertTrue(
+            wait_until(lambda: self.a.contact_requests() == []),
+            "accepting clears the box entry",
+        )
+        self.assertTrue(
+            any(c.id == B_ID for c in self.a.contacts_list()),
+            "accepting adds the member",
+        )
+        # A's acceptance announces; B's presence sweep re-dials (quiet) into
+        # a KNOWN member and the session comes up
+        self.assertTrue(wait_until(lambda: self.b.is_chat_alive(A_ID)))
+        self.assertTrue(
+            wait_until(lambda: self.a.is_chat_alive(B_ID)),
+            "B must see A online after the acceptance",
+        )
+        # both sides' outboxes work over the accepted session
+        self.assertTrue(
+            self.a.send_message(B_ID, "\u4f60\u597d\uff0c\u6211\u662fA")  # 你好，我是A
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: any(
+                    m.content == "\u4f60\u597d\uff0c\u6211\u662fA"
+                    for m in self.b.messages_for(A_ID)
+                )
+            ),
+            "a message must flush over the accepted session",
+        )
+
+    def test_dialer_told_request_is_pending_not_failed(self):
+        """The Android request box answers a first-contact dial with
+        "direct_pending" instead of accepting or hanging up: the dialer must
+        surface "等待对方确认" as an EVENT — never as a connect failure (the
+        old code mapped it to 'bad direct_ack' and toasted a refusal)."""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def serve():
+            conn, _ = srv.accept()
+            try:
+                reader = conn.makefile("r", encoding="utf-8", newline="\n")
+                first_line = _read_line_bounded(reader)
+                start = NetworkPacket.from_json(first_line)
+                wire = make_wire(conn, reader)
+                Handshake.accept_direct(wire, start, None)
+                hello = wire.recv_packet()
+                if hello.type == Protocol.DIRECT_HELLO:
+                    wire.send_packet(NetworkPacket(type=Protocol.DIRECT_PENDING))
+            finally:
+                conn.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+
+        events = []
+        failures = []
+        self.a.on_event = events.append
+
+        from localchat.network import DirectChatListener
+
+        class Rec(DirectChatListener):
+            def direct_connect_failed(self, peer, reason):
+                failures.append(reason)
+
+        self.a.attach(Rec())
+        result = self.a.start_chat(
+            Peer(f"ip:127.0.0.1:{port}", "BoxPeer", "127.0.0.1", port), quiet=False
+        )
+        self.assertIsNone(result, "a pending request is not a session")
+        self.assertFalse(failures, "pending must not surface as a failure")
+        self.assertTrue(
+            wait_until(lambda: any("\u7b49\u5f85\u5bf9\u65b9" in e for e in events)),
+            f"dialer must surface the waiting event: {events}",
         )
 
     def test_removed_marks_snapshot_roundtrip(self):
@@ -341,6 +597,112 @@ class DirectPresenceTest(unittest.TestCase):
         )
         got_ids, _ = stale.removed_marks()
         self.assertNotIn("dev-X", got_ids, "expired marks are dropped")
+
+    def test_request_box_dedupes_by_id_and_endpoint(self):
+        """The box keeps ONE row per peer — by device id AND by endpoint (a
+        placeholder-era peer re-requesting from a new address must not stack
+        two rows). A NEW entry alone raises the event, so B's presence sweep
+        re-dialing every minute cannot toast in a loop."""
+        events = []
+        self.a.on_event = events.append
+        box_peer = Peer("dev-1", "Alice", "192.168.1.5", 9999)
+        self.a.record_contact_request(box_peer, from_removed=False)
+        self.a.record_contact_request(box_peer, from_removed=False)  # sweep re-dial
+        self.a.record_contact_request(
+            Peer("dev-2", "Bob", "192.168.1.6", 9999), from_removed=False
+        )
+        # same endpoint under a different id (placeholder-era re-request):
+        # the LATEST request replaces the stale row
+        self.a.record_contact_request(
+            Peer("dev-3", "Alice2", "192.168.1.5", 9999), from_removed=False
+        )
+
+        ids = [r.id for r in self.a.contact_requests()]
+        self.assertEqual(sorted(ids), ["dev-2", "dev-3"], ids)
+        # dev-3 replaces dev-1's box slot (same endpoint): the replacement is
+        # an UPDATE, not a new request — no second toast for it
+        self.assertEqual(len(events), 2, "only NEW entries toast")
+
+    def test_request_box_capped(self):
+        """A LAN scanner hammering the port must not be able to grow the box
+        without bound: oldest entries fall off past REQUEST_BOX_MAX."""
+        self.a.record_contact_request(
+            Peer("first", "F", "192.168.1.1", 9999), from_removed=False
+        )
+        for i in range(200):
+            self.a.record_contact_request(
+                Peer(f"dev-{i}", f"S{i}", f"192.168.1.{i % 250 + 2}", 9999),
+                from_removed=False,
+            )
+        requests = self.a.contact_requests()
+        self.assertLessEqual(len(requests), self.a.REQUEST_BOX_MAX)
+        self.assertFalse(
+            any(r.id == "first" for r in requests), "oldest entries fall off"
+        )
+
+    def test_request_box_restore_roundtrip(self):
+        """The persistence round-trip: contact_requests() snapshots the box,
+        restore_contact_requests() reinstates it, deduping by id AND endpoint
+        (the same slot semantics the live box uses)."""
+        self.a.record_contact_request(
+            Peer("dev-1", "Alice", "192.168.1.5", 9999), from_removed=True
+        )
+        self.a.record_contact_request(
+            Peer("dev-2", "Bob", "192.168.1.6", 9999), from_removed=False
+        )
+        saved = self.a.contact_requests()
+
+        fresh = DirectChatManager()
+        fresh.restore_contact_requests(saved)
+        self.assertEqual(
+            [r.id for r in fresh.contact_requests()], ["dev-1", "dev-2"]
+        )
+        self.assertTrue(fresh.contact_requests()[0].from_removed)
+
+        # a stale saved row must not duplicate its live replacement: the
+        # live slot wins (it is the newer request), the saved row is skipped
+        stale = DirectChatManager()
+        stale.record_contact_request(
+            Peer("dev-1", "Alice", "192.168.1.5", 9999), from_removed=False
+        )
+        stale.restore_contact_requests(saved)
+        ids = [r.id for r in stale.contact_requests()]
+        self.assertEqual(
+            ids, ["dev-1", "dev-2"], f"no duplicate row across restore: {ids}"
+        )
+        self.assertFalse(
+            stale.contact_requests()[0].from_removed,
+            "the live (newer) request keeps its slot",
+        )
+
+        # saved rows themselves dedupe by id AND endpoint: two saved rows
+        # sharing an endpoint collapse to one
+        fresh2 = DirectChatManager()
+        fresh2.restore_contact_requests(
+            [
+                ContactRequest("dev-1", "Alice", "192.168.1.5", 9999, True, 1),
+                ContactRequest("dev-3", "Alice2", "192.168.1.5", 9999, False, 2),
+                ContactRequest("dev-2", "Bob", "192.168.1.6", 9999, False, 3),
+            ]
+        )
+        ids2 = [r.id for r in fresh2.contact_requests()]
+        self.assertEqual(
+            ids2, ["dev-1", "dev-2"], f"endpoint dedupe inside saved rows: {ids2}"
+        )
+
+    def test_ignore_request_never_adds_contact(self):
+        """Ignoring a request drops the entry without touching contacts; the
+        member is never auto-added and no removal mark is created."""
+        self.a.record_contact_request(
+            Peer("dev-1", "Alice", "192.168.1.5", 9999), from_removed=False
+        )
+        self.a.ignore_contact_request("dev-1")
+        self.assertEqual(self.a.contact_requests(), [])
+        self.assertFalse(
+            any(c.id == "dev-1" for c in self.a.contacts_list()),
+            "ignoring never adds the member",
+        )
+        self.assertNotIn("dev-1", self.a.removed_marks()[0])
 
 
 if __name__ == "__main__":

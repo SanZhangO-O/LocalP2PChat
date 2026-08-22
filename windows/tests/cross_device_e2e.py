@@ -292,6 +292,14 @@ def tap_fab():
     view pinned to the bottom-right by the Scaffold (GroupListScreen.kt), so a
     clickable node in the bottom-right quadrant is a reliable fallback."""
     nodes = wait_ui(lambda ns: find_text(ns, "添加群组") is not None, timeout=10)
+    if nodes is None:
+        # the app may still be on the member-list tab: switch to 群组 first
+        nodes = ui_dump()
+        tab = find_desc(nodes, "群组")
+        if tab is not None:
+            tap(tab)
+            time.sleep(1.0)
+            nodes = wait_ui(lambda ns: find_text(ns, "添加群组") is not None, timeout=10)
     if nodes is not None:
         tap(find_text(nodes, "添加群组"))
         return True
@@ -348,13 +356,19 @@ def wake_phone() -> None:
 
 
 def phone_ip() -> str:
-    out = adb("shell", "ip", "addr", "show", "wlan0")
-    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
-    return m.group(1) if m else ""
+    for iface in ("wlan0", "eth0"):
+        out = adb("shell", "ip", "addr", "show", iface)
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+        if m:
+            return m.group(1)
+    return ""
 
 
 def pc_ip_for(phone: str) -> str:
-    """Pick this PC's LAN address on the same subnet as the phone."""
+    """Pick this PC's LAN address on the same subnet as the phone.
+    An emulator NAT guest (10.0.2.x) reaches the host at 10.0.2.2."""
+    if phone.startswith("10.0.2."):
+        return "10.0.2.2"
     try:
         import socket as _s
 
@@ -547,7 +561,9 @@ def main() -> int:
             key=lambda n: n["cy"],
         )
         got = [f["text"] for f in fields]
-        if got != values:
+        # password fields render masked (•) in some accessibility dumps: only
+        # the first three fields must match exactly, the password just non-empty
+        if got[:3] != values[:3] or not got[3]:
             print("表单填写校验失败: %r != %r" % (got, values))
             dump_labels("form")
             screenshot("shot_phone_form.png")

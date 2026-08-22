@@ -22,6 +22,7 @@ from .models import (
     MAX_LINE_LENGTH,
     TCP_PORT,
     ChatMessage,
+    ContactRequest,
     FileInfo,
     GroupInfo,
     NetworkPacket,
@@ -1906,6 +1907,13 @@ class DirectChatManager:
         # Marks changed (contact removed / re-added): callable() persisting
         # them, fired on whichever thread made the change.
         self.removed_marks_changed = None
+        # Contact-request message box: incoming first-contact / removed-
+        # member dials parked for the user to accept or ignore (Android
+        # parity). Oldest entries fall off past REQUEST_BOX_MAX so a LAN
+        # scanner hammering the port cannot grow the box without bound.
+        self._contact_requests: List[ContactRequest] = []
+        # Box changed: callable() persisting it, fired on the changing thread.
+        self.contact_requests_changed = None
         # Call-signaling bridge: callable(packet) invoked on the session read
         # thread for call_* packets that involve this node (Android parity —
         # direct calls ride the session socket, not the host relay).
@@ -1981,7 +1989,12 @@ class DirectChatManager:
         changed = False
         with self._lock:
             # dedupe by endpoint: a manually added placeholder (id from ip) is
-            # replaced by the real contact once a handshake reveals the id
+            # replaced by the real contact once a handshake reveals the id.
+            # The reverse must NOT happen: a manual "ip:..." add of an
+            # endpoint already known under its REAL device id keeps the real
+            # contact — the placeholder knows nothing the real one doesn't,
+            # and clobbering it would orphan the chat history keyed by the
+            # real id ("re-adding my contact by IP wiped it").
             for old_id in list(self._contacts):
                 old = self._contacts[old_id]
                 if (
@@ -1989,6 +2002,10 @@ class DirectChatManager:
                     and old.port == contact.port
                     and old.id != contact.id
                 ):
+                    if contact.id.startswith("ip:") and not old_id.startswith("ip:"):
+                        # keep the known real contact; the re-add still
+                        # cleared the removal marks above
+                        return
                     del self._contacts[old_id]
                     changed = True
             old_same_id = self._contacts.get(contact.id)
@@ -2103,6 +2120,111 @@ class DirectChatManager:
                 if now - v < self.REMOVED_MARK_TTL
             }
         return ids, endpoints
+
+    # ------------------------------------------------ contact-request box
+
+    # Box capacity: a LAN scanner hammering the port must not be able to
+    # grow the box without bound. Oldest entries fall off.
+    REQUEST_BOX_MAX = 50
+
+    def contact_requests(self) -> list:
+        """Snapshot of the parked contact requests, newest last."""
+        with self._lock:
+            return list(self._contact_requests)
+
+    def _fire_contact_requests_changed(self) -> None:
+        cb = self.contact_requests_changed
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def record_contact_request(self, peer: Peer, from_removed: bool) -> None:
+        """Park an incoming request in the message box. Deduped by device id
+        AND by endpoint (a placeholder-era peer re-requesting from a new
+        address must not stack two rows); only a NEW entry raises the
+        user-facing event, so a peer's presence sweep re-dialing every
+        minute cannot toast in a loop."""
+        entry = ContactRequest(
+            id=peer.id,
+            name=peer.name,
+            ip=peer.ip_address,
+            port=peer.port,
+            from_removed=from_removed,
+            timestamp=int(time.time() * 1000),
+        )
+
+        def same_slot(other: ContactRequest) -> bool:
+            return other.id == entry.id or (other.ip == entry.ip and other.port == entry.port)
+
+        with self._lock:
+            is_new = not any(same_slot(r) for r in self._contact_requests)
+            self._contact_requests = (
+                [r for r in self._contact_requests if not same_slot(r)] + [entry]
+            )[-self.REQUEST_BOX_MAX:]
+        if is_new:
+            suffix = "（已移除的成员）" if from_removed else ""
+            self._emit_event(f"{peer.name} 请求添加你为成员{suffix}")
+        self._fire_contact_requests_changed()
+
+    def accept_contact_request(self, request_id: str) -> None:
+        """The user accepted a request: add the member (clearing any removal
+        marks — acceptance is the explicit un-block) and announce right away;
+        the presence sweep dials the fresh contact immediately (quiet)."""
+        with self._lock:
+            req = next(
+                (r for r in self._contact_requests if r.id == request_id), None
+            )
+            if req is None:
+                return
+            self._contact_requests = [
+                r for r in self._contact_requests if r.id != request_id
+            ]
+        self.add_contact(Peer(req.id, req.name, req.ip, req.port))
+        self._emit_event(f"已添加 {req.name}")
+        self.announce_online()
+        self._fire_contact_requests_changed()
+
+    def ignore_contact_request(self, request_id: str) -> None:
+        """The user ignored a request: drop the entry. The peer is never
+        auto-added, so no removal mark is needed; if it insists, its next
+        dial simply re-parks the (single, deduped) entry."""
+        with self._lock:
+            before = len(self._contact_requests)
+            self._contact_requests = [
+                r for r in self._contact_requests if r.id != request_id
+            ]
+        if len(self._contact_requests) != before:
+            self._fire_contact_requests_changed()
+
+    def restore_contact_requests(self, saved: list) -> None:
+        """Restore the request box persisted by a previous process (startup).
+        Deduped by id AND endpoint — the same slot semantics the live box
+        uses — against BOTH the live rows and the saved list, so a stale
+        saved row cannot sit beside its live replacement."""
+        if not saved:
+            return
+        with self._lock:
+            live = self._contact_requests
+
+            def taken(other: ContactRequest) -> bool:
+                return any(
+                    k.id == other.id or (k.ip == other.ip and k.port == other.port)
+                    for k in live
+                ) or any(
+                    k.id == other.id or (k.ip == other.ip and k.port == other.port)
+                    for k in kept
+                )
+
+            kept: List[ContactRequest] = []
+            for r in saved:
+                if taken(r):
+                    continue
+                kept.append(r)
+            if kept:
+                self._contact_requests = (live + kept)[-self.REQUEST_BOX_MAX:]
+        self._fire_contact_requests_changed()
 
     # -------------------------------------------------------------- presence
 
@@ -2299,6 +2421,18 @@ class DirectChatManager:
                 NetworkPacket(type=Protocol.DIRECT_HELLO, peer=self.my_peer())
             )
             ack = wire.recv_packet()
+            if ack is not None and ack.type == Protocol.DIRECT_PENDING:
+                # The peer parked our request in its contact-request message
+                # box instead of accepting (first contact or removed-and-
+                # re-requesting): NOT a failure. Loud dials surface "waiting
+                # for confirmation"; the session comes up once the peer
+                # accepts and dials back / our sweep redials.
+                if not quiet:
+                    self._emit_event(
+                        f"已向 {peer.name} 发送连接请求，等待对方在其设备上确认"
+                    )
+                self._safe_close(sock)
+                return None
             if ack is None or ack.type != Protocol.DIRECT_ACK or ack.peer is None:
                 raise OSError("bad direct_ack")
             remote = ack.peer
@@ -2357,9 +2491,26 @@ class DirectChatManager:
         if peer is None or peer.id == self._my_id:
             self._safe_close(sock)
             return
-        # A contact the local user REMOVED must not be resurrected by the
-        # peer's presence redial (peers announce forever now): silently drop.
-        if self._is_removed(peer):
+        # First contact / removed member -> the request box. Nothing here is
+        # dropped silently: the box entry is visible (deduped, one row per
+        # peer, one event per NEW entry) and the dialer gets a definitive
+        # "pending" answer instead of a hung-up connection. A KNOWN member
+        # (id or endpoint) is auto-accepted below — the handshake already
+        # authenticated the dialer's identity key.
+        removed = self._is_removed(peer)
+        with self._lock:
+            known = peer.id in self._contacts or any(
+                c.ip_address == peer.ip_address and c.port == peer.port
+                for c in self._contacts.values()
+            )
+        if removed or not known:
+            self.record_contact_request(peer, from_removed=removed)
+            try:
+                wire.send_packet(
+                    NetworkPacket(type=Protocol.DIRECT_PENDING)
+                )
+            except Exception:
+                pass
             self._safe_close(sock)
             return
         # Identity-first: when the handshake already proves the peer's KNOWN
@@ -2647,6 +2798,15 @@ class DirectChatManager:
             ]
             for alias in aliases:
                 self._chat_endpoints.pop(alias, None)
+            # The endpoint now belongs to [real_id]: drop a manually added
+            # "ip:<endpoint>" placeholder CONTACT for it. add_contact's
+            # dedupe cannot do this when the peer advertises a DIFFERENT
+            # local IP (multi-homed / DHCP churn) — the placeholder then
+            # survived every handshake as a duplicate member row that
+            # dialed forever and never merged.
+            dropped_placeholder = self._contacts.pop(f"ip:{endpoint}", None)
+        if dropped_placeholder is not None:
+            self._notify_contacts()
         for alias in aliases:
             self._merge_chat_state(alias, real_id)
             cb = self.on_chat_migrated

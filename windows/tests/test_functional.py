@@ -24,6 +24,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication
 
 import localchat.network as network_module
+from localchat.models import Peer
 from localchat.network import P2PListener, P2PManager
 from localchat.storage import ChatStore
 from localchat.view_model import ChatViewModel
@@ -992,6 +993,69 @@ class ViewModelFlowTest(unittest.TestCase):
         for bad in bad_inputs:
             self.assertFalse(vm.add_direct_contact(bad, ""), f"must reject {bad!r}")
         self.assertEqual(len(vm.direct_contacts_list()), before)
+
+    def test_readd_by_ip_keeps_real_contact(self):
+        """Regression: manually re-adding by IP an endpoint already known
+        under its REAL device id must keep the real contact. The endpoint
+        dedupe used to let the fresh "ip:..." placeholder CLOBBER the real
+        contact, orphaning the chat history keyed by the real id — the user
+        saw their existing member get wiped by an add (and, with the peer
+        offline, no migration ever repaired it)."""
+        vm = make_vm(_fresh_db("lc_test_readd_ip.db"))
+        self._vms = [vm]
+
+        real = Peer(
+            "8fe9b98a-59d7-4f39-89ab-a333299a6d6d",
+            "MyPhone",
+            "192.168.0.191",
+            9999,
+        )
+        vm.direct.configure("my-device-id", "me", "127.0.0.1", 10038,
+                            saved_contacts=[real])
+
+        self.assertTrue(vm.add_direct_contact("192.168.0.191:9999", "Again"))
+        contacts = vm.direct_contacts_list()
+        self.assertEqual(len(contacts), 1, "no second row for a known endpoint")
+        self.assertEqual(contacts[0].id, real.id, "real contact must survive")
+        self.assertFalse(
+            any(c.id.startswith("ip:") for c in contacts),
+            "the manual placeholder must not be stored over the real contact",
+        )
+
+    def test_second_add_to_connected_member_surfaces_toast(self):
+        """Regression: re-adding an ALREADY-CONNECTED member by IP must NOT
+        be silent. start_chat short-circuits on a live session with no event
+        at all, so the second add did nothing visible — reported as "only
+        the first add works". The manual-add path must surface the
+        connection state itself."""
+        vm = make_vm(_fresh_db("lc_test_second_add.db"))
+        self._vms = [vm]
+        vm.direct.configure("my-device", "me", "127.0.0.1", 10039)
+        real = Peer(
+            "8fe9b98a-85e4-4d95-aba4-b5bf4848dbc5", "MyPhone",
+            "192.168.0.191", 9999,
+        )
+        vm.direct.add_contact(real)
+        vm.direct._sessions[real.id] = {
+            "peer_id": real.id,
+            "peer_name": real.name,
+            "sock": socket.socket(),
+            "wire": None,
+            "alive": True,
+            "send_queue": None,
+        }
+        toasts = []
+        vm.status_message.connect(lambda t: toasts.append(t))
+
+        self.assertTrue(vm.add_direct_contact("192.168.0.191:9999", ""))
+        deadline = time.time() + 5
+        while time.time() < deadline and not toasts:
+            self.pump()
+            time.sleep(0.05)
+        self.assertTrue(
+            any("\u5df2\u8fde\u63a5" in t for t in toasts),  # 已连接
+            f"re-add of a connected member must toast its state: {toasts}",
+        )
 
 
 if __name__ == "__main__":

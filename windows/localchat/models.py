@@ -144,6 +144,44 @@ class GroupInfo:
 
 
 @dataclass
+class ContactRequest:
+    """An incoming first-contact / removed-member dial parked in the
+    contact-request message box for the user to accept or ignore (Android
+    parity). Persisted by the ViewModel; [fromRemoved] marks a request from
+    a member the local user removed."""
+
+    id: str
+    name: str
+    ip: str
+    port: int
+    from_removed: bool = False
+    timestamp: int = 0
+
+    def to_dict(self) -> dict:
+        d = {
+            "id": self.id,
+            "name": self.name,
+            "ip": self.ip,
+            "port": self.port,
+            "timestamp": self.timestamp,
+        }
+        if self.from_removed:
+            d["fromRemoved"] = True
+        return d
+
+    @staticmethod
+    def from_dict(d: dict) -> "ContactRequest":
+        return ContactRequest(
+            id=str(d.get("id", "")),
+            name=str(d.get("name", "")),
+            ip=str(d.get("ip", "")),
+            port=int(d.get("port", 0)),
+            from_removed=bool(d.get("fromRemoved", False)),
+            timestamp=int(d.get("timestamp", 0)),
+        )
+
+
+@dataclass
 class CallInfo:
     """Metadata for a video/audio call (see docs/video_call_protocol.md).
 

@@ -281,9 +281,11 @@ def android_flow(wm) -> None:
     tap_node_wait(text="添加", timeout=10)
     time.sleep(3)
     screenshot("emu_added_win")
-    # wait until the session shows the member online (the row is the manually
-    # added one showing the forwarded address)
-    tap_node_wait(contains=f"{GUEST_ALIAS}:{WIN_PORT}", timeout=60)
+    # the manual add dials back and the handshake completes immediately
+    # (Windows already knows us), so the transient placeholder row MERGES
+    # into the real contact row — tap by nickname, not the placeholder's
+    # endpoint (that row no longer exists once the merge ran)
+    tap_node_wait(contains=WIN_NICK, timeout=60)
     if not wait_text("在线", 60):
         log("WARN: Android session not shown online, continuing")
     time.sleep(2)
@@ -319,6 +321,9 @@ def main() -> int:
         print("emulator not booted"); return 2
     log("re-checking adb forward")
     adb("forward", f"tcp:{HOST_FWD_PORT}", "tcp:9999")
+    # deterministic baseline: wipe the app's data so no stale contacts /
+    # removal marks / unanswered request-box entries survive between runs
+    adb("shell", "pm", "clear", "com.zqr.localchat")
 
     from PyQt6.QtWidgets import QApplication
     app = QApplication([])
@@ -360,10 +365,18 @@ def main() -> int:
     log(f"add_direct_contact -> {ok}")
     if not ok:
         raise RuntimeError("add_direct_contact returned False")
+    # The Android side no longer auto-accepts a FIRST CONTACT: the request
+    # is parked in its contact-request message box and the dialer is told
+    # "direct_pending" (surfaced as a waiting-for-confirmation event, NOT a
+    # failure). Accept it on the emulator so the session can come up.
+    log("accepting the request in the emulator's request box")
+    tap_node_wait(text="接受", timeout=30)
+    screenshot("emu_request_accepted")
 
     # presence dials right away; wait until the real device id is learned
+    # (the accepted side dials back; worst case the Windows sweep redials)
     real_id = None
-    deadline = time.time() + 60
+    deadline = time.time() + 120
     while time.time() < deadline:
         app.processEvents()
         time.sleep(0.2)

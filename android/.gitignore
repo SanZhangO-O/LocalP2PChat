@@ -1,12 +1,9 @@
 *.iml
 .gradle
 /local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
+# IDE-local metadata (gradle.xml pins a machine-local JDK, misc.xml the
+# project JDK name): never shared
+/.idea/
 .DS_Store
 /build
 /captures

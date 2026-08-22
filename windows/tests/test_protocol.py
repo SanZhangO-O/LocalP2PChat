@@ -1029,6 +1029,84 @@ class CallManagerSignalingTest(unittest.TestCase):
             b.stop()
             host.stop()
 
+    def test_second_call_after_first_ends(self):
+        """Regression: the media-stop event must be per-CALL, not sticky.
+        CallManager is an app-wide singleton, and the teardown of the first
+        call used to leave the media stop flag set forever — the SECOND
+        call's read loop then exited at its first check and the call ended
+        instantly with 对方已挂断, with every outgoing frame dropped."""
+        from localchat.call import (
+            STATE_ACTIVE,
+            STATE_IDLE,
+            STATE_INCOMING,
+            STATE_OUTGOING,
+            CallManager,
+        )
+
+        install_identity()
+        host = P2PManager(Recorder(), port=19198, password=GROUP_PASSWORD)
+        host.initialize_as_host(HOST_NAME, GROUP_NAME)
+        host.start_as_host()
+
+        a = P2PManager(Recorder(), port=21113)
+        a.initialize_as_client("\u547c\u53eb\u8005", GROUP_NAME, password=GROUP_PASSWORD)
+        a.confirm_join("127.0.0.1", 19198)
+        b = P2PManager(Recorder(), port=21114)
+        b.initialize_as_client("\u88ab\u53eb\u8005", GROUP_NAME, password=GROUP_PASSWORD)
+        b.confirm_join("127.0.0.1", 19198)
+        self.assertTrue(wait_until(lambda: a.connection_result is not None and a.connection_result[0]))
+        self.assertTrue(wait_until(lambda: b.connection_result is not None and b.connection_result[0]))
+        self.assertTrue(wait_until(lambda: b.my_id in a.peers and a.my_id in b.peers))
+
+        cm_a = CallManager()
+        cm_b = CallManager()
+        a.call_listener = cm_a._on_signal
+        b.call_listener = cm_b._on_signal
+        try:
+            def one_call(tag):
+                cm_a.start_call(a, b.my_id)
+                self.assertTrue(self._wait_qt(lambda: cm_a.state == STATE_OUTGOING), tag)
+                self.assertTrue(self._wait_qt(lambda: cm_b.state == STATE_INCOMING), tag)
+                cm_b.accept_call()
+                self.assertTrue(
+                    self._wait_qt(lambda: cm_a.state == STATE_ACTIVE and cm_b.state == STATE_ACTIVE),
+                    tag,
+                )
+                cm_b.hangup()
+                self.assertTrue(
+                    self._wait_qt(lambda: cm_a.state == STATE_IDLE and cm_b.state == STATE_IDLE),
+                    tag,
+                )
+
+            one_call("first call")
+            # the second call must go live and STAY live: with the sticky
+            # stop flag the read loop exits immediately and the call would
+            # collapse back to idle within a moment
+            cm_a.start_call(a, b.my_id)
+            self.assertTrue(self._wait_qt(lambda: cm_a.state == STATE_OUTGOING), "second call")
+            self.assertTrue(self._wait_qt(lambda: cm_b.state == STATE_INCOMING), "second call")
+            cm_b.accept_call()
+            self.assertTrue(
+                self._wait_qt(lambda: cm_a.state == STATE_ACTIVE and cm_b.state == STATE_ACTIVE),
+                "second call must reach active",
+            )
+            self.assertTrue(
+                self._wait_qt(
+                    lambda: cm_a._media_socket is not None and cm_b._media_socket is not None
+                ),
+                "second call must open a media socket",
+            )
+            time.sleep(1.0)
+            self.app.processEvents()
+            self.assertEqual(cm_a.state, STATE_ACTIVE, "second call must STAY active")
+            self.assertEqual(cm_b.state, STATE_ACTIVE, "second call must STAY active")
+        finally:
+            cm_a.hangup()
+            cm_b.hangup()
+            a.stop()
+            b.stop()
+            host.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

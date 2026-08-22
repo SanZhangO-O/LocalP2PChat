@@ -11,7 +11,15 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from .call import CallManager
 from .crypto import random_password
 from .hardware import get_hardware_id, get_local_ip_address
-from .models import TCP_PORT, ChatMessage, FileInfo, GroupInfo, NetworkPacket, Peer
+from .models import (
+    TCP_PORT,
+    ChatMessage,
+    ContactRequest,
+    FileInfo,
+    GroupInfo,
+    NetworkPacket,
+    Peer,
+)
 from . import network as network_module
 from .network import DirectChatListener, DirectChatManager, P2PListener, P2PManager, Protocol
 from .securewire import DeviceIdentity
@@ -57,6 +65,8 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # Direct member chats (queued from the direct-chat worker threads).
     direct_contacts_signal = pyqtSignal()
     direct_messages_signal = pyqtSignal(str)
+    # The contact-request message box changed (parked / accepted / ignored).
+    direct_requests_signal = pyqtSignal()
     # A direct session forwarded call signaling (NetworkPacket) or closed
     # (peer_id). Emitted from network threads; the slots run on the main
     # thread (queued connection) and route into the CallManager.
@@ -145,6 +155,11 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # the user deleted (marks carry id + endpoint + removal time)
         removed_ids, removed_endpoints = self._load_direct_removed_marks()
         self.direct.restore_removed_marks(removed_ids, removed_endpoints)
+        # unanswered contact requests survive a restart too: they are the
+        # user's pending decisions, not transient state (Android parity)
+        self.direct.restore_contact_requests(
+            self._load_direct_contact_requests()
+        )
         self.direct.configure(
             self._device_id(),
             self.nickname or "用户",
@@ -167,6 +182,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # Removal marks changed (contact removed / re-added): persist them so
         # a restart keeps honoring the removals (ChatStore is thread-safe).
         self.direct.removed_marks_changed = self._save_direct_removed_marks
+        # The request box changed (parked / accepted / ignored): persist it
+        # and let the member page re-render (queued to the main thread).
+        self.direct.contact_requests_changed = self._direct_contact_requests_changed
         # Surface transient direct-chat events (connected, offline notices,
         # security warnings) as toasts.
         self.direct.on_event = lambda text: self.status_message.emit(text)
@@ -439,6 +457,39 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         except Exception:
             pass
 
+    def _load_direct_contact_requests(self) -> list:
+        """Contact-request box persisted by a previous process: unanswered
+        requests must still be answerable after a restart."""
+        raw = self.store.get_setting("direct_contact_requests", "")
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+            return [ContactRequest.from_dict(d) for d in data]
+        except Exception:
+            return []
+
+    def _direct_contact_requests_changed(self) -> None:
+        try:
+            self.store.set_setting(
+                "direct_contact_requests",
+                json.dumps(
+                    [r.to_dict() for r in self.direct.contact_requests()]
+                ),
+            )
+        except Exception:
+            pass
+        self.direct_requests_signal.emit()
+
+    def direct_requests_list(self) -> list:
+        return self.direct.contact_requests()
+
+    def accept_contact_request(self, request_id: str) -> None:
+        self.direct.accept_contact_request(request_id)
+
+    def ignore_contact_request(self, request_id: str) -> None:
+        self.direct.ignore_contact_request(request_id)
+
     def direct_contacts_list(self) -> list:
         return self.direct.contacts_list()
 
@@ -526,6 +577,17 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             port=parsed_port,
         )
         self.direct.add_contact(contact)
+        # add_contact keeps the REAL-id contact when this endpoint is already
+        # known (a manual placeholder must not clobber it): dial the stored
+        # contact, not the placeholder, so the session keys under the real id
+        effective = next(
+            (
+                c
+                for c in self.direct.contacts_list()
+                if c.ip_address == ip and c.port == parsed_port
+            ),
+            contact,
+        )
 
         # A manual add is an explicit user action: dial LOUD right away
         # (quiet=False). The presence sweep also picks the new contact up,
@@ -534,7 +596,14 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # closes). Success: "已连接 X" toast; failure: the reason toast
         # (not running / different network / removed on the peer side).
         def run():
-            self.direct.start_chat(contact, quiet=False)
+            if self.direct.is_chat_alive(effective.id):
+                # already connected (re-adding an existing member): the
+                # dial short-circuits with no event, so surface it here —
+                # without this, the second add silently does nothing and
+                # looks like "only the first add works"
+                self.status_message.emit(f"已连接 {effective.name}")
+                return
+            self.direct.start_chat(effective, quiet=False)
 
         threading.Thread(target=run, daemon=True).start()
         return True

@@ -34,18 +34,24 @@ import java.util.*
  * Member list — the home screen and the first-class management unit. Every
  * known member (seen in a group, met through a direct chat, or added by
  * address) appears here; tapping one immediately pulls up a 1:1 chat, no
- * confirmation needed. Groups are a secondary entry in the header.
+ * confirmation needed. Incoming first-contact requests (and re-add attempts
+ * from removed members) are parked in the request box rendered above the
+ * list — accept or ignore, nothing is silently dropped. Groups are a
+ * secondary entry in the header.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun MemberListScreen(
     contacts: List<DirectChatManager.Contact>,
+    requests: List<DirectChatManager.ContactRequest>,
     lastMessages: Map<String, ChatMessage>,
     onOpenGroups: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenChat: (DirectChatManager.Contact) -> Unit,
     onAddContact: (ipPort: String, name: String) -> Boolean,
-    onRemoveContact: (id: String) -> Unit
+    onRemoveContact: (id: String) -> Unit,
+    onAcceptRequest: (id: String) -> Unit,
+    onIgnoreRequest: (id: String) -> Unit
 ) {
     val context = LocalContext.current
     var showAdd by remember { mutableStateOf(false) }
@@ -69,7 +75,7 @@ fun MemberListScreen(
             )
         }
     ) { padding ->
-        if (contacts.isEmpty()) {
+        if (requests.isEmpty() && contacts.isEmpty()) {
             Box(
                 modifier = Modifier.fillMaxSize().padding(padding),
                 contentAlignment = Alignment.Center
@@ -98,13 +104,52 @@ fun MemberListScreen(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(contacts, key = { it.id }) { contact ->
-                    MemberItem(
-                        contact = contact,
-                        lastMessage = lastMessages[contact.id],
-                        onClick = { onOpenChat(contact) },
-                        onRemove = { pendingDelete = contact.id }
-                    )
+                if (requests.isNotEmpty()) {
+                    item(key = "req-header") {
+                        Row(
+                            modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "联系人请求（${requests.size}）",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                "等待你确认的添加请求",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                    items(requests, key = { "req-${it.id}" }) { request ->
+                        RequestItem(
+                            request = request,
+                            onAccept = { onAcceptRequest(request.id) },
+                            onIgnore = { onIgnoreRequest(request.id) }
+                        )
+                    }
+                }
+                if (contacts.isNotEmpty()) {
+                    item(key = "contacts-header") {
+                        Text(
+                            "成员",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = if (requests.isEmpty()) 4.dp else 12.dp, bottom = 2.dp)
+                        )
+                    }
+                    items(contacts, key = { it.id }) { contact ->
+                        MemberItem(
+                            contact = contact,
+                            lastMessage = lastMessages[contact.id],
+                            onClick = { onOpenChat(contact) },
+                            onRemove = { pendingDelete = contact.id }
+                        )
+                    }
                 }
             }
         }
@@ -253,6 +298,73 @@ private fun MemberItem(
                     contentDescription = "移除成员",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+        }
+    }
+}
+
+/** A parked contact request: who wants in, with accept / ignore buttons. */
+@Composable
+private fun RequestItem(
+    request: DirectChatManager.ContactRequest,
+    onAccept: () -> Unit,
+    onIgnore: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(42.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.primary),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = avatarChar(request.name),
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimary
+                    )
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = request.name,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = "${request.ip}:${request.port}",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = if (request.fromRemoved) "已移除的成员请求重新添加" else "请求添加你为成员",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.error.copy(alpha = 0.9f)
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = onIgnore) {
+                    Text("忽略", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Spacer(modifier = Modifier.width(4.dp))
+                Button(onClick = onAccept) {
+                    Text("接受")
+                }
             }
         }
     }

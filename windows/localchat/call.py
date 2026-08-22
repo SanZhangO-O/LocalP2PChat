@@ -187,6 +187,11 @@ class CallManager(QObject):
         self._media_key = None
         self._send_lock = threading.Lock()
         self._stop_event = threading.Event()
+        # Media-channel stop event, distinct from _stop_event (the capture
+        # lifecycle flag): _start_capture() toggles _stop_event when a
+        # duplicate activation restarts the capture thread, and that must
+        # never make the media read loop / sender think the call ended.
+        self._media_stop = threading.Event()
         # Audio-priority media sender: audio chunks before video, written by a
         # dedicated thread so capture callbacks never block on the socket.
         self._audio_send_q = queue.Queue(maxsize=AUDIO_SEND_QUEUE)
@@ -582,10 +587,12 @@ class CallManager(QObject):
         with self._lock:
             if call.call_id != self._call_id or call.caller_id != self._my_id:
                 return
-            if self._state == STATE_OUTGOING:
-                self._state = STATE_ACTIVE
-            elif self._state != STATE_ACTIVE:
+            if self._state != STATE_OUTGOING:
+                # Already ACTIVE (activation happened via the media socket):
+                # restarting capture/audio here would set _stop_event, which
+                # must never disturb the running media read loop.
                 return
+            self._state = STATE_ACTIVE
         self.state_changed.emit(STATE_ACTIVE, self._peer_name, "")
         self._start_capture()
         self._start_audio()
@@ -801,6 +808,12 @@ class CallManager(QObject):
         self._sig_media_socket.emit(sock, key)
 
     def _start_read_loop(self, sock) -> None:
+        # A media session starts fresh on every call: _media_stop may still
+        # be set by a PREVIOUS call's teardown — without the clear, the
+        # second call's read loop would exit at the first check and the
+        # sender would drop every frame (mirror of _send_stop.clear() in
+        # _start_send_thread).
+        self._media_stop.clear()
         self._start_send_thread()
         threading.Thread(target=self._media_read_loop, args=(sock,), daemon=True).start()
 
@@ -808,7 +821,7 @@ class CallManager(QObject):
         reason = "对方已挂断"
         try:
             sock.settimeout(MEDIA_READ_TIMEOUT)
-            while not self._stop_event.is_set():
+            while not self._media_stop.is_set():
                 header = _read_exact(sock, 5)
                 if header is None:
                     return
@@ -849,7 +862,7 @@ class CallManager(QObject):
         Capture callbacks must never block on the socket (a stalled TCP write
         would glitch the microphone), so audio is queued with drop-oldest and
         the sender serves audio with strict priority over video."""
-        if self._stop_event.is_set() or self._send_stop.is_set():
+        if self._media_stop.is_set() or self._send_stop.is_set():
             return
         if channel == CH_AUDIO:
             q = self._audio_send_q
@@ -1638,6 +1651,7 @@ class CallManager(QObject):
                 return
             self._state = STATE_IDLE
             self._stop_event.set()
+            self._media_stop.set()
             server, sock = self._media_server, self._media_socket
             self._reset()
         run_catching_close(server)
@@ -1653,6 +1667,7 @@ class CallManager(QObject):
         """Stop capture/audio resources. Runs on the GUI thread (deferred via
         a queued signal when the call ended on a worker thread)."""
         self._stop_event.set()
+        self._media_stop.set()
         self._stop_audio()
         thread = self._capture_thread
         if thread is not None:

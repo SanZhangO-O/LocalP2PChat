@@ -133,6 +133,13 @@ def main() -> int:
         raise RuntimeError("add-member dialog flow did not complete")
     log("dialog submitted")
 
+    # The Android side parks the first-contact request in its message box
+    # instead of auto-accepting: accept it on the emulator so the session
+    # can come up.
+    log("accepting the request in the emulator's request box")
+    tap_node_wait(text="接受", timeout=30)
+    screenshot("gui_request_accepted")
+
     # ---- 2) the new row appears; click it to open the chat ----
     log("== waiting for the contact row ==")
     peer_id = None
@@ -216,7 +223,10 @@ def main() -> int:
     emu_type_text(1, WIN_NICK)
     tap_node_wait(text="添加", timeout=10)
     time.sleep(2)
-    tap_node_wait(contains=f"{GUEST_ALIAS}:{WIN_PORT}", timeout=60)
+    # the manual add's dial-back handshake completes immediately (Windows
+    # already knows us), merging the placeholder row into the real contact
+    # row — tap by nickname, not the transient placeholder's endpoint
+    tap_node_wait(contains=WIN_NICK, timeout=60)
     time.sleep(2)
     # chat input on Android: re-dump and type into the single EditText
     try:
