@@ -140,6 +140,11 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # only need the IP of SOME member, not the creator's.
         self.host_server.member_group_handler = self._handle_member_group_request
         saved_contacts = self._load_direct_contacts()
+        # honor contact removals from previous processes BEFORE announcing:
+        # a peer that keeps presenting itself must not resurrect a contact
+        # the user deleted (marks carry id + endpoint + removal time)
+        removed_ids, removed_endpoints = self._load_direct_removed_marks()
+        self.direct.restore_removed_marks(removed_ids, removed_endpoints)
         self.direct.configure(
             self._device_id(),
             self.nickname or "用户",
@@ -159,6 +164,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # A handshake revealed a placeholder "ip:..." contact's real device
         # id: move that chat's observer, persisted rows and open screen over.
         self.direct.on_chat_migrated = self._on_direct_chat_migrated
+        # Removal marks changed (contact removed / re-added): persist them so
+        # a restart keeps honoring the removals (ChatStore is thread-safe).
+        self.direct.removed_marks_changed = self._save_direct_removed_marks
         # Surface transient direct-chat events (connected, offline notices,
         # security warnings) as toasts.
         self.direct.on_event = lambda text: self.status_message.emit(text)
@@ -201,7 +209,13 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         return fp
 
     def set_window_active(self, active: bool) -> None:
+        was = self.window_active
         self.window_active = active
+        if active and not was:
+            # returning to the window: sessions may have died (sleep/resume,
+            # network change) -- re-announce every dead contact session now
+            # instead of waiting for the presence sweep
+            self.direct.announce_online()
 
     @property
     def security_code(self) -> str:
@@ -402,6 +416,29 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         except Exception:
             pass
 
+    def _load_direct_removed_marks(self) -> tuple:
+        """Removed-contact marks persisted by a previous process: (ids,
+        endpoints) -> removal time, so a peer that keeps announcing cannot
+        resurrect a contact the user deleted."""
+        raw = self.store.get_setting("direct_removed_marks", "")
+        if not raw:
+            return {}, {}
+        try:
+            data = json.loads(raw)
+            return dict(data.get("ids", {})), dict(data.get("endpoints", {}))
+        except Exception:
+            return {}, {}
+
+    def _save_direct_removed_marks(self) -> None:
+        try:
+            ids, endpoints = self.direct.removed_marks()
+            self.store.set_setting(
+                "direct_removed_marks",
+                json.dumps({"ids": ids, "endpoints": endpoints}),
+            )
+        except Exception:
+            pass
+
     def direct_contacts_list(self) -> list:
         return self.direct.contacts_list()
 
@@ -489,6 +526,17 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             port=parsed_port,
         )
         self.direct.add_contact(contact)
+
+        # A manual add is an explicit user action: dial LOUD right away
+        # (quiet=False). The presence sweep also picks the new contact up,
+        # but it is deliberately silent — without this loud dial, adding an
+        # unreachable member gives NO feedback at all (the dialog just
+        # closes). Success: "已连接 X" toast; failure: the reason toast
+        # (not running / different network / removed on the peer side).
+        def run():
+            self.direct.start_chat(contact, quiet=False)
+
+        threading.Thread(target=run, daemon=True).start()
         return True
 
     def remove_direct_contact(self, contact_id: str) -> None:
@@ -496,9 +544,6 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # the chat before dropping the contact)
         self.direct.close_chat(contact_id)
         self.direct.remove_contact(contact_id)
-
-    def close_direct_chat(self, peer_id: str) -> None:
-        self.direct.close_chat(peer_id)
 
     # ------------------------------------------ direct calls and file transfer
 

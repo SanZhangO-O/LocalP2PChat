@@ -1813,6 +1813,18 @@ class DirectChatManager:
     placeholder "ip:..." id until the handshake reveals the real device id;
     queued state keyed by the placeholder is migrated to the real id then.
 
+    Presence: "the app is running" IS "online". At start (and on window
+    activation / network change) the manager announces itself to every saved
+    contact by dialing the ones without a live session — the dial IS the
+    notification: it rides the identity handshake, so the peer flips us to
+    online with no polling and both sides' outboxes flush. Between events a
+    low-frequency sweep repairs sessions that died mid-air; deterministic
+    dialing (the member with the smaller id dials, placeholder contacts
+    always dial) keeps simultaneous announces from both apps from racing
+    into mismatched session pairs (Android parity). A contact the local
+    user removed is MARKED (id + endpoint): the removed peer's announces
+    must not resurrect it.
+
     Each session has a single sender thread draining a FIFO queue — enqueue
     order IS wire order, so a chat sent right before a delete reaches the peer
     in that order (Android parity).
@@ -1829,6 +1841,15 @@ class DirectChatManager:
     REDIAL_BACKOFF = 5.0
     REDIAL_MAX_BACKOFF = 30.0
     REDIAL_LIFETIME = 600.0
+    # Presence sweep cadence: how often a dead contact session is retried
+    # between announce events (app start, window activation). Quiet and
+    # low-frequency by design -- link REPAIR, not status polling.
+    PRESENCE_SWEEP = 60.0
+    # How long a removed-contact mark survives (seconds): blocks the removed
+    # peer's announces from resurrecting the contact, but a stale endpoint
+    # mark (DHCP gave the address to a new device) must not block a
+    # legitimate first contact forever.
+    REMOVED_MARK_TTL = 30 * 24 * 3600.0
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -1853,10 +1874,38 @@ class DirectChatManager:
         self._chat_endpoints: Dict[str, str] = {}
         # Keys with a redial loop currently running.
         self._redial_loops: set = set()
+        # Per-peer dial locks: the presence sweep, the outbox redial loop and
+        # an explicit open-chat can all dial the same member at once, and two
+        # concurrent handshakes interleave into MISMATCHED session pairs —
+        # each side's "replace the old session" then lands on a different
+        # one of the two connections, so writes go to a socket the peer
+        # already closed and messages silently never arrive.
+        self._dial_locks: Dict[str, threading.Lock] = {}
         # RLock (not Lock): the redial loop's finally may re-enter
         # _ensure_redial_loop while still holding this guard to relaunch for a
         # message that raced with loop shutdown.
         self._redial_guard = threading.RLock()
+        # Presence: wake semaphore + started flag + in-flight dedupe for the
+        # reconnect sweep (see announce_online). A Semaphore (not Event):
+        # permits accumulate, so a wake issued while a sweep is still dialing
+        # is never lost (Event's clear-after-wait races announce_online and
+        # can delay the dial a whole sweep).
+        self._presence_wake = threading.Semaphore(0)
+        self._presence_started = False
+        self._presence_lock = threading.Lock()
+        self._presence_dialing: set = set()
+        # Removed-contact marks: id / endpoint -> removal time. A peer that
+        # keeps announcing must not resurrect a contact the local user
+        # deleted; add_contact clears the marks (explicit re-add, group
+        # sync, or a handshake from a re-added address). The id->endpoint
+        # link makes re-adding clear BOTH marks even when the peer's
+        # address changed between removal and re-add (DHCP churn).
+        self._removed_ids: Dict[str, float] = {}
+        self._removed_endpoints: Dict[str, float] = {}
+        self._removed_id_endpoint: Dict[str, str] = {}
+        # Marks changed (contact removed / re-added): callable() persisting
+        # them, fired on whichever thread made the change.
+        self.removed_marks_changed = None
         # Call-signaling bridge: callable(packet) invoked on the session read
         # thread for call_* packets that involve this node (Android parity —
         # direct calls ride the session socket, not the host relay).
@@ -1899,6 +1948,10 @@ class DirectChatManager:
             self._my_ip = my_ip
             self._my_port = my_port
             self._contacts = {c.id: c for c in (saved_contacts or [])}
+        # identity + saved contacts ready: the app is ONLINE the moment it
+        # starts, so announce to every saved contact right away (idempotent:
+        # re-configure on nickname/port changes only re-checks dead sessions)
+        self.announce_online()
 
     def is_configured(self) -> bool:
         with self._lock:
@@ -1919,6 +1972,12 @@ class DirectChatManager:
             return sorted(self._contacts.values(), key=lambda c: c.name.lower())
 
     def add_contact(self, contact: Peer) -> None:
+        # a contact (re-)added is no longer "removed": clear the marks so
+        # the peer's announces are accepted again
+        self._unmark(
+            contact.id,
+            f"{contact.ip_address}:{contact.port}" if contact.ip_address else None,
+        )
         changed = False
         with self._lock:
             # dedupe by endpoint: a manually added placeholder (id from ip) is
@@ -1955,8 +2014,164 @@ class DirectChatManager:
 
     def remove_contact(self, contact_id: str) -> None:
         with self._lock:
-            if self._contacts.pop(contact_id, None) is not None:
-                self._notify_contacts()
+            contact = self._contacts.pop(contact_id, None)
+        if contact is not None:
+            # remember the removal: the peer's app keeps announcing (its
+            # presence dials forever), and an incoming hello must not
+            # resurrect the contact the user just deleted
+            self._mark_removed(
+                contact_id,
+                f"{contact.ip_address}:{contact.port}" if contact.ip_address else None,
+            )
+            self._notify_contacts()
+
+    # ------------------------------------------------------- removal marks
+
+    def _mark_removed(self, peer_id: str, endpoint: Optional[str]) -> None:
+        now = time.time()
+        with self._lock:
+            self._removed_ids[peer_id] = now
+            if endpoint:
+                self._removed_endpoints[endpoint] = now
+                self._removed_id_endpoint[peer_id] = endpoint
+        self._fire_removed_marks_changed()
+
+    def _unmark(self, peer_id: str, endpoint: Optional[str]) -> None:
+        changed = False
+        with self._lock:
+            changed = self._removed_ids.pop(peer_id, None) is not None
+            # clear the endpoint recorded WITH the id mark: the peer's
+            # address may have changed between removal and re-add, so
+            # clearing only the newly advertised endpoint would leave the
+            # stale one blocking the peer's announces
+            linked = self._removed_id_endpoint.pop(peer_id, None)
+            if linked and self._removed_endpoints.pop(linked, None) is not None:
+                changed = True
+            if endpoint and self._removed_endpoints.pop(endpoint, None) is not None:
+                changed = True
+        if changed:
+            self._fire_removed_marks_changed()
+
+    def _fire_removed_marks_changed(self) -> None:
+        cb = self.removed_marks_changed
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def _is_removed(self, peer: Peer) -> bool:
+        """True when [peer] is a contact the local user removed (id match, or
+        endpoint match for a contact removed under an "ip:..." placeholder
+        whose real device id was never learned)."""
+        now = time.time()
+        with self._lock:
+            t = self._removed_ids.get(peer.id)
+            if t is not None and now - t < self.REMOVED_MARK_TTL:
+                return True
+            if peer.ip_address:
+                t = self._removed_endpoints.get(f"{peer.ip_address}:{peer.port}")
+                if t is not None and now - t < self.REMOVED_MARK_TTL:
+                    return True
+        return False
+
+    def restore_removed_marks(
+        self, ids: Dict[str, float], endpoints: Dict[str, float]
+    ) -> None:
+        """Restore removal marks persisted by a previous process (entries
+        past the TTL are dropped). Must run before announce_online()."""
+        now = time.time()
+        with self._lock:
+            self._removed_ids.update(
+                {k: v for k, v in ids.items() if now - v < self.REMOVED_MARK_TTL}
+            )
+            self._removed_endpoints.update(
+                {k: v for k, v in endpoints.items() if now - v < self.REMOVED_MARK_TTL}
+            )
+
+    def removed_marks(self) -> tuple:
+        """Snapshot of the removal marks (expired entries filtered), for
+        persistence by the ViewModel."""
+        now = time.time()
+        with self._lock:
+            ids = {
+                k: v for k, v in self._removed_ids.items()
+                if now - v < self.REMOVED_MARK_TTL
+            }
+            endpoints = {
+                k: v for k, v in self._removed_endpoints.items()
+                if now - v < self.REMOVED_MARK_TTL
+            }
+        return ids, endpoints
+
+    # -------------------------------------------------------------- presence
+
+    def announce_online(self) -> None:
+        """The app is up (start, window activated, contact added): announce
+        to every contact by dialing the ones without a live session. The
+        dial IS the notification -- it rides the identity handshake, so the
+        peer flips us to online with no polling and both sides' outboxes
+        flush. Wakes the reconnect sweep immediately; between events the
+        sweep alone repairs dead sessions (PRESENCE_SWEEP)."""
+        with self._presence_lock:
+            if not self._presence_started:
+                self._presence_started = True
+                _spawn(self._presence_loop)
+        self._presence_wake.release()
+
+    def _presence_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._dial_dead_contacts()
+            except Exception:
+                pass
+            # wait for the next wake, or the fallback sweep timeout; extra
+            # permits piled up during the dial are drained so N wakes
+            # coalesce into one immediate extra pass (Semaphore permits are
+            # never lost, unlike an Event's clear)
+            if not self._presence_wake.acquire(timeout=self.PRESENCE_SWEEP):
+                continue
+            while self._presence_wake.acquire(blocking=False):
+                pass
+
+    def _dial_dead_contacts(self) -> None:
+        """Dial every contact without a live session. Deterministic dialer:
+        with real ids on both sides only the member with the SMALLER id
+        dials, so a simultaneous announce from both apps cannot race into
+        mismatched session pairs (same rule as the group mesh). A
+        placeholder "ip:..." contact always dials -- the other side does not
+        know this device yet, so nobody else would establish the session."""
+        with self._lock:
+            my_id = self._my_id
+            contacts = list(self._contacts.values())
+            live = {pid for pid, s in self._sessions.items() if s["alive"]}
+        if not my_id:
+            return
+        for contact in contacts:
+            if not contact.ip_address or contact.port <= 0:
+                continue
+            if contact.id in live:
+                continue
+            if not contact.id.startswith("ip:") and my_id >= contact.id:
+                continue
+            # a redial loop already hammers this peer for the outbox
+            if contact.id in self._redial_loops:
+                continue
+            with self._presence_lock:
+                if contact.id in self._presence_dialing:
+                    continue
+                self._presence_dialing.add(contact.id)
+
+            def run(c=contact):
+                try:
+                    self.start_chat(c, quiet=True)
+                except Exception:
+                    pass
+                finally:
+                    with self._presence_lock:
+                        self._presence_dialing.discard(c.id)
+
+            _spawn(run)
 
     # -------------------------------------------------------------- messages
 
@@ -2042,7 +2257,20 @@ class DirectChatManager:
             existing = self._sessions.get(peer.id)
             if existing is not None and existing["alive"]:
                 return peer.id
+            dial_lock = self._dial_locks.setdefault(peer.id, threading.Lock())
         self.add_contact(peer)
+        # serialize dials per peer (see _dial_locks): a concurrent dial may
+        # have established the session while we waited for the lock
+        with dial_lock:
+            with self._lock:
+                existing = self._sessions.get(peer.id)
+                if existing is not None and existing["alive"]:
+                    return peer.id
+            return self._dial_peer(peer, quiet)
+
+    def _dial_peer(self, peer: Peer, quiet: bool) -> Optional[str]:
+        """The actual dial + secured handshake (runs under the peer's dial
+        lock)."""
         sock = None
         try:
             sock = socket.create_connection(
@@ -2103,6 +2331,11 @@ class DirectChatManager:
                     reason = "无响应（请确认对方应用在运行且在同一网络）"
                 elif isinstance(e, ConnectionRefusedError):
                     reason = "连接被拒绝（对方应用未运行或端口不对）"
+                elif str(e) == "bad direct_ack":
+                    # the handshake SUCCEEDED but the peer hung up instead of
+                    # acking: the classic signature of a peer that dropped the
+                    # hello on purpose (removed contact) — or died mid-handshake
+                    reason = "对方未接受连接（应用刚退出、不在同一网络，或已被对方移除）"
                 elif isinstance(e, OSError):
                     reason = f"网络不可达（{e}）"
                 elif isinstance(e, WireException):
@@ -2122,6 +2355,11 @@ class DirectChatManager:
         authenticated the dialer's identity key)."""
         peer = packet.peer
         if peer is None or peer.id == self._my_id:
+            self._safe_close(sock)
+            return
+        # A contact the local user REMOVED must not be resurrected by the
+        # peer's presence redial (peers announce forever now): silently drop.
+        if self._is_removed(peer):
             self._safe_close(sock)
             return
         # Identity-first: when the handshake already proves the peer's KNOWN
@@ -2591,6 +2829,8 @@ class DirectChatManager:
 
     def shutdown(self) -> None:
         self._stop_event.set()
+        # release the presence loop so a shutdown process exits promptly
+        self._presence_wake.release()
         with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()

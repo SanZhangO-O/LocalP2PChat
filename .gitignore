@@ -17,6 +17,9 @@ android/.gradle/
 android/local.properties
 android/app/release/
 
+# E2E artifacts (emulator screenshots / logs)
+.interop/
+
 # IDE
 .idea/
 .vscode/

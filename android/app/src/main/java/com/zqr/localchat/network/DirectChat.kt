@@ -29,6 +29,7 @@ import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
@@ -63,6 +64,17 @@ import kotlin.concurrent.thread
  *    [onCallSignal] (the ViewModel routes them into CallManager with this
  *    manager as the signaling channel); media itself travels over a separate
  *    TCP connection managed by CallManager.
+ *
+ * Presence: "the app is running" IS "online". At start (and on return to the
+ * foreground / a network change) the manager announces itself to every saved
+ * contact by dialing the ones without a live session — the dial IS the
+ * notification: it rides the identity handshake, so the peer flips us to
+ * online with no polling and both sides' outboxes flush. Between events a
+ * low-frequency sweep repairs sessions that died mid-air; deterministic
+ * dialing (the member with the smaller id dials, placeholder contacts
+ * always dial) keeps simultaneous announces from both apps from racing into
+ * mismatched session pairs. A contact the local user removed is MARKED
+ * (id + endpoint): the removed peer's announces must not resurrect it.
  */
 object DirectChatManager {
 
@@ -91,6 +103,18 @@ object DirectChatManager {
     private const val REDIAL_BACKOFF_MS = 5_000L
     private const val REDIAL_MAX_BACKOFF_MS = 30_000L
     private const val REDIAL_LIFETIME_MS = 10 * 60_000L
+
+    /** Presence sweep cadence: how often a dead contact session is retried
+     *  between announce events (app start, foreground return, network
+     *  change). Quiet and low-frequency by design — this is link REPAIR,
+     *  not status polling. */
+    private const val PRESENCE_SWEEP_MS = 60_000L
+
+    /** How long a removed-contact mark survives: the mark blocks the removed
+     *  peer's presence dials from resurrecting the contact, but a stale
+     *  endpoint mark (DHCP gave the address to a new device) must not block
+     *  a legitimate first contact forever. */
+    private val REMOVED_MARK_TTL_MS = 30L * 24 * 3600 * 1000
 
     private class Session(
         val peerId: String,
@@ -122,6 +146,41 @@ object DirectChatManager {
     /** Keys with a redial loop currently running. */
     private val redialLoops = ConcurrentHashMap.newKeySet<String>()
     private val redialGuard = Any()
+
+    // -------------------------------------------------------------- presence
+
+    /** Wakes the presence loop between sweeps (announce events coalesce). */
+    private val presenceWake = Semaphore(1)
+    private val presenceGuard = Any()
+    private var presenceStarted = false
+
+    /** Contacts a presence dial is currently in flight for (dedupes sweeps
+     *  and concurrent announce events). */
+    private val presenceDialing = ConcurrentHashMap.newKeySet<String>()
+
+    /** Per-peer dial serialization: the presence sweep, the outbox redial
+     *  loop and an explicit open-chat can all dial the same member at once,
+     *  and two concurrent handshakes interleave into MISMATCHED session
+     *  pairs — each side's "replace the old session" then lands on a
+     *  different one of the two connections, so writes go to a socket the
+     *  peer already closed and messages silently never arrive. */
+    private val dialLocks = ConcurrentHashMap<String, Any>()
+
+    /** Removed-contact marks: ids (and endpoints) the LOCAL user deleted,
+     *  with the removal time. A peer still announcing to us must not
+     *  resurrect a deleted contact; [addContact] clears the marks (explicit
+     *  re-add, group sync, or a handshake from a re-added address). The
+     *  id->endpoint link makes re-adding clear BOTH marks even when the
+     *  peer's address changed between removal and re-add (DHCP churn). */
+    private val removedIds = ConcurrentHashMap<String, Long>()
+    private val removedEndpoints = ConcurrentHashMap<String, Long>()
+    private val removedEndpointById = ConcurrentHashMap<String, String>()
+
+    /** Marks changed (contact removed / re-added): the ViewModel persists
+     *  them so a restart keeps honoring the removals. May fire on any
+     *  thread. */
+    @Volatile
+    var onRemovedMarksChanged: (() -> Unit)? = null
 
     /** Outbound file servers keyed by fileId; each offers one file until its
      *  accept loop ends (timeout, socket close or explicit removal). */
@@ -186,6 +245,9 @@ object DirectChatManager {
         this.myIp = myIp
         this.myPort = myPort
         _contacts.value = savedContacts.associateBy { it.id }
+        // identity + saved contacts ready: the app is ONLINE the moment it
+        // starts, so announce to every saved contact right away
+        announceOnline()
     }
 
     /** Local device id (set by [configure]); used by call signaling. */
@@ -237,6 +299,9 @@ object DirectChatManager {
     // ------------------------------------------------------------- contacts
 
     fun addContact(contact: Contact) {
+        // a contact (re-)added is no longer "removed": clear the marks so
+        // the peer's announces are accepted again
+        unmark(contact.id, contact.ip.takeIf { it.isNotBlank() }?.let { "$it:${contact.port}" })
         _contacts.update { map ->
             // dedupe by endpoint: a manually added placeholder (id from ip)
             // is replaced by the real contact once a handshake reveals the id
@@ -251,7 +316,64 @@ object DirectChatManager {
     }
 
     fun removeContact(id: String) {
+        val c = _contacts.value[id]
         _contacts.update { it - id }
+        // remember the removal: the peer's app keeps announcing (its
+        // presence dials forever), and an incoming hello must not
+        // resurrect the contact the user just deleted
+        markRemoved(id, c?.takeIf { it.ip.isNotBlank() }?.let { "${it.ip}:${it.port}" })
+    }
+
+    /** Restore removal marks persisted by a previous process (entries past
+     *  the TTL are dropped). Runs at startup, before [announceOnline]. */
+    fun restoreRemovedMarks(ids: Map<String, Long>, endpoints: Map<String, Long>) {
+        val now = System.currentTimeMillis()
+        ids.forEach { (k, t) -> if (now - t < REMOVED_MARK_TTL_MS) removedIds[k] = t }
+        endpoints.forEach { (k, t) -> if (now - t < REMOVED_MARK_TTL_MS) removedEndpoints[k] = t }
+    }
+
+    /** Snapshot of the removal marks (expired entries filtered), for
+     *  persistence by the ViewModel. */
+    fun removedMarks(): Pair<Map<String, Long>, Map<String, Long>> {
+        val now = System.currentTimeMillis()
+        fun fresh(m: Map<String, Long>) = m.filterValues { now - it < REMOVED_MARK_TTL_MS }
+        return fresh(removedIds.toMap()) to fresh(removedEndpoints.toMap())
+    }
+
+    private fun markRemoved(id: String, endpoint: String?) {
+        val now = System.currentTimeMillis()
+        removedIds[id] = now
+        if (endpoint != null) {
+            removedEndpoints[endpoint] = now
+            removedEndpointById[id] = endpoint
+        }
+        onRemovedMarksChanged?.invoke()
+    }
+
+    private fun unmark(id: String, endpoint: String?) {
+        var changed = removedIds.remove(id) != null
+        // clear the endpoint recorded WITH the id mark: the peer's address
+        // may have changed between removal and re-add, so clearing only the
+        // newly advertised endpoint would leave the stale one blocking the
+        // peer's announces
+        removedEndpointById.remove(id)?.let { linked ->
+            if (removedEndpoints.remove(linked) != null) changed = true
+        }
+        if (endpoint != null && removedEndpoints.remove(endpoint) != null) changed = true
+        if (changed) onRemovedMarksChanged?.invoke()
+    }
+
+    /** True when [peer] is a contact the local user removed (id match, or
+     *  endpoint match for a contact removed under an "ip:..." placeholder
+     *  whose real device id was never learned). */
+    private fun isRemoved(peer: Peer): Boolean {
+        val now = System.currentTimeMillis()
+        if (removedIds[peer.id]?.let { now - it < REMOVED_MARK_TTL_MS } == true) return true
+        if (peer.ipAddress.isNotEmpty()) {
+            val ep = "${peer.ipAddress}:${peer.port}"
+            if (removedEndpoints[ep]?.let { now - it < REMOVED_MARK_TTL_MS } == true) return true
+        }
+        return false
     }
 
     // -------------------------------------------------------------- messages
@@ -321,6 +443,18 @@ object DirectChatManager {
         if (myId.isEmpty() || peer.id == myId) return null
         sessions[peer.id]?.let { if (it.alive) return peer.id }
         addContact(Contact(peer.id, peer.name, peer.ipAddress, peer.port))
+        // serialize dials per peer (see dialLocks); a concurrent dial may
+        // have established the session while we waited for the lock
+        val dialLock = dialLocks.computeIfAbsent(peer.id) { Any() }
+        synchronized(dialLock) {
+            sessions[peer.id]?.let { if (it.alive) return peer.id }
+            return dialPeer(peer, quiet)
+        }
+    }
+
+    /** The actual dial + secured handshake (runs under the peer's dial
+     *  lock). Returns the member's REAL device id, or null on failure. */
+    private fun dialPeer(peer: Peer, quiet: Boolean): String? {
         var sock: Socket? = null
         return try {
             sock = Socket()
@@ -376,7 +510,13 @@ object DirectChatManager {
                         "网络不可达（请检查双方是否在同一局域网）"
                     is SecurityException ->
                         "缺少本地网络权限"
-                    else -> e.message ?: "未知错误"
+                    else -> if (e.message == "no direct_ack" || e.message == "bad direct_ack") {
+                        // the handshake SUCCEEDED but the peer hung up
+                        // instead of acking: the classic signature of a peer
+                        // that dropped the hello on purpose (removed
+                        // contact) — or died mid-handshake
+                        "对方未接受连接（应用刚退出、不在同一网络，或已被对方移除）"
+                    } else e.message ?: "未知错误"
                 }
                 _events.tryEmit("无法连接成员 ${peer.name}（${peer.ipAddress}:${peer.port}）：$reason")
             }
@@ -394,6 +534,13 @@ object DirectChatManager {
     fun handleDirectHello(socket: Socket, wire: Wire, hello: NetworkPacket, peerIdent: String?) {
         val peer = hello.peer
         if (peer == null || peer.id == myId) {
+            closeSocket(socket)
+            return
+        }
+
+        // A contact the local user REMOVED must not be resurrected by the
+        // peer's presence redial (peers announce forever now): silently drop.
+        if (isRemoved(peer)) {
             closeSocket(socket)
             return
         }
@@ -546,6 +693,77 @@ object DirectChatManager {
                     ) {
                         ensureRedialLoop(peerId)
                     }
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- presence
+
+    /**
+     * The app is up (start, return to foreground, network change, contact
+     * added): announce to every contact by dialing the ones without a live
+     * session. The dial IS the notification — it rides the identity
+     * handshake, so the peer flips us to online with no polling and both
+     * sides' outboxes flush. Wakes the reconnect sweep immediately; between
+     * events the sweep alone repairs dead sessions ([PRESENCE_SWEEP_MS]).
+     */
+    fun announceOnline() {
+        if (myId.isEmpty()) return
+        synchronized(presenceGuard) {
+            if (!presenceStarted) {
+                presenceStarted = true
+                thread(isDaemon = true, name = "direct-presence") { presenceLoop() }
+            }
+        }
+        presenceWake.release()
+    }
+
+    private fun presenceLoop() {
+        while (true) {
+            try {
+                dialDeadContacts()
+            } catch (e: Exception) {
+                Log.w(TAG, "presence sweep failed", e)
+            }
+            try {
+                // wake early on announce events; otherwise the
+                // low-frequency fallback sweep
+                presenceWake.tryAcquire(PRESENCE_SWEEP_MS, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                return
+            }
+            // coalesce piled-up wakes into one pass
+            while (presenceWake.tryAcquire()) {
+            }
+        }
+    }
+
+    /** Dial every contact without a live session. Deterministic dialer:
+     *  with real ids on both sides only the member with the SMALLER id
+     *  dials, so a simultaneous announce from both apps cannot race into
+     *  mismatched session pairs (same rule as the group mesh). A
+     *  placeholder "ip:..." contact always dials — the other side does not
+     *  know this device yet, so nobody else would establish the session. */
+    private fun dialDeadContacts() {
+        if (myId.isEmpty()) return
+        for (contact in _contacts.value.values) {
+            if (contact.ip.isBlank() || contact.port <= 0) continue
+            if (sessions[contact.id]?.alive == true) continue
+            if (!contact.id.startsWith("ip:") && myId >= contact.id) continue
+            // a redial loop already hammers this peer for the outbox
+            if (contact.id in redialLoops) continue
+            if (!presenceDialing.add(contact.id)) continue
+            thread(isDaemon = true, name = "direct-announce-${contact.id}") {
+                try {
+                    startChatSync(
+                        Peer(contact.id, contact.name, contact.ip, contact.port),
+                        quiet = true
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "presence dial to ${contact.id} failed", e)
+                } finally {
+                    presenceDialing.remove(contact.id)
                 }
             }
         }

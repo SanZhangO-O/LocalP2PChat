@@ -79,7 +79,8 @@ fun LocalChatApp(viewModel: ChatViewModel = viewModel()) {
         }
         if (currentScreen == Screen.Settings) settingsFrom = null
         if (currentScreen == Screen.DirectChat) {
-            activeDirectPeerId?.let { viewModel.closeDirectChat(it) }
+            // keep the session alive: with presence ("app running = online")
+            // backing out of a chat must not tear the connection down
             activeDirectPeerId = null
         }
     }
@@ -410,7 +411,8 @@ fun LocalChatApp(viewModel: ChatViewModel = viewModel()) {
                     messages = directMessages,
                     downloadStates = downloadStates,
                     onBack = {
-                        viewModel.closeDirectChat(peerId)
+                        // keep the session alive (presence re-establishes
+                        // anyway; closing only causes offline flicker)
                         activeDirectPeerId = null
                         currentScreenName = Screen.MemberList.name
                     },

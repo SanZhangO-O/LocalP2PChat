@@ -8,6 +8,10 @@ import android.content.Context.MODE_PRIVATE
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.util.Log
@@ -53,6 +57,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -232,10 +237,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteDirectMessage(peerId: String, messageId: String, senderId: String) =
         DirectChatManager.deleteMessage(peerId, messageId, senderId)
 
-    fun closeDirectChat(peerId: String) {
-        DirectChatManager.closeChat(peerId)
-    }
-
     fun addDirectContact(ipPort: String, name: String): Boolean {
         val parsed = parseHostPort(ipPort)
         // validate: a syntactically broken endpoint (mangled IP, bad port)
@@ -245,9 +246,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // parity).
         if (!isValidHost(parsed.host) || parsed.port !in 1..65535) return false
         val nick = name.trim().ifBlank { parsed.host }
-        DirectChatManager.addContact(
-            DirectChatManager.Contact("ip:${parsed.host}:${parsed.port}", nick, parsed.host, parsed.port)
+        val contact = DirectChatManager.Contact(
+            "ip:${parsed.host}:${parsed.port}", nick, parsed.host, parsed.port
         )
+        DirectChatManager.addContact(contact)
+        // A manual add is an explicit user action: dial LOUD right away
+        // (startChat's default). The presence sweep also picks the new
+        // contact up, but it is deliberately silent — without this loud
+        // dial, adding an unreachable member gives NO feedback at all.
+        // Success: "已连接 X" toast; failure: the reason toast.
+        DirectChatManager.startChat(
+            Peer(contact.id, contact.name, contact.ip, contact.port)
+        ) { }
         return true
     }
 
@@ -418,6 +428,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Removed-contact marks persisted across restarts, so a peer that keeps
+     *  announcing cannot resurrect a contact the user deleted. */
+    @Serializable
+    private data class RemovedMarks(
+        val ids: Map<String, Long> = emptyMap(),
+        val endpoints: Map<String, Long> = emptyMap()
+    )
+
+    private fun loadDirectRemovedMarks(): Pair<Map<String, Long>, Map<String, Long>> {
+        val empty = emptyMap<String, Long>()
+        val raw = directContactsPrefs.getString("direct_removed_marks", null)
+            ?: return empty to empty
+        val parsed = runCatching { directJson.decodeFromString<RemovedMarks>(raw) }.getOrNull()
+            ?: return empty to empty
+        return parsed.ids to parsed.endpoints
+    }
+
+    private fun saveDirectRemovedMarks() {
+        val (ids, endpoints) = DirectChatManager.removedMarks()
+        runCatching {
+            directContactsPrefs.edit()
+                .putString("direct_removed_marks", directJson.encodeToString(RemovedMarks(ids, endpoints)))
+                .apply()
+        }
+    }
+
     // ------------------------------------------------------------- group mesh
     // Member-to-member links inside a group: host-offline messaging + history
     // backfill. Peers are persisted so links survive the host going away.
@@ -565,6 +601,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val hostServer = HostGroupServer(ChatApp.savedPort(getApplication()))
 
     private val isAppForeground = MutableStateFlow(true)
+
+    /** Registered in init to re-announce on network changes; unregistered
+     *  in onCleared. */
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     private val _groups = MutableStateFlow<List<GroupMeta>>(emptyList())
     val groups: StateFlow<List<GroupMeta>> = _groups.asStateFlow()
@@ -778,6 +819,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // devices with no host group, and the local identity must match the
         // one used in groups so contacts unify.
         hostServer.ensureRunning()
+        // honor contact removals from previous processes BEFORE announcing:
+        // a peer that keeps presenting itself must not resurrect a contact
+        // the user deleted (marks carry id + endpoint + removal time)
+        val (removedIds, removedEndpoints) = loadDirectRemovedMarks()
+        DirectChatManager.restoreRemovedMarks(removedIds, removedEndpoints)
         DirectChatManager.configure(
             myId = ChatApp.savedDeviceId(getApplication()),
             myName = ChatApp.savedNickname(getApplication()).ifBlank { "用户" },
@@ -815,6 +861,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         DirectChatManager.onChatMigrated = { fromId, toId ->
             migrateDirectChat(fromId, toId)
         }
+        // Removal marks changed (contact removed / re-added): persist them
+        // so a restart keeps honoring the removals. May fire on session
+        // threads; SharedPreferences.apply() is thread-safe.
+        DirectChatManager.onRemovedMarksChanged = { saveDirectRemovedMarks() }
         viewModelScope.launch {
             DirectChatManager.contacts.collect { contacts ->
                 saveDirectContacts(contacts.values.toList())
@@ -824,8 +874,35 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : LifecycleEventObserver {
             override fun onStateChanged(source: LifecycleOwner, event: Lifecycle.Event) {
                 isAppForeground.value = event.targetState.isAtLeast(Lifecycle.State.STARTED)
+                // sockets rarely survive doze/background: returning to the
+                // foreground re-announces (reconnects) every dead contact
+                // session instead of waiting for the presence sweep
+                if (event == Lifecycle.Event.ON_RESUME) {
+                    DirectChatManager.announceOnline()
+                }
             }
         })
+
+        // Network changes (Wi-Fi switch, DHCP renewal) kill every session
+        // and invalidate our advertised address: re-announce as soon as a
+        // LAN-capable network comes up. Registration needs no more than the
+        // already-declared ACCESS_NETWORK_STATE.
+        runCatching {
+            val cm = getApplication<Application>()
+                .getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val request = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                .build()
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    DirectChatManager.announceOnline()
+                }
+            }
+            cm.registerNetworkCallback(request, callback)
+            connectivityManager = cm
+            networkCallback = callback
+        }
 
         loadPersistedGroups()
         restoreDirectSummaries()
@@ -1761,6 +1838,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         DirectChatManager.onSessionEstablished = null
         DirectChatManager.onChatMigrated = null
         DirectChatManager.onCallSignal = null
+        DirectChatManager.onRemovedMarksChanged = null
+        runCatching {
+            networkCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
+        }
+        networkCallback = null
+        connectivityManager = null
         GroupMeshManager.shutdown()
         groupP2pMap.values.forEach { it.stop() }
         pendingP2pManager?.stop()
