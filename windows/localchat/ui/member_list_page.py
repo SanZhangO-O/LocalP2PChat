@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..models import ContactRequest, Peer
-from ..view_model import ChatViewModel
+from ..view_model import MAX_NAME_LENGTH, ChatViewModel
 from .theme import ERROR, PRIMARY, TEXT_SUBTLE
 from .widgets import AvatarLabel, Toast, format_message_time
 
@@ -261,6 +261,7 @@ class MemberListPage(QWidget):
         layout.addWidget(ip_edit)
         name_edit = QLineEdit()
         name_edit.setPlaceholderText("备注名（可选）")
+        name_edit.setMaxLength(MAX_NAME_LENGTH)
         name_edit.setMinimumHeight(38)
         layout.addWidget(name_edit)
         layout.addSpacing(8)

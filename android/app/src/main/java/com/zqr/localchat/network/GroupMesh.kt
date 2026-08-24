@@ -40,6 +40,15 @@ object GroupMeshManager {
     private const val RETRY_INTERVAL_MS = 10_000L
     private const val HISTORY_CAP = 500
 
+    /** 每群 mesh peer 数量上限：mesh_announce 携带的 peer 是对端可控
+     *  输入，无上限会让 peer 表（以及每 peer 一条的重试线程）无界增长。 */
+    private const val MAX_PEERS_PER_GROUP = 64
+
+    /** connectWithRetry 的最多尝试次数：被 announce 的地址可能永远不可达
+     *  （或早已下线），无限重试只会永久烧掉线程与流量；退群/停止时循环
+     *  也靠 state.connected 立即退出。 */
+    private const val MAX_CONNECT_ATTEMPTS = 30
+
     /** History is pushed in batches whose encoded line stays safely under
      *  P2PManager.MAX_LINE_LENGTH — one 500-message packet would exceed the
      *  read cap and drop the link. The cap accounts for the AES-GCM + Base64
@@ -260,6 +269,17 @@ object GroupMeshManager {
         val state = groups[groupId] ?: return
         val mine = state.myPeer?.id
         if (peer.id == mine || peer.id.isEmpty()) return
+        // endpoint 校验：mesh_announce 的 host:port 是对端可控的，非法
+        // 值（空 host / 越界端口）直接忽略，不做任何拨号
+        if (peer.ipAddress.isBlank() || peer.port !in 1..65535) {
+            Log.w(TAG, "ignore peer ${peer.id} with invalid endpoint ${peer.ipAddress}:${peer.port}")
+            return
+        }
+        // peer 数量上限（同 id 的更新/重连不占新名额）
+        if (state.peers.size >= MAX_PEERS_PER_GROUP && !state.peers.containsKey(peer.id)) {
+            Log.w(TAG, "peer cap ($MAX_PEERS_PER_GROUP) reached for $groupId, ignoring ${peer.id}")
+            return
+        }
         state.peers[peer.id] = peer
         // Deterministic linking: only the member with the smaller id connects,
         // the larger one accepts — a simultaneous connect for the same pair
@@ -277,7 +297,11 @@ object GroupMeshManager {
     }
 
     private fun connectWithRetry(state: GroupState, peer: Peer) {
-        while (state.connected) {
+        // 有界重试：最多 MAX_CONNECT_ATTEMPTS 次，防止对被 announce 的
+        // 不可达地址无限拨号；state.connected=false（退群/停止）立即退出
+        var attempts = 0
+        while (state.connected && attempts < MAX_CONNECT_ATTEMPTS) {
+            attempts++
             if (state.links[peer.id]?.alive == true) return
             val link = tryConnect(state, peer)
             if (link == null) {
@@ -320,6 +344,9 @@ object GroupMeshManager {
             runLinkLoop(state, link)
             state.links.remove(peer.id, link)
             updateHasLinks(state.groupId)
+            // 链路确实建立过：重置尝试计数（与 Windows 端一致），一个
+            // 真实但网络不稳的成员不会因累计断连耗尽重拨预算
+            attempts = 0
             if (!state.connected) return
             try { Thread.sleep(RETRY_INTERVAL_MS) } catch (e: InterruptedException) { return }
         }
@@ -433,7 +460,12 @@ object GroupMeshManager {
                         }
                     }
                     "history_reply" -> {
-                        val incoming = packet.messages.orEmpty().map { P2PManager.markFromMe(it, state.myPeer?.id ?: "") }
+                        // 历史里合法包含多个发送者的消息，但每条仍须形状
+                        // 合法：senderId 非空白且内容不超限（与 Windows 端
+                        // 过滤一致），防止伪造 senderId 注入或超长内容入库
+                        val incoming = packet.messages.orEmpty()
+                            .filter { it.senderId.isNotBlank() && P2PManager.isValidContent(it.content) }
+                            .map { P2PManager.markFromMe(it, state.myPeer?.id ?: "") }
                         handleIncoming(state, incoming)
                     }
                     "mesh_announce" -> packet.peer?.let { peer ->

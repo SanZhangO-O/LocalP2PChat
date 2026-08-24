@@ -487,6 +487,16 @@ class HostGroupServer:
             attempts[:] = [
                 ts for ts in attempts if now - ts < self.HANDSHAKE_RATE_WINDOW
             ]
+            # also drop IPs whose whole window has expired: they never come
+            # back to be pruned by the filter above, so the map would grow
+            # without bound as LAN hosts probe the listener and vanish
+            for dead_ip in [
+                key
+                for key, stamps in self._handshake_attempts.items()
+                if key != ip
+                and all(now - ts >= self.HANDSHAKE_RATE_WINDOW for ts in stamps)
+            ]:
+                del self._handshake_attempts[dead_ip]
             if len(attempts) >= self.HANDSHAKE_RATE_LIMIT:
                 return False
             attempts.append(now)
@@ -1166,7 +1176,16 @@ class P2PManager:
         # The handshake already verified the group password (password-bound
         # ECDH); only the packet shape is validated here.
         peer = packet.peer
-        if not packet.group_id or not self._matches_group(packet.group_id) or peer is None:
+        if (
+            not packet.group_id
+            or not self._matches_group(packet.group_id)
+            or peer is None
+            # reject unusable identities: an empty id cannot be addressed or
+            # cleaned up, and a join claiming the HOST's own id would let
+            # the sender impersonate the host towards every member
+            or not peer.id
+            or peer.id == self.my_id
+        ):
             try:
                 wire.send_packet(NetworkPacket(type="join_rejected"))
             except Exception:
@@ -3274,6 +3293,16 @@ class GroupMeshManager:
     HEARTBEAT_TIMEOUT = 45.0
     RETRY_INTERVAL = 10.0
     HISTORY_CAP = 500
+    # Hard cap on tracked peers per group: mesh_announce carries
+    # attacker-controlled peer records, and without a cap a flood of them
+    # would grow the peer map (and the dial backlog behind it) without
+    # bound. Real LAN groups stay far below this.
+    MAX_PEERS_PER_GROUP = 64
+    # A mesh dial gives up after this many consecutive failed attempts
+    # (with linear backoff): an unreachable host:port from a forged
+    # announce must not keep a dial thread retrying forever. Re-entering
+    # the group or a fresh legitimate announce starts a new bounded cycle.
+    MAX_DIAL_ATTEMPTS = 30
     # History is pushed in batches whose encrypted line stays safely under
     # MAX_LINE_LENGTH (the AES-GCM + Base64 expansion is ~1.4x) — one
     # 500-message packet would exceed the read cap and drop the link
@@ -3518,8 +3547,19 @@ class GroupMeshManager:
             state = self._groups.get(group_id)
             if state is None:
                 return
+            # endpoint sanity: never dial an empty host or an out-of-range
+            # port — both come straight off the wire inside mesh_announce
+            if not peer.ip_address or not 1 <= peer.port <= 65535:
+                return
             mine = state["my_peer"].id if state["my_peer"] else ""
             if peer.id == mine or not peer.id:
+                return
+            # per-group peer cap (see MAX_PEERS_PER_GROUP): once full, only
+            # already-known peers are refreshed, never new ones
+            if (
+                peer.id not in state["peers"]
+                and len(state["peers"]) >= self.MAX_PEERS_PER_GROUP
+            ):
                 return
             state["peers"][peer.id] = peer
             # deterministic linking: only the smaller id dials
@@ -3541,7 +3581,29 @@ class GroupMeshManager:
                 if state is not None:
                     state["dialing"].discard(peer.id)
 
+    def _dial_sleep(self, group_id: str, seconds: float) -> bool:
+        """Sleep in small slices while the group stays live; returns False as
+        soon as the group is left/stopped, so a dial thread exits promptly
+        (leave_group flips the state alive flag) instead of blocking inside
+        one long time.sleep."""
+        deadline = time.monotonic() + seconds
+        while True:
+            with self._lock:
+                state = self._groups.get(group_id)
+                if state is None or not state["connected"]:
+                    return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(0.5, remaining))
+
     def _dial_with_retry(self, group_id: str, peer: Peer) -> None:
+        # Bounded retry (see MAX_DIAL_ATTEMPTS): a peer address learned from
+        # a mesh_announce may be garbage or unreachable forever, and the
+        # loop must not dial it for the lifetime of the process. A link that
+        # DID come up resets the counter: a flaky-but-real member is still
+        # retried patiently across drops.
+        failures = 0
         while True:
             with self._lock:
                 state = self._groups.get(group_id)
@@ -3552,7 +3614,18 @@ class GroupMeshManager:
                     return
             link = self._try_connect(group_id, peer)
             if link is None:
-                time.sleep(self.RETRY_INTERVAL)
+                failures += 1
+                if failures >= self.MAX_DIAL_ATTEMPTS:
+                    logger.warning(
+                        "mesh dial to %s (%s:%d) gave up after %d failed attempts",
+                        peer.id, peer.ip_address, peer.port, failures,
+                    )
+                    return
+                # linear backoff up to a minute between attempts
+                if not self._dial_sleep(
+                    group_id, min(self.RETRY_INTERVAL * failures, 60.0)
+                ):
+                    return
                 continue
             with self._lock:
                 state = self._groups.get(group_id)
@@ -3572,6 +3645,7 @@ class GroupMeshManager:
                 state["links"][peer.id] = link
                 self._set_has_links(group_id, True)
                 history = list(state["messages"])[-self.HISTORY_CAP:]
+            failures = 0
             # push our history so the peer backfills what it missed (both
             # sides push; receivers dedup by id)
             if history:
@@ -3583,7 +3657,8 @@ class GroupMeshManager:
                     if state["links"].get(peer.id) is link:
                         state["links"].pop(peer.id, None)
                     self._set_has_links(group_id, bool(state["links"]))
-            time.sleep(self.RETRY_INTERVAL)
+            if not self._dial_sleep(group_id, self.RETRY_INTERVAL):
+                return
 
     def _try_connect(self, group_id: str, peer: Peer) -> Optional[dict]:
         sock = None
@@ -3683,6 +3758,24 @@ class GroupMeshManager:
                         m for m in (packet.messages or [])
                         if m.sender_id and is_valid_content(m.content)
                     ]
+                    with self._lock:
+                        state = self._groups.get(group_id)
+                        # A batch entry reusing a locally-known id with
+                        # DIFFERENT content is a forged overwrite (local
+                        # persistence upserts by id, so accepting it would
+                        # rewrite the stored message). Drop those entries;
+                        # identical id+content dedups naturally by id below.
+                        local_contents = (
+                            {m.id: m.content for m in state["messages"]}
+                            if state is not None
+                            else None
+                        )
+                    if local_contents is not None:
+                        valid_history = [
+                            m for m in valid_history
+                            if m.id not in local_contents
+                            or local_contents[m.id] == m.content
+                        ]
                     if valid_history:
                         self._handle_incoming(group_id, valid_history)
                 elif packet.type == "mesh_announce" and packet.peer is not None:

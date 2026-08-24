@@ -37,6 +37,7 @@ from localchat.models import (
     GroupInfo,
     NetworkPacket,
     Peer,
+    sanitize_file_name,
 )
 from localchat.network import P2PListener, P2PManager
 from localchat.securewire import Handshake
@@ -915,6 +916,184 @@ class CallRoutingTest(ProtocolTestBase):
             host.stop()
 
 
+class SanitizeFileNameTest(unittest.TestCase):
+    """Inbound file names are attacker-controlled and end up inside the
+    suggested save path, so FileInfo.from_dict must sanitize them (path
+    components, control characters, Windows-hostile trailing dots/spaces,
+    length)."""
+
+    def test_path_components_stripped_both_separators(self):
+        self.assertEqual(sanitize_file_name("..\\..\\evil.exe"), "evil.exe")
+        self.assertEqual(sanitize_file_name("../../etc/passwd"), "passwd")
+        self.assertEqual(sanitize_file_name("a/b\\c.txt"), "c.txt")
+        self.assertEqual(sanitize_file_name("plain.txt"), "plain.txt")
+
+    def test_control_characters_stripped(self):
+        self.assertEqual(sanitize_file_name("a\x00b\x1fc\x7fd.txt"), "abcd.txt")
+
+    def test_trailing_dots_and_spaces_stripped(self):
+        self.assertEqual(sanitize_file_name("report.pdf.  "), "report.pdf")
+        self.assertEqual(sanitize_file_name("report.pdf.. .."), "report.pdf")
+
+    def test_length_capped_at_255(self):
+        out = sanitize_file_name("x" * 300 + ".txt")
+        self.assertLessEqual(len(out), 255)
+        self.assertTrue(out.startswith("x"))
+        self.assertEqual(out, "x" * 255)
+
+    def test_empty_and_path_only_names_fall_back(self):
+        self.assertEqual(sanitize_file_name(""), "file")
+        self.assertEqual(sanitize_file_name("   "), "file")
+        self.assertEqual(sanitize_file_name(".."), "file")
+        self.assertEqual(sanitize_file_name("\\\\\\..\\..\\"), "file")
+
+    def test_from_dict_applies_sanitization(self):
+        fi = FileInfo.from_dict({
+            "fileId": "f1",
+            "fileName": "..\\..\\..\\" + "e" * 300 + ".exe.",
+            "fileSize": 10,
+            "downloadHost": "1.2.3.4",
+            "downloadPort": 8080,
+        })
+        self.assertEqual(fi.file_name, "e" * 255)
+        fi2 = FileInfo.from_dict({"fileId": "f2", "fileName": "../..", "fileSize": 1,
+                                  "downloadHost": "h", "downloadPort": 1})
+        self.assertEqual(fi2.file_name, "file")
+
+
+class StrictIntCoercionTest(unittest.TestCase):
+    """Wire fields must be real ints (or pure digit strings): bools, floats
+    and crafted strings are rejected as malformed packets, and port fields
+    are range-checked with 0 meaning 'not set'."""
+
+    PEER = {"id": "p", "name": "n", "ipAddress": "1.2.3.4", "port": 9999}
+
+    def test_peer_port(self):
+        self.assertEqual(Peer.from_dict(self.PEER).port, 9999)
+        self.assertEqual(Peer.from_dict({**self.PEER, "port": "9999"}).port, 9999)
+        self.assertEqual(Peer.from_dict({**self.PEER, "port": 0}).port, 0)
+        for bad in (True, False, 1.5, "99x99", "", " 80", "1e3", None, [9]):
+            with self.assertRaises(ValueError):
+                Peer.from_dict({**self.PEER, "port": bad})
+        for bad_port in (-1, 65536, "70000"):
+            with self.assertRaises(ValueError):
+                Peer.from_dict({**self.PEER, "port": bad_port})
+
+    def test_file_info_fields(self):
+        base = {"fileId": "f", "fileName": "a.txt", "downloadHost": "1.2.3.4",
+                "downloadPort": 8080}
+        self.assertEqual(FileInfo.from_dict({**base, "fileSize": "12"}).file_size, 12)
+        self.assertEqual(FileInfo.from_dict({**base, "fileSize": 0}).file_size, 0)
+        self.assertEqual(FileInfo.from_dict({**base, "downloadPort": "8080"}).download_port, 8080)
+        self.assertEqual(FileInfo.from_dict({**base, "downloadPort": 0}).download_port, 0)
+        for bad in (True, 12.0, "1e3", None, -1, "-5"):
+            with self.assertRaises(ValueError):
+                FileInfo.from_dict({**base, "fileSize": bad})
+        for bad_port in (65536, -2, True, "8080.0"):
+            with self.assertRaises(ValueError):
+                FileInfo.from_dict({**base, "downloadPort": bad_port})
+
+    def test_chat_message_timestamp(self):
+        base = {"id": "m", "senderId": "s", "content": "hi"}
+        self.assertEqual(ChatMessage.from_dict({**base, "timestamp": "123"}).timestamp, 123)
+        for bad in (True, 1.5, "now", None):
+            with self.assertRaises(ValueError):
+                ChatMessage.from_dict({**base, "timestamp": bad})
+
+    def test_call_info_media_port(self):
+        base = {"callId": "c", "callerId": "a", "callerName": "A", "calleeId": "b"}
+        self.assertEqual(CallInfo.from_dict({**base, "mediaPort": 0}).media_port, 0)
+        self.assertEqual(CallInfo.from_dict({**base, "mediaPort": "35001"}).media_port, 35001)
+        for bad in (True, 35001.0, "x", -1, 65536):
+            with self.assertRaises(ValueError):
+                CallInfo.from_dict({**base, "mediaPort": bad})
+        # the strict bool checks on accepted/audioEnabled stay in force
+        with self.assertRaises(ValueError):
+            CallInfo.from_dict({**base, "accepted": 1})
+
+
+class JoinIdentityTest(ProtocolTestBase):
+    """_handle_join must refuse a join with an empty peer id or one that
+    impersonates the host, while a same-id rejoin still replaces the old
+    connection (identity-spoofing regression)."""
+
+    PORT = 19201
+
+    def test_join_with_empty_peer_id_rejected(self):
+        host = self.start_host()
+        try:
+            s = FakePeerClient.connect("127.0.0.1", self.PORT)
+            s.hs_join(GROUP_NAME, GROUP_PASSWORD)
+            s.send(NetworkPacket(
+                type="join", group_id=GROUP_NAME,
+                peer=Peer("", "\u533f\u540d", "192.168.1.9", 9999),  # 匿名
+            ))
+            resp = s.recv(timeout=3)
+            self.assertIsNotNone(resp)
+            self.assertEqual(resp.type, "join_rejected")
+            self.assertFalse(host.peers, "an empty id must never enter the roster")
+            s.close()
+        finally:
+            host.stop()
+
+    def test_join_impersonating_host_rejected(self):
+        host = self.start_host()
+        try:
+            s = FakePeerClient.connect("127.0.0.1", self.PORT)
+            s.hs_join(GROUP_NAME, GROUP_PASSWORD)
+            s.send(NetworkPacket(
+                type="join", group_id=GROUP_NAME,
+                peer=Peer(host.my_id, "\u5047\u4e3b\u673a", "192.168.1.9", 9999),  # 假主机
+            ))
+            resp = s.recv(timeout=3)
+            self.assertIsNotNone(resp)
+            self.assertEqual(resp.type, "join_rejected")
+            self.assertNotIn(host.my_id, host.peers, "the host id must not be hijackable")
+            s.close()
+        finally:
+            host.stop()
+
+    def test_same_id_rejoin_still_replaces_connection(self):
+        host = self.start_host()
+        try:
+            m1 = self.join_member(MEMBER_PEER)
+            m2 = self.join_member(MEMBER_PEER)
+            # the fresh connection is now the registered one for the id
+            # (join_ack is only sent after registration, so this is stable);
+            # compare the TCP endpoints because the host holds the server
+            # side of m2's connection
+            registered = host._connected_clients.get(MEMBER_PEER.id, {}).get("sock")
+            self.assertIsNotNone(registered)
+            self.assertEqual(
+                registered.getpeername(),
+                m2.sock.getsockname(),
+                "the rejoin must REPLACE the old connection for the same id",
+            )
+            # ...and the stale one was closed: no further traffic ever
+            # arrives on it
+            self.assertTrue(
+                wait_until(lambda: m1.recv(timeout=0.3, skip_heartbeat=True) is None),
+                "the stale connection must deliver nothing after replacement",
+            )
+            self.assertTrue(
+                wait_until(lambda: MEMBER_PEER.id in host.peers),
+                "the rejoining member must stay in the roster",
+            )
+            m2.send(NetworkPacket(type="chat", message=ChatMessage(
+                "m-rejoin", "hi", 1, MEMBER_PEER.id, "\u5f20\u4e09",
+            )))
+            packet = m2.recv(timeout=3, skip_heartbeat=True)
+            self.assertIsNone(packet, "sender must not get its own chat echo")
+            self.assertTrue(
+                wait_until(lambda: any(m.id == "m-rejoin" for m in host.messages)),
+                "the fresh connection must be the live one",
+            )
+            m1.close()
+            m2.close()
+        finally:
+            host.stop()
+
+
 class MediaFramingTest(unittest.TestCase):
     def setUp(self):
         install_identity()
@@ -945,6 +1124,34 @@ class MediaFramingTest(unittest.TestCase):
         huge = (MAX_FRAME_WIRE_LEN + 1).to_bytes(4, "big")
         dec.feed(b"\x00" + huge + b"x" * 16)
         self.assertEqual(dec.frames, [], "oversized frames must be discarded")
+
+    def test_video_frame_decode_size_capped(self):
+        """A video frame whose header claims dimensions over the decode cap
+        is dropped BEFORE the pixel buffer is allocated (decompression
+        bomb); normal frames still decode."""
+        from PyQt6.QtCore import QBuffer, QIODevice
+        from PyQt6.QtGui import QImage
+
+        from localchat.call import VIDEO_MAX_DECODE_EDGE, _decode_video_frame
+
+        def jpeg_of(width, height):
+            img = QImage(width, height, QImage.Format.Format_RGB32)
+            img.fill(0)
+            buf = QBuffer()
+            buf.open(QIODevice.OpenModeFlag.ReadWrite)
+            if not img.save(buf, "JPG"):
+                self.skipTest("Qt JPEG image plugin unavailable")
+            return bytes(buf.data())
+
+        bomb = jpeg_of(VIDEO_MAX_DECODE_EDGE + 1, 8)
+        self.assertIsNone(
+            _decode_video_frame(bomb),
+            "an oversized frame must be dropped without decoding",
+        )
+        ok = _decode_video_frame(jpeg_of(32, 24))
+        self.assertIsNotNone(ok)
+        self.assertFalse(ok.isNull())
+        self.assertEqual((ok.width(), ok.height()), (32, 24))
 
 
 class CallManagerSignalingTest(unittest.TestCase):

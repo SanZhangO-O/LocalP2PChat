@@ -7,6 +7,54 @@ MAX_LINE_LENGTH = 64 * 1024
 TCP_PORT = 9999
 
 
+def _strict_int(value, field: str) -> int:
+    """Strict integer coercion for wire fields: only real ints (never bool)
+    and pure ASCII digit strings pass; floats, bools and anything else raise
+    ValueError so the packet reader rejects the whole malformed packet
+    instead of silently rounding a crafted value."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value and all("0" <= c <= "9" for c in value):
+        return int(value)
+    raise ValueError(f"{field} must be an integer")
+
+
+def _strict_size(value, field: str) -> int:
+    """_strict_int plus a non-negative lower bound: a negative fileSize is
+    meaningless on the wire and would corrupt UI progress math."""
+    size = _strict_int(value, field)
+    if size < 0:
+        raise ValueError(f"{field} must be non-negative")
+    return size
+
+
+def _strict_port(value, field: str) -> int:
+    """_strict_int plus the 0-65535 port range. 0 means "not set" and stays
+    allowed where the field is optional (existing semantics)."""
+    port = _strict_int(value, field)
+    if not 0 <= port <= 65535:
+        raise ValueError(f"{field} must be a port in 0..65535")
+    return port
+
+
+def sanitize_file_name(name: str) -> str:
+    """Sanitize a file name received from the network before it is ever
+    combined into a local save path: normalize separators and keep only the
+    basename, strip control characters, drop trailing dots/spaces (Windows
+    cannot round-trip them) and cap the length. Returns "file" when nothing
+    usable remains, so a crafted fileName can never push the suggested save
+    path outside the Downloads directory."""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(ch for ch in name if not (ord(ch) < 32 or 0x7F <= ord(ch) < 0xA0))
+    name = name.rstrip(" .")
+    if len(name) > 255:
+        # truncation can re-expose a trailing dot/space
+        name = name[:255].rstrip(" .")
+    return name or "file"
+
+
 @dataclass
 class Peer:
     id: str
@@ -23,7 +71,7 @@ class Peer:
             id=str(d.get("id", "")),
             name=str(d.get("name", "")),
             ip_address=str(d.get("ipAddress", "")),
-            port=int(d.get("port", 0)),
+            port=_strict_port(d.get("port", 0), "peer port"),
         )
 
 
@@ -61,10 +109,13 @@ class FileInfo:
     def from_dict(d: dict) -> "FileInfo":
         return FileInfo(
             file_id=str(d.get("fileId", "")),
-            file_name=str(d.get("fileName", "")),
-            file_size=int(d.get("fileSize", 0)),
+            # every inbound path (group relay, direct chat, restart recovery)
+            # builds its save-path suggestion from this name, so sanitize it
+            # here once instead of trusting the sender's basename
+            file_name=sanitize_file_name(str(d.get("fileName", ""))),
+            file_size=_strict_size(d.get("fileSize", 0), "fileSize"),
             download_host=str(d.get("downloadHost", "")),
-            download_port=int(d.get("downloadPort", 0)),
+            download_port=_strict_port(d.get("downloadPort", 0), "downloadPort"),
             file_key=str(d.get("fileKey", "")),
         )
 
@@ -107,7 +158,7 @@ class ChatMessage:
         return ChatMessage(
             id=msg_id,
             content=str(d.get("content", "")),
-            timestamp=int(d.get("timestamp", 0)),
+            timestamp=_strict_int(d.get("timestamp", 0), "timestamp"),
             sender_id=sender_id,
             sender_name=str(d.get("senderName", "")),
             file_info=file_info,
@@ -227,7 +278,7 @@ class CallInfo:
             caller_id=str(d.get("callerId", "")),
             caller_name=str(d.get("callerName", "")),
             callee_id=str(d.get("calleeId", "")),
-            media_port=int(d.get("mediaPort", 0)),
+            media_port=_strict_port(d.get("mediaPort", 0), "mediaPort"),
             accepted=accepted,
             audio_enabled=audio_enabled,
         )

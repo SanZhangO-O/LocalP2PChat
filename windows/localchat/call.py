@@ -36,8 +36,8 @@ import uuid
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
-from PyQt6.QtGui import QImage
+from PyQt6.QtCore import QBuffer, QIODevice, QObject, QTimer, pyqtSignal
+from PyQt6.QtGui import QImage, QImageReader
 from PyQt6.QtMultimedia import (
     QAudio,
     QAudioFormat,
@@ -70,6 +70,15 @@ MAX_FRAME_WIRE_LEN = MAX_FRAME_LEN + GCM_NONCE_LEN + 16
 VIDEO_MAX_EDGE = 640
 VIDEO_JPEG_QUALITY = 70
 VIDEO_INTERVAL = 0.08  # ~12 fps
+
+# A decoded inbound video frame may be at most this many pixels on an edge:
+# QImageReader.size() reads the dimensions from the image header without
+# decoding, so a small crafted "decompression bomb" (tiny JPEG claiming
+# huge dimensions) is dropped before the pixel buffer is ever allocated.
+VIDEO_MAX_DECODE_EDGE = 4096
+
+# Rate limit for the oversized-frame warning (monotonic timestamp).
+_FRAME_SIZE_WARN_AT = 0.0
 
 # Audio jitter/pacing: pre-roll before playback starts, a hard ceiling on the
 # pending playback buffer (drop-oldest), and a bounded send queue so capture
@@ -106,6 +115,31 @@ def _read_exact(sock: socket.socket, n: int) -> bytes:
             return None
         buf.extend(chunk)
     return bytes(buf)
+
+
+def _decode_video_frame(payload: bytes):
+    """Decode an inbound video frame with a size ceiling. The caller has
+    already AES-GCM verified the payload (authentication stays BEFORE any
+    decoding); QImageReader.size() reads only the image header, so frames
+    wider/taller than VIDEO_MAX_DECODE_EDGE — a decompression bomb — are
+    dropped and logged (rate-limited) without allocating the pixel buffer.
+    Returns a QImage (possibly null on undecodable input) or None."""
+    global _FRAME_SIZE_WARN_AT
+    buf = QBuffer()
+    buf.setData(payload)
+    buf.open(QIODevice.OpenModeFlag.ReadOnly)
+    reader = QImageReader(buf)
+    size = reader.size()
+    if size.width() > VIDEO_MAX_DECODE_EDGE or size.height() > VIDEO_MAX_DECODE_EDGE:
+        now = time.monotonic()
+        if now - _FRAME_SIZE_WARN_AT >= 5.0:
+            _FRAME_SIZE_WARN_AT = now
+            logger.warning(
+                "dropped oversized video frame %dx%d (cap %d)",
+                size.width(), size.height(), VIDEO_MAX_DECODE_EDGE,
+            )
+        return None
+    return reader.read()
 
 
 def build_frame(channel: int, payload: bytes) -> bytes:
@@ -844,8 +878,10 @@ class CallManager(QObject):
                     # other side is not who we secured the channel with
                     return
                 if channel == CH_VIDEO:
-                    qimg = QImage.fromData(payload)
-                    if not qimg.isNull():
+                    # AEAD already verified above; decode with the header
+                    # size check (no full decode for oversized frames)
+                    qimg = _decode_video_frame(payload)
+                    if qimg is not None and not qimg.isNull():
                         self.remote_frame.emit(qimg)
                 elif channel == CH_AUDIO:
                     self.remote_audio.emit(bytes(payload))

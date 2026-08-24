@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import network as network_module
-from ..view_model import ChatViewModel
+from ..view_model import MAX_NAME_LENGTH, ChatViewModel
 from .widgets import Toast
 
 
@@ -64,6 +64,7 @@ class SettingsPage(QWidget):
         nick_layout.addWidget(nick_hint)
         self.nick_edit = QLineEdit()
         self.nick_edit.setPlaceholderText("昵称")
+        self.nick_edit.setMaxLength(MAX_NAME_LENGTH)
         self.nick_edit.setMaximumWidth(320)
         self.nick_edit.setMinimumHeight(36)
         nick_layout.addWidget(self.nick_edit)
@@ -190,7 +191,9 @@ class SettingsPage(QWidget):
 
     def _save_port(self):
         text = self.port_edit.text().strip()
-        if not text.isdigit() or not (1 <= int(text) <= 65535):
+        # isascii() first: str.isdigit() alone is True for superscripts ("²")
+        # and other unicode digits, which int() then rejects with ValueError
+        if not (text.isascii() and text.isdigit()) or not (1 <= int(text) <= 65535):
             self.port_error.setText("端口必须在 1-65535 之间")
             self.port_error.show()
             return

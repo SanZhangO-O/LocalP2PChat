@@ -25,6 +25,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 object Constants {
     const val TCP_PORT = 9999
@@ -64,6 +65,17 @@ class HostGroupServer(port: Int) {
     /** Bumped on every start/stop so a stale runServer() coroutine (from a
      *  cancelled/restarted generation) can never bind or publish state. */
     private var generation = 0
+
+    /** 并发处理中的入站连接计数（上限 MAX_ACTIVE_CONNECTIONS）：无上限时
+     *  每个连接都要跑一次 PBKDF2 握手，单台局域网主机可仅凭握手流量打满
+     *  手机 CPU（PBKDF2 CPU DoS）。 */
+    private val activeConnections = AtomicInteger(0)
+
+    /** 每源 IP 握手限流：HANDSHAKE_RATE_WINDOW_MS 内每 IP 最多
+     *  HANDSHAKE_RATE_LIMIT 次握手尝试（Windows 端 _allow_handshake 的
+     *  对等实现）。 */
+    private val handshakeLimiter =
+        HandshakeRateLimiter(HANDSHAKE_RATE_LIMIT, HANDSHAKE_RATE_WINDOW_MS)
 
     @Volatile
     private var serverSocket: ServerSocket? = null
@@ -175,7 +187,21 @@ class HostGroupServer(port: Int) {
                 break
             }
             client.tcpNoDelay = true
-            serverScope.launch { handleIncoming(client) }
+            // 并发连接上限：超限直接关闭，不进入握手（每个握手都要跑
+            // PBKDF2，无上限会被握手风暴耗尽 CPU）
+            if (activeConnections.get() >= MAX_ACTIVE_CONNECTIONS) {
+                Log.w(TAG, "active connection cap ($MAX_ACTIVE_CONNECTIONS) reached, dropping $client.remoteSocketAddress")
+                closeSocket(client)
+                continue
+            }
+            activeConnections.incrementAndGet()
+            serverScope.launch {
+                try {
+                    handleIncoming(client)
+                } finally {
+                    activeConnections.decrementAndGet()
+                }
+            }
         }
         runCatching { server.close() }
         synchronized(lock) {
@@ -207,6 +233,13 @@ class HostGroupServer(port: Int) {
 
     private suspend fun handleIncoming(socket: Socket) {
         try {
+            // 每源 IP 握手限流：必须放在读 hs_start、跑 PBKDF2 之前，超限
+            // 的连接在读任何数据前就被关闭
+            val sourceIp = socket.inetAddress?.hostAddress ?: "unknown"
+            if (!handshakeLimiter.allow(sourceIp)) {
+                closeSocket(socket)
+                return
+            }
             socket.soTimeout = 15000
             val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
             val writer = PrintWriter(socket.getOutputStream(), true)
@@ -239,6 +272,12 @@ class HostGroupServer(port: Int) {
                         closeSocket(socket)
                         return
                     }
+                    // 密码是为 start.groupId 验证的，hello 不得指向其他群：
+                    // 否则可用 A 群密码读取 B 群的 mesh 状态与全部历史
+                    if (hello.groupId != start.groupId) {
+                        closeSocket(socket)
+                        return
+                    }
                     GroupMeshManager.handleMeshHello(socket, wire, hello)
                 }
                 Protocol.MODE_QUERY, Protocol.MODE_JOIN -> {
@@ -251,6 +290,13 @@ class HostGroupServer(port: Int) {
                     }
                     val packet = wire.recvPacket() ?: run { closeSocket(socket); return }
                     if (packet.type != mode) {
+                        closeSocket(socket)
+                        return
+                    }
+                    // 内层 packet 必须指向握手认证的同一个群：密码是为
+                    // start.groupId 验证的，放行其他 id 会让 A 群成员借
+                    // 成员赞助路径探测 B 群的成员列表/主机地址
+                    if (packet.groupId != start.groupId) {
                         closeSocket(socket)
                         return
                     }
@@ -291,10 +337,62 @@ class HostGroupServer(port: Int) {
         private const val TAG = "HostGroupServer"
         private val json = Json { ignoreUnknownKeys = true }
 
+        /** 并发处理中的入站连接上限：手机端低于 Windows 的 256——一个
+         *  群聊的成员规模远小于该值，纯握手风暴则被挡在外面。 */
+        private const val MAX_ACTIVE_CONNECTIONS = 64
+
+        /** 每源 IP 握手限流参数：60 秒窗口内最多 60 次握手尝试，正常
+         *  群聊流量远低于该限制（与 Windows 端一致）。 */
+        private const val HANDSHAKE_RATE_LIMIT = 60
+        private const val HANDSHAKE_RATE_WINDOW_MS = 60_000L
+
         private fun closeSocket(socket: Socket?) {
             socket ?: return
             runCatching { socket.close() }
         }
+    }
+}
+
+/**
+ * 每源 IP 的滑动窗口握手限流器：[windowMs] 时间窗内每 IP 最多 [limit]
+ * 次握手尝试。超限的连接在读 hs_start、跑 PBKDF2 之前就被关闭，防止单
+ * 台局域网主机用无休止的握手耗尽 CPU（PBKDF2 CPU DoS）。已跟踪 IP 数
+ * 达到上限时先清理整个窗口都已过期的 key，保证 IP 表不会无界增长。
+ *
+ * 时钟用 System.nanoTime()（单调）：currentTimeMillis 是墙钟，NTP 校时
+ * 回跳会让窗口永久卡死、前跳则让限流瞬间失效。
+ */
+internal class HandshakeRateLimiter(
+    private val limit: Int,
+    private val windowMs: Long,
+    private val clock: () -> Long = System::nanoTime
+) {
+    private val attempts = HashMap<String, MutableList<Long>>()
+
+    /** 最多跟踪的源 IP 数：正常局域网远达不到；达到后先清理过期 key。 */
+    private val maxTrackedKeys = 1024
+
+    @Synchronized
+    fun allow(ip: String): Boolean {
+        val now = clock()
+        // 清理整个窗口都已过期的 key，防止 IP 集合无界增长
+        if (attempts.size >= maxTrackedKeys) {
+            val iter = attempts.entries.iterator()
+            while (iter.hasNext()) {
+                val entry = iter.next()
+                if (entry.value.all { ts -> now - ts >= windowMs }) iter.remove()
+            }
+        }
+        val list = attempts[ip]
+        if (list == null) {
+            if (attempts.size >= maxTrackedKeys) return false
+            attempts[ip] = arrayListOf(now)
+            return true
+        }
+        list.removeAll { ts -> now - ts >= windowMs }
+        if (list.size >= limit) return false
+        list.add(now)
+        return true
     }
 }
 
@@ -742,6 +840,14 @@ class P2PManager(
             return
         }
         val newPeer = packet.peer
+        // 拒绝身份无效的加入：空 id 无法寻址/去重，伪造宿主自己的 myId
+        // 会被成员当作宿主本人（组内身份冒充）。同 id 重连替换旧连接的
+        // 重连语义不受影响（有效的同 id 仍走下面的替换逻辑）。
+        if (newPeer.id.isBlank() || newPeer.id == myId) {
+            wire.sendPacket(NetworkPacket(type = "join_rejected"))
+            closeSocket(socket)
+            return
+        }
         _peers.update { it + (newPeer.id to newPeer) }
         // A rejoin with the same stable peer id replaces the old connection: the
         // stale connection would otherwise keep a live input channel for that

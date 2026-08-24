@@ -1058,5 +1058,137 @@ class ViewModelFlowTest(unittest.TestCase):
         )
 
 
+    def test_query_group_validates_endpoint(self):
+        """Regression: query_group used to accept any non-empty host/id — a
+        mangled IP, out-of-range port or wrong-length join id sailed through
+        and the query then just timed out with no clue. It must now validate
+        like add_direct_contact (8-digit id, plausible host, 1-65535 port)."""
+        network_module.TCP_PORT = 10041
+        vm = make_vm(_fresh_db("lc_test_query_valid.db"))
+        self._vms = [vm]
+        toasts = []
+        vm.status_message.connect(lambda t: toasts.append(t))
+
+        bad_cases = [
+            ("1234567", "192.168.0.1", None),  # 7-digit join id
+            ("123456789", "192.168.0.1", None),  # 9-digit join id
+            ("12345678", "127001", None),  # mangled host (dots lost)
+            ("12345678", "192.168.0.300", None),  # octet out of range
+            ("12345678", "192.168.0.1", 0),  # explicit port out of range
+            ("12345678", "192.168.0.1", 70000),
+            ("12345678", "192.168.0.1:0", None),  # port inside the address
+        ]
+        for gid, ip, port in bad_cases:
+            toasts.clear()
+            vm.query_group("\u6210\u5458", gid, ip, port=port)
+            self.assertIsNone(vm.setup_p2p, f"must not dial for {gid}/{ip}/{port}")
+            self.assertIn(
+                "\u5730\u5740\u65e0\u6548", "".join(toasts), f"must toast for {gid}/{ip}/{port}"
+            )
+
+        # empty nick: silent return, and the empty name is never persisted
+        vm.query_group("   ", "12345678", "192.168.0.1")
+        self.assertIsNone(vm.setup_p2p)
+        self.assertEqual(vm.store.get_setting("nickname", ""), "")
+
+        # endpoint validation wins over the nickname check: a blank nick with
+        # a bad endpoint still surfaces the toast (not a silent no-op)
+        toasts.clear()
+        vm.query_group("   ", "1234567", "192.168.0.1")
+        self.assertIsNone(vm.setup_p2p)
+        self.assertIn("\u5730\u5740\u65e0\u6548", "".join(toasts))
+
+        # a valid endpoint proceeds to an actual query
+        vm.query_group("\u6210\u5458", "12345678", "127.0.0.1", port=10041)
+        self.assertIsNotNone(vm.setup_p2p)
+        self.assertEqual(vm.pending_host_ip, "127.0.0.1")
+        self.assertEqual(vm.pending_host_port, 10041)
+
+    def test_group_name_exists(self):
+        """Same-name creation silently replaces the old instance (same derived
+        group id); the VM must expose a lookup so the UI can confirm first."""
+        network_module.TCP_PORT = 10042
+        dba = _fresh_db("lc_test_gname_exists.db")
+        vm = make_vm(dba)
+        self._vms = [vm]
+        self.assertFalse(vm.group_name_exists("\u5df2\u5b58\u5728"))
+        vm.create_group("\u4e3b\u673a", "\u5df2\u5b58\u5728")
+        self.assertTrue(vm.group_name_exists("\u5df2\u5b58\u5728"))
+        self.assertFalse(vm.group_name_exists("\u5176\u4ed6\u7fa4"))
+        self.assertFalse(vm.group_name_exists("   "))
+        # still detected after a restart, from the persisted row alone
+        vm.shutdown()
+        vm2 = make_vm(dba)
+        self._vms = [vm2]
+        self.assertTrue(vm2.group_name_exists("\u5df2\u5b58\u5728"))
+
+    def test_display_names_capped_at_20(self):
+        """Nicknames, group names and contact remarks are truncated to
+        MAX_NAME_LENGTH (Android parity, 20 chars)."""
+        from localchat.view_model import MAX_NAME_LENGTH
+
+        self.assertEqual(MAX_NAME_LENGTH, 20)
+        network_module.TCP_PORT = 10043
+        vm = make_vm(_fresh_db("lc_test_namecap.db"))
+        self._vms = [vm]
+        vm.create_group("N" * 35, "G" * 35)
+        self.assertEqual(vm.nickname, "N" * 20)
+        meta = vm.groups_list()[0]
+        self.assertEqual(meta.group_name, "G" * 20)
+
+        vm.set_nickname("M" * 35)
+        self.assertEqual(vm.nickname, "M" * 20)
+        self.assertEqual(vm.store.get_setting("nickname", ""), "M" * 20)
+
+        self.assertTrue(vm.add_direct_contact("192.168.0.5:10043", "R" * 35))
+        contact = vm.direct_contacts_list()[-1]
+        self.assertEqual(contact.name, "R" * 20)
+
+    def test_parse_host_port_superscript_no_crash(self):
+        '''Regression: "²".isdigit() is True but int("²") raises ValueError —
+        _parse_host_port must guard with isascii() instead of crashing.'''
+        network_module.TCP_PORT = 10044
+        vm = make_vm(_fresh_db("lc_test_superscript.db"))
+        self._vms = [vm]
+        host, port = vm._parse_host_port("192.168.0.1:\u00b2\u00b2")
+        self.assertEqual(port, network_module.TCP_PORT)
+        self.assertFalse(vm.add_direct_contact("192.168.0.1:\u00b2\u00b2", ""))
+        # full-width digits still normalize and parse
+        host, port = vm._parse_host_port("192.168.0.1:\uff11\uff10\uff10\uff14\uff14")
+        self.assertEqual((host, port), ("192.168.0.1", 10044))
+
+    def test_corrupt_port_setting_falls_back_to_default(self):
+        """Regression: startup used a bare int() on the persisted port — a
+        corrupted/hand-edited value crashed the constructor."""
+        dba = _fresh_db("lc_test_badport.db")
+        store = ChatStore(dba)
+        store.set_setting("port", "not_a_port")
+        store.close()
+        network_module.TCP_PORT = 10045
+        vm = make_vm(dba)
+        self._vms = [vm]
+        self.assertEqual(vm.port, 10045)
+
+    def test_name_input_widgets_have_max_length(self):
+        """The UI caps nickname/group/remark inputs at 20 chars (double
+        protection on top of the VM-side truncation)."""
+        from localchat.ui.member_list_page import MemberListPage
+        from localchat.ui.settings_page import SettingsPage
+        from localchat.ui.setup_page import SetupPage
+
+        network_module.TCP_PORT = 10046
+        vm = make_vm(_fresh_db("lc_ui_caps.db"))
+        self._vms = [vm]
+        setup = SetupPage(vm, lambda: None, lambda: None)
+        for edit in (setup.create_name_edit, setup.create_group_edit, setup.join_name_edit):
+            self.assertEqual(edit.maxLength(), 20)
+        settings = SettingsPage(vm, lambda: None)
+        self.assertEqual(settings.nick_edit.maxLength(), 20)
+        members = MemberListPage(vm, lambda: None, lambda: None, lambda c: None)
+        setup.deleteLater()
+        settings.deleteLater()
+        members.deleteLater()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,12 @@ from .network import DirectChatListener, DirectChatManager, P2PListener, P2PMana
 from .securewire import DeviceIdentity
 from .storage import ChatStore, SavedGroup, to_saved_message
 
+# Display-name cap for nicknames, group names and contact remarks — Android
+# parity (20 chars). Enforced by truncation here plus QLineEdit.maxLength in
+# the UI; truncation (not rejection) because persisted names may predate the
+# cap and must keep working.
+MAX_NAME_LENGTH = 20
+
 
 @dataclass
 class GroupMeta:
@@ -116,7 +122,14 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # The whole program uses ONE port (default 9999, configurable in the
         # settings dialog). A single shared host server listens on it and
         # serves every host group (see network.HostGroupServer).
-        self.port: int = int(self.store.get_setting("port", "") or network_module.TCP_PORT)
+        try:
+            self.port: int = int(
+                self.store.get_setting("port", "") or network_module.TCP_PORT
+            )
+        except (TypeError, ValueError):
+            # a corrupted / hand-edited port setting must not crash startup:
+            # fall back to the default instead
+            self.port = network_module.TCP_PORT
         self.host_server = network_module.HostGroupServer(self.port)
 
         # Video/audio call engine (created on the GUI thread; it owns the
@@ -303,7 +316,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     def set_nickname(self, name: str) -> None:
         """Persist the display nickname and apply it to every live session so
         new direct chats, calls and group joins immediately use the new name."""
-        nick = name.strip()
+        nick = name.strip()[:MAX_NAME_LENGTH]
         if not nick:
             return
         self.nickname = nick
@@ -572,7 +585,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             return False
         contact = Peer(
             id=f"ip:{ip}:{parsed_port}",
-            name=name.strip() or ip,
+            name=name.strip()[:MAX_NAME_LENGTH] or ip,
             ip_address=ip,
             port=parsed_port,
         )
@@ -996,7 +1009,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         if ":" in host:
             head, _, tail = host.rpartition(":")
             tail = tail.strip()
-            if tail.isdigit():
+            # isascii() first: str.isdigit() alone is True for superscripts
+            # ("²") and other unicode digits, which int() then rejects with
+            # ValueError (a crash, not a validation failure)
+            if tail.isascii() and tail.isdigit():
                 return head.strip(), int(tail)
         return host, network_module.TCP_PORT
 
@@ -1129,8 +1145,8 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.active_messages_changed.emit()
 
     def create_group(self, user_name: str, group_name: str) -> None:
-        nick = user_name.strip()
-        name = group_name.strip()
+        nick = user_name.strip()[:MAX_NAME_LENGTH]
+        name = group_name.strip()[:MAX_NAME_LENGTH]
         if not nick or not name:
             return
 
@@ -1179,6 +1195,27 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.active_server_error_changed.emit()
         self.status_message.emit("群组已创建，等待其他设备加入")
 
+    def group_name_exists(self, name: str) -> bool:
+        """True if a live or persisted group already carries this display
+        name. Creating again with the same name derives the SAME group id and
+        silently replaces the old instance (create_group stops the previous
+        manager), so the UI asks for confirmation first."""
+        wanted = name.strip()
+        if not wanted:
+            return False
+        if any(meta.group_name == wanted for meta in self.groups):
+            return True
+        try:
+            saved = self.store.get_all_groups()
+        except Exception:
+            return False
+        # "direct:..." rows are direct chats stored in the same table; they
+        # are never groups in the list sense
+        return any(
+            sg.group_name == wanted and not sg.group_id.startswith("direct:")
+            for sg in saved
+        )
+
     def query_group(
         self,
         user_name: str,
@@ -1191,12 +1228,29 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         (the group name is only a display label, learned from the host)."""
         join_id = "".join(ch for ch in group_id.strip() if ch.isdigit())
         raw_ip = host_ip.strip()
-        if not join_id or not raw_ip:
-            return
         ip, parsed_port = self._parse_host_port(raw_ip)
         if port is None:
             port = parsed_port
-        nick = user_name.strip()
+        # Validate the whole endpoint BEFORE the nickname check (same style
+        # as add_direct_contact): a wrong-length join id, mangled host or
+        # out-of-range port used to be accepted silently and the query then
+        # just timed out with no clue why. The numeric join id is exactly 8
+        # digits (network.numeric_group_id_of zfills to 8), so anything else
+        # can never match a group. Endpoint errors win over a blank nickname
+        # so the user always gets the "地址无效" toast for the actual fault.
+        if (
+            not join_id
+            or not raw_ip
+            or len(join_id) != 8
+            or not self._is_valid_host(ip)
+            or not 1 <= port <= 65535
+        ):
+            self.status_message.emit("地址无效")
+            return
+        nick = user_name.strip()[:MAX_NAME_LENGTH]
+        if not nick:
+            # never persist an empty nickname (create_group behaves the same)
+            return
         self.nickname = nick
         self.store.set_setting("nickname", nick)
         self._stop_pending_p2p()

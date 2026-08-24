@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..models import MAX_CONTENT_LENGTH, ChatMessage
+from ..models import MAX_CONTENT_LENGTH, ChatMessage, sanitize_file_name
 from ..view_model import ChatViewModel
 from .theme import (
     BUBBLE_MINE,
@@ -52,6 +52,12 @@ TIME_H = 14
 NAME_H = 17
 SIDE_MARGIN = 12
 FILE_CARD_H = 66
+
+
+def _safe_save_name(name: str) -> str:
+    # 远端文件名只作建议名：复用 models.sanitize_file_name（FileInfo 入口
+    # 已经消毒过，这里是针对旧存量数据的二次防线）
+    return sanitize_file_name(name or "")
 
 
 def format_file_size(size: int) -> str:
@@ -520,7 +526,7 @@ class ChatPage(QWidget):
         downloads = os.path.join(os.path.expanduser("~"), "Downloads")
         os.makedirs(downloads, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
-            self.window(), "保存文件", os.path.join(downloads, fi.file_name)
+            self.window(), "保存文件", os.path.join(downloads, _safe_save_name(fi.file_name))
         )
         if not path:
             return

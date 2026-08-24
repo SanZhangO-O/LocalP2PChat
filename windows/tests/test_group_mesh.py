@@ -262,6 +262,98 @@ class GroupMeshTest(unittest.TestCase):
             f"B should backfill the whole large history, got {len(self.rec_b.messages)}",
         )
 
+    def test_history_reply_cannot_overwrite_existing_message(self):
+        """A history batch entry that reuses a locally-known message id with
+        DIFFERENT content must be dropped: local persistence upserts by id,
+        so accepting it would let a peer rewrite already-stored history.
+        Identical id+content still dedups naturally, and brand-new ids in
+        the same batch are still accepted."""
+        self._link()
+        original = make_msg(
+            "\u539f\u59cb\u5185\u5bb9", "aaa-member", "\u6210\u5458A", "h-conflict",
+        )
+        self.a.broadcast(GRP, original)
+        self.assertTrue(
+            wait_until(lambda: any(m.id == "h-conflict" for _, m in self.rec_b.messages)),
+            "B should hold the original message first",
+        )
+        # A pushes a forged history batch over its live link to B: one entry
+        # reuses the known id with tampered content, one is brand new.
+        forged = make_msg(
+            "\u7be1\u6539\u8fc7\u7684\u5185\u5bb9", "aaa-member", "\u6210\u5458A", "h-conflict",
+        )
+        fresh = make_msg(
+            "\u5168\u65b0\u5386\u53f2", "aaa-member", "\u6210\u5458A", "h-fresh",
+        )
+        links = list(self.a._groups[GRP]["links"].values())
+        self.assertTrue(links, "A must have a live link to push over")
+        for link in links:
+            link["wire"].send_packet(
+                NetworkPacket(type="history_reply", group_id=GRP, messages=[forged, fresh])
+            )
+        self.assertTrue(
+            wait_until(lambda: any(m.id == "h-fresh" for _, m in self.rec_b.messages)),
+            "the new entry in the batch must still be accepted",
+        )
+        time.sleep(0.3)
+        stored = [
+            m for m in self.b._groups[GRP]["messages"] if m.id == "h-conflict"
+        ]
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(
+            stored[0].content,
+            "\u539f\u59cb\u5185\u5bb9",
+            "same id + different content must be dropped, not overwrite",
+        )
+        self.assertFalse(
+            any(m.content == "\u7be1\u6539\u8fc7\u7684\u5185\u5bb9" for _, m in self.rec_b.messages),
+            "the tampered content must never surface",
+        )
+
+    def test_add_peer_ignores_invalid_endpoints(self):
+        """mesh_announce carries attacker-controlled peer records: an empty
+        host or an out-of-range port is ignored entirely (never dialed,
+        never entered into the roster)."""
+        mm = GroupMeshManager()
+        mm.attach(Rec())
+        # "zz-me" sorts after every peer id below, so no dial thread spawns
+        mm.enter_group(GRP, Peer("zz-me", "me", "127.0.0.1", 1), [], [], GROUP_PASSWORD)
+        try:
+            for bad in (
+                Peer("p1", "p", "", 1000),          # empty host
+                Peer("p2", "p", "10.0.0.1", 0),     # port 0
+                Peer("p3", "p", "10.0.0.1", 65536), # out of range
+                Peer("p4", "p", "10.0.0.1", -1),    # negative
+            ):
+                mm.add_peer(GRP, bad)
+            self.assertEqual(mm._groups[GRP]["peers"], {}, "invalid endpoints must be ignored")
+            mm.add_peer(GRP, Peer("p5", "p", "10.0.0.1", 5000))
+            self.assertIn("p5", mm._groups[GRP]["peers"])
+        finally:
+            mm.shutdown()
+
+    def test_add_peer_roster_capped(self):
+        """The per-group roster stops growing at MAX_PEERS_PER_GROUP: a NEW
+        id is ignored once full, while an already-known id is still
+        refreshed (e.g. an endpoint update)."""
+        mm = GroupMeshManager()
+        mm.attach(Rec())
+        mm.enter_group(GRP, Peer("zz-me", "me", "127.0.0.1", 1), [], [], GROUP_PASSWORD)
+        try:
+            cap = GroupMeshManager.MAX_PEERS_PER_GROUP
+            for i in range(cap):
+                mm.add_peer(GRP, Peer(f"q-{i:03d}", "p", "10.0.0.1", 5000))
+            self.assertEqual(len(mm._groups[GRP]["peers"]), cap)
+            mm.add_peer(GRP, Peer("q-new", "p", "10.0.0.1", 5000))
+            self.assertNotIn("q-new", mm._groups[GRP]["peers"], "the roster is capped")
+            mm.add_peer(GRP, Peer("q-000", "p", "10.0.0.2", 6000))
+            self.assertEqual(
+                mm._groups[GRP]["peers"]["q-000"].ip_address, "10.0.0.2",
+                "a known id is still refreshed at the cap",
+            )
+        finally:
+            mm.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

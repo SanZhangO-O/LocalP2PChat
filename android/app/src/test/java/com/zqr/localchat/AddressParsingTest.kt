@@ -1,6 +1,7 @@
 package com.zqr.localchat
 
 import com.zqr.localchat.ui.screen.DEFAULT_GROUP_PORT
+import com.zqr.localchat.ui.screen.hasInvalidPort
 import com.zqr.localchat.ui.screen.isValidHost
 import com.zqr.localchat.ui.screen.normalizeAddressInput
 import com.zqr.localchat.ui.screen.parseHostPort
@@ -59,5 +60,17 @@ class AddressParsingTest {
         assertFalse("bare number", isValidHost("999"))
         assertFalse("empty", isValidHost(""))
         assertFalse("space is not a hostname char", isValidHost("host name!"))
+    }
+
+    @Test
+    fun `unusable trailing ports are flagged`() {
+        assertFalse("no port", hasInvalidPort("192.168.0.1"))
+        assertFalse("valid port", hasInvalidPort("192.168.0.1:9999"))
+        assertFalse("trailing colon only", hasInvalidPort("192.168.0.1:"))
+        assertFalse("hostname only", hasInvalidPort("mypc"))
+        assertTrue("port zero", hasInvalidPort("192.168.0.1:0"))
+        assertTrue("one above range", hasInvalidPort("192.168.0.1:65536"))
+        assertTrue("far above range", hasInvalidPort("192.168.0.1:70000"))
+        assertTrue("tail too large to parse", hasInvalidPort("192.168.0.1:99999999999999999999"))
     }
 }

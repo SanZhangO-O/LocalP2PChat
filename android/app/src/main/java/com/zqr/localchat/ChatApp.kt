@@ -63,7 +63,11 @@ class ChatApp : Application() {
             ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE).getString(KEY_NICKNAME, "") ?: ""
 
         fun saveNickname(ctx: Context, name: String) {
-            ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE).edit().putString(KEY_NICKNAME, name).apply()
+            // defense in depth: every nickname entry point truncates to 20,
+            // but a stray caller must not persist an unbounded name either
+            ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE).edit()
+                .putString(KEY_NICKNAME, name.take(20))
+                .apply()
         }
 
         /** The single program-wide port used by every host group (default 9999). */

@@ -53,6 +53,7 @@ fun DirectChatScreen(
 ) {
     val context = LocalContext.current
     var input by remember { mutableStateOf("") }
+    var pendingDelete by remember { mutableStateOf<ChatMessage?>(null) }
     val tooLong = input.length > P2PManager.MAX_CONTENT_LENGTH
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -135,7 +136,7 @@ fun DirectChatScreen(
                                 message = msg,
                                 state = downloadStates[msg.id],
                                 onDownload = { onDownloadFile(msg.fileInfo!!) },
-                                onDelete = { onDelete(msg) }
+                                onDelete = { pendingDelete = msg }
                             )
                         } else {
                             DirectMessageBubble(
@@ -144,7 +145,7 @@ fun DirectChatScreen(
                                     onCopy(msg.content)
                                     Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
                                 },
-                                onDelete = { onDelete(msg) }
+                                onDelete = { pendingDelete = msg }
                             )
                         }
                     }
@@ -198,6 +199,29 @@ fun DirectChatScreen(
                 }
             }
         }
+    }
+
+    pendingDelete?.let { msg ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("删除消息") },
+            text = { Text("删除后，这条消息会从双方的聊天记录中移除，且无法恢复。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDelete(msg)
+                        pendingDelete = null
+                    }
+                ) {
+                    Text("删除", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) {
+                    Text("取消")
+                }
+            }
+        )
     }
 }
 

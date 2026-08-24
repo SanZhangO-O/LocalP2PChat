@@ -250,7 +250,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // no effect". Reject it here; the UI surfaces 地址无效 (Windows
         // parity).
         if (!isValidHost(parsed.host) || parsed.port !in 1..65535) return false
-        val nick = name.trim().ifBlank { parsed.host }
+        val nick = name.trim().ifBlank { parsed.host }.take(20)
         val contact = DirectChatManager.Contact(
             "ip:${parsed.host}:${parsed.port}", nick, parsed.host, parsed.port
         )
@@ -531,7 +531,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         ChatApp.savedNickname(getApplication()).ifBlank { "用户" }
 
     fun setNickname(name: String) {
-        val nick = name.trim()
+        val nick = name.trim().take(20)
         if (nick.isBlank()) return
         ChatApp.saveNickname(getApplication(), nick)
     }
@@ -815,6 +815,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // Long-term device identity for direct chats and call media (loaded
         // once; the private key never leaves app storage).
         DeviceIdentity.ensureLoaded(application)
+
+        // Mirror the group list's names into the companion flow so the setup
+        // screen can detect a same-name re-creation without extra wiring.
+        viewModelScope.launch {
+            _groups.collect { list -> savedGroupNames.value = list.map { it.groupName } }
+        }
 
         // Group mesh: messages arriving over member-to-member links (host
         // offline, or history backfill) flow into the owning group's list.
@@ -1242,9 +1248,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun createGroup(userName: String, groupName: String) {
         if (userName.isBlank() || groupName.isBlank()) return
-        val name = groupName.trim()
+        val name = groupName.trim().take(20)
         if (name.isBlank()) return
-        val nick = userName.trim()
+        val nick = userName.trim().take(20)
         ChatApp.saveNickname(getApplication(), nick)
 
         // Crypto-random group password (8 chars ≈ 47.6 bits): high enough
@@ -1296,11 +1302,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun queryGroup(userName: String, groupId: String, hostIp: String, password: String? = null) {
         val id = groupId.trim().filter { it.isDigit() }
         val ip = hostIp.trim()
-        if (id.isBlank() || ip.isBlank()) return
+        // VM-side double check with the UI gating (UI can be bypassed): the
+        // numeric join id must be 8 digits and the endpoint a usable
+        // host:port — anything else can never connect.
+        if (id.length != 8 || ip.isBlank()) return
         val parsed = parseHostPort(ip)
-        if (parsed.host.isBlank()) return
-        val nick = userName.trim()
-        ChatApp.saveNickname(getApplication(), nick)
+        if (!isValidHost(parsed.host) || parsed.port !in 1..65535) return
+        // A blank nickname (spaces) must not overwrite the saved nickname;
+        // keep the current one and continue the join rather than stalling.
+        val rawNick = userName.trim().take(20)
+        val nick = rawNick.ifBlank { currentNickname() }
+        if (rawNick.isNotBlank()) {
+            ChatApp.saveNickname(getApplication(), rawNick)
+        }
         stopPendingP2p()
         _rejoinInProgress.value = false
         _rejoinFailed.value = false
@@ -1908,5 +1922,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private const val CHANNEL_MESSAGES = "localchat_messages"
+
+        /** Process-wide mirror of the current group names (kept in sync with
+         *  [groups] in init): the setup screen reads it to confirm before a
+         *  same-name creation silently replaces the old group instance. */
+        val savedGroupNames = MutableStateFlow<List<String>>(emptyList())
     }
 }

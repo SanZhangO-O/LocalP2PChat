@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListView,
     QMenu,
+    QMessageBox,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -30,7 +31,7 @@ from PyQt6.QtWidgets import (
 
 from ..models import MAX_CONTENT_LENGTH, Peer
 from ..view_model import ChatViewModel
-from .chat_page import HEADER_ROLE, MSG_ROLE, MessageDelegate, file_offer_expired
+from .chat_page import HEADER_ROLE, MSG_ROLE, MessageDelegate, _safe_save_name, file_offer_expired
 from .theme import PRIMARY, TEXT_SUBTLE
 from .widgets import Toast, date_header_text, format_message_time, is_same_day
 
@@ -325,7 +326,7 @@ class DirectChatPage(QWidget):
         downloads = os.path.join(os.path.expanduser("~"), "Downloads")
         os.makedirs(downloads, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
-            self.window(), "保存文件", os.path.join(downloads, fi.file_name)
+            self.window(), "保存文件", os.path.join(downloads, _safe_save_name(fi.file_name))
         )
         if not path:
             return
@@ -381,4 +382,11 @@ class DirectChatPage(QWidget):
         peer_id = self._peer_id
         if peer_id is None:
             return
-        self.vm.delete_direct_message(peer_id, msg.id, msg.sender_id)
+        box = QMessageBox(self.window())
+        box.setWindowTitle("删除消息")
+        box.setText("删除后，这条消息会从双方的聊天记录中移除，且无法恢复。是否删除？")
+        delete_btn = box.addButton("删除", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is delete_btn:
+            self.vm.delete_direct_message(peer_id, msg.id, msg.sender_id)

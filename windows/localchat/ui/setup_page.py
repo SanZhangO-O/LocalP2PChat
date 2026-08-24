@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QStackedWidget,
     QVBoxLayout,
@@ -12,7 +13,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..models import GroupInfo
-from ..view_model import ChatViewModel
+from ..view_model import MAX_NAME_LENGTH, ChatViewModel
 from .widgets import Toast
 
 MODE_SELECT = 0
@@ -258,6 +259,8 @@ class SetupPage(QWidget):
         )
         self.create_name_edit, self.create_group_edit = inputs
         self.create_submit_btn = btn
+        for edit in (self.create_name_edit, self.create_group_edit):
+            edit.setMaxLength(MAX_NAME_LENGTH)
         page_layout = page.layout()
         card = QFrame()
         card.setObjectName("card")
@@ -298,6 +301,7 @@ class SetupPage(QWidget):
         )
         self.join_name_edit, self.join_group_edit, self.join_ip_edit, self.join_password_edit = inputs
         self.join_submit_btn = btn
+        self.join_name_edit.setMaxLength(MAX_NAME_LENGTH)
         ip_hint = QLabel("ID 由创建者设备指纹生成，与群名无关；地址可在创建者的“本机地址”卡片中点击复制")
         ip_hint.setObjectName("faint")
         ip_hint.setWordWrap(True)
@@ -382,6 +386,18 @@ class SetupPage(QWidget):
         self._set_select_error(message)
 
     def _on_create(self):
+        # The same group name derives the same group id, so re-creating with
+        # an existing name silently REPLACES the old instance; ask first.
+        name = self.create_group_edit.text().strip()
+        if self.vm.group_name_exists(name):
+            box = QMessageBox(self.window())
+            box.setWindowTitle("创建群组")
+            box.setText("已存在同名群组，重新创建将替换原群组（聊天记录保留），是否继续？")
+            recreate_btn = box.addButton("继续创建", QMessageBox.ButtonRole.DestructiveRole)
+            cancel_btn = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is not recreate_btn:
+                return
         self.vm.create_group(self.create_name_edit.text(), self.create_group_edit.text())
         self.on_group_entered()
 

@@ -95,6 +95,13 @@ object CallManager {
     private const val VIDEO_MAX_EDGE = 640
     private const val VIDEO_JPEG_QUALITY = 70
 
+    /** 收到视频帧任一边的绝对上限（解压炸弹防护）：超过直接丢帧。 */
+    private const val MAX_VIDEO_FRAME_DIMEN = 4096
+
+    /** 解码目标边长上限：超过则按需 inSampleSize 降采样（正常对端发送
+     *  640px，不受影响）。 */
+    private const val VIDEO_DECODE_TARGET_DIMEN = 1280
+
     /** Cap outgoing video at ~10 fps: the Windows client sends ~12 fps and a
      * higher rate only burns CPU/link and crowds audio out of the shared TCP
      * socket (which is what made speech stutter). */
@@ -986,7 +993,7 @@ object CallManager {
                         break
                     }
                     if (channel == CH_VIDEO) {
-                        val bmp = BitmapFactory.decodeByteArray(payload, 0, payload.size)
+                        val bmp = decodeVideoFrame(payload)
                         if (bmp != null) _remoteVideo.value = bmp
                     } else if (channel == CH_AUDIO) {
                         audioEngine?.enqueuePlayback(payload)
@@ -1020,6 +1027,36 @@ object CallManager {
             read += got
         }
         return buf
+    }
+
+    /** bounds-first 两段解码收到的 JPEG 帧：先用 inJustDecodeBounds 取
+     *  尺寸，任一边超过 MAX_VIDEO_FRAME_DIMEN（解压炸弹）直接丢帧；
+     *  正常帧按需 inSampleSize 降采样到 ~VIDEO_DECODE_TARGET_DIMEN 再
+     *  解码，避免一张超大图分配出巨大的位图。 */
+    private fun decodeVideoFrame(payload: ByteArray): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(payload, 0, payload.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            Log.w(TAG, "drop undecodable video frame (${payload.size} bytes)")
+            return null
+        }
+        if (bounds.outWidth > MAX_VIDEO_FRAME_DIMEN || bounds.outHeight > MAX_VIDEO_FRAME_DIMEN) {
+            Log.w(TAG, "drop oversized video frame ${bounds.outWidth}x${bounds.outHeight}")
+            return null
+        }
+        val opts = BitmapFactory.Options().apply {
+            inSampleSize = videoInSampleSize(bounds.outWidth, bounds.outHeight)
+        }
+        return BitmapFactory.decodeByteArray(payload, 0, payload.size, opts)
+    }
+
+    /** 2 的幂次 inSampleSize：解码后最长边不超过 VIDEO_DECODE_TARGET_DIMEN。 */
+    private fun videoInSampleSize(width: Int, height: Int): Int {
+        var sample = 1
+        while (maxOf(width, height) / (sample * 2) >= VIDEO_DECODE_TARGET_DIMEN) {
+            sample *= 2
+        }
+        return sample
     }
 
     // -------------------------------------------------------------- engines
