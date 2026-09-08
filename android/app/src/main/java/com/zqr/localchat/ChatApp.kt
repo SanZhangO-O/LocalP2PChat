@@ -94,6 +94,23 @@ class ChatApp : Application() {
                 .apply()
         }
 
+        private fun groupMutedKey(groupId: String) = "group_muted_$groupId"
+
+        /**
+         * Whether a group is muted: new messages still badge unread in-app,
+         * but never post a system notification. Persisted, so it survives
+         * restarts; a removed group clears its flag so a future group reusing
+         * the id starts unmuted.
+         */
+        fun isGroupMuted(ctx: Context, groupId: String): Boolean =
+            ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE).getBoolean(groupMutedKey(groupId), false)
+
+        fun setGroupMuted(ctx: Context, groupId: String, muted: Boolean) {
+            ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE).edit()
+                .putBoolean(groupMutedKey(groupId), muted)
+                .apply()
+        }
+
         private fun passwordKey(groupId: String) = "group_password_$groupId"
 
         fun savedGroupPassword(ctx: Context, groupId: String): String =

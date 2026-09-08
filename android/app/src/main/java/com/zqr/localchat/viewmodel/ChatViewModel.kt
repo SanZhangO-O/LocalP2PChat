@@ -3,6 +3,7 @@ package com.zqr.localchat.viewmodel
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Context.MODE_PRIVATE
 import android.content.Intent
@@ -17,6 +18,7 @@ import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.Person
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Lifecycle
@@ -26,6 +28,7 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import com.zqr.localchat.ChatApp
 import com.zqr.localchat.MainActivity
+import com.zqr.localchat.NotificationDismissReceiver
 import com.zqr.localchat.call.CallManager
 import com.zqr.localchat.crypto.Crypto
 import com.zqr.localchat.data.ChatDao
@@ -74,6 +77,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val lastMessage: String = "",
         val lastMessageTime: Long = 0L,
         val unreadCount: Int = 0,
+        val muted: Boolean = false,
         val connected: Boolean = false
     )
 
@@ -1006,6 +1010,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                     false,
                                     hostIp = hostIp,
                                     hostPort = hostPort,
+                                    muted = ChatApp.isGroupMuted(getApplication(), groupId),
                                     connected = true
                                 )
                             ) + groups
@@ -1141,7 +1146,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 hostPort = if (sg.isHost) currentPort else sg.hostPort,
                                 memberCount = sg.memberCount,
                                 lastMessage = sg.lastMessage,
-                                lastMessageTime = sg.lastMessageTime
+                                lastMessageTime = sg.lastMessageTime,
+                                muted = ChatApp.isGroupMuted(getApplication(), sg.groupId)
                             )
                         }
                         .filter { it.groupId !in currentIds && it.groupId !in removedGroupIds }
@@ -1551,6 +1557,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         removedGroupIds.add(groupId)
         persistedMessageIds.remove(groupId)
         persistedPeerCounts.remove(groupId)
+        // drop the group's notification AND its mute flag: group ids can be
+        // reused (they derive from fingerprint + port), so a stale flag would
+        // silently mute a future group with the same id
+        cancelGroupNotification(groupId)
+        ChatApp.setGroupMuted(getApplication(), groupId, false)
         _groups.update { list -> list.filter { it.groupId != groupId } }
         if (_activeGroupId.value == groupId) {
             _activeGroupId.value = null
@@ -1597,6 +1608,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (g.groupId == groupId && g.unreadCount > 0) g.copy(unreadCount = 0) else g
             }
         }
+        // also drops a notification still showing from an earlier background
+        // session once the user opens the group
+        cancelGroupNotification(groupId)
     }
 
     fun deleteMessage(messageId: String) {
@@ -1782,7 +1796,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                     if (!isAppForeground.value && incoming.isNotEmpty()) {
-                        notifyNewMessages(groupId, newMessages.first().senderName, incoming.last().content, incoming.size)
+                        notifyNewMessages(
+                            groupId,
+                            _groups.value.find { it.groupId == groupId }?.groupName ?: "群聊",
+                            incoming.map { NotifEntry(it.senderName, it.content, it.timestamp) }
+                        )
                     }
                 }
 
@@ -1854,44 +1872,82 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         monitoringJobs[groupId] = listOf(jobPeers, jobConnection, jobMessages)
     }
 
-    private fun notifyNewMessages(groupId: String, senderName: String, content: String, count: Int) {
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(getApplication(), android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            return
-        }
+    // ------------------------------------------------ message notifications
+
+    private fun notifyNewMessages(groupId: String, groupName: String, incoming: List<NotifEntry>) {
+        if (incoming.isEmpty()) return
         val context = getApplication<Application>()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_MESSAGES,
-                "新消息",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "收到新群聊消息时通知"
-            }
-            val nm = context.getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
+        if (!notificationsPermissionGranted(context)) return
+        if (ChatApp.isGroupMuted(getApplication(), groupId)) return
+        ensureMessageChannel(context)
+        val log = notificationLog.getOrPut(groupId) { mutableListOf() }
+        log.addAll(incoming)
+        while (log.size > MAX_NOTIFICATION_MESSAGES) log.removeAt(0)
+
+        val myName = persistedMyNames[groupId]?.ifBlank { null } ?: "我"
+        val style = NotificationCompat.MessagingStyle(Person.Builder().setName(myName).build())
+            .setConversationTitle(groupName)
+        for (m in log) {
+            style.addMessage(m.text, m.time, Person.Builder().setName(m.sender).build())
         }
-        val tapIntent = Intent(context, MainActivity::class.java).apply {
+        // distinct requestCodes per group: a shared one would let the last
+        // posted intent overwrite every other group's deep-link extra
+        val openIntent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra(MainActivity.EXTRA_OPEN_GROUP_ID, groupId)
         }
-        val pendingIntent = android.app.PendingIntent.getActivity(
-            context, 0, tapIntent,
-            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        val contentPendingIntent = PendingIntent.getActivity(
+            context, groupId.hashCode(), openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val deleteIntent = Intent(context, NotificationDismissReceiver::class.java).apply {
+            action = ACTION_NOTIF_DISMISSED
+            putExtra(EXTRA_DISMISSED_GROUP_ID, groupId)
+        }
+        val deletePendingIntent = PendingIntent.getBroadcast(
+            context, groupId.hashCode(), deleteIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val notification = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
-            .setContentTitle(if (count > 1) "$senderName 等 $count 条新消息" else "$senderName")
-            .setContentText(content)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(content))
+            // MessagingStyle renders the conversation; the title/text are the
+            // fallback for launchers that do not style it
+            .setContentTitle(groupName)
+            .setContentText(log.last().text)
+            .setStyle(style)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setWhen(log.last().time)
             .setAutoCancel(true)
-            .setContentIntent(pendingIntent)
+            .setContentIntent(contentPendingIntent)
+            // swiping the bubble away must drop its log entry too, or the
+            // group's next message resurrects dismissed bubbles and the
+            // summary keeps stale counts
+            .setDeleteIntent(deletePendingIntent)
+            .setGroup(GROUP_KEY_MESSAGES)
+            // children alert, the summary stays silent
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
             .build()
         NotificationManagerCompat.from(context).notify(groupId.hashCode(), notification)
+        refreshMessageSummary(context)
     }
 
     private fun cancelGroupNotification(groupId: String) {
-        NotificationManagerCompat.from(getApplication()).cancel(groupId.hashCode())
+        val context = getApplication<Application>()
+        notificationLog.remove(groupId)
+        NotificationManagerCompat.from(context).cancel(groupId.hashCode())
+        refreshMessageSummary(context)
+    }
+
+    /** Per-group mute: persisted across restarts. Muting also drops any
+     *  notification the group currently shows. */
+    fun setGroupMuted(groupId: String, muted: Boolean) {
+        ChatApp.setGroupMuted(getApplication(), groupId, muted)
+        _groups.update { list ->
+            list.map { g ->
+                if (g.groupId == groupId) g.copy(muted = muted) else g
+            }
+        }
+        if (muted) cancelGroupNotification(groupId)
     }
 
     override fun onCleared() {
@@ -1922,10 +1978,102 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private const val CHANNEL_MESSAGES = "localchat_messages"
+        private const val GROUP_KEY_MESSAGES = "localchat_message_group"
+        private const val SUMMARY_NOTIFICATION_ID = 20001
+        private const val MAX_NOTIFICATION_MESSAGES = 8
+        const val ACTION_NOTIF_DISMISSED = "com.zqr.localchat.NOTIF_DISMISSED"
+        const val EXTRA_DISMISSED_GROUP_ID = "com.zqr.localchat.DISMISSED_GROUP_ID"
 
         /** Process-wide mirror of the current group names (kept in sync with
          *  [groups] in init): the setup screen reads it to confirm before a
          *  same-name creation silently replaces the old group instance. */
         val savedGroupNames = MutableStateFlow<List<String>>(emptyList())
+
+        private data class NotifEntry(val sender: String, val text: String, val time: Long)
+
+        /**
+         * Recent incoming messages per group: a follow-up notification
+         * re-renders the whole recent conversation (MessagingStyle) instead
+         * of a single orphan bubble. Lives on the companion — NOT the
+         * instance — because it must stay in sync with what is actually in
+         * the shade across activity/ViewModel recreation, and because
+         * [NotificationDismissReceiver] clears entries from outside any
+         * instance. Cleared when a notification is cancelled or swiped away,
+         * so it only ever holds messages the user has NOT seen as
+         * notifications yet.
+         */
+        private val notificationLog = ConcurrentHashMap<String, MutableList<NotifEntry>>()
+
+        private fun notificationsPermissionGranted(context: Context): Boolean =
+            Build.VERSION.SDK_INT < 33 ||
+                ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+
+        private fun ensureMessageChannel(context: Context) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    CHANNEL_MESSAGES,
+                    "新消息",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "收到新群聊消息时通知"
+                }
+                context.getSystemService(NotificationManager::class.java)
+                    .createNotificationChannel(channel)
+            }
+        }
+
+        /**
+         * Swipe-away hook for [NotificationDismissReceiver]: a dismissed
+         * bubble must drop its log entry, or the group's next message
+         * re-renders already-dismissed messages and the summary keeps stale
+         * counts. A null group id means the whole summary / group stack was
+         * dismissed — clear everything.
+         */
+        fun onNotificationsDismissed(context: Context, groupId: String?) {
+            if (groupId == null) notificationLog.clear()
+            else notificationLog.remove(groupId)
+            refreshMessageSummary(context)
+        }
+
+        /** Reconcile the grouped summary with the log: posted only while two
+         *  or more groups still have unread notifications (a single child
+         *  stands alone), cancelled otherwise. */
+        private fun refreshMessageSummary(context: Context) {
+            if (!notificationsPermissionGranted(context)) return
+            ensureMessageChannel(context)
+            val nm = NotificationManagerCompat.from(context)
+            if (notificationLog.size < 2) {
+                nm.cancel(SUMMARY_NOTIFICATION_ID)
+                return
+            }
+            val total = notificationLog.values.sumOf { it.size }
+            val openIntent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            }
+            val contentPendingIntent = PendingIntent.getActivity(
+                context, SUMMARY_NOTIFICATION_ID, openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            // no group id extra = swipe of the whole stack clears the log
+            val deleteIntent = Intent(context, NotificationDismissReceiver::class.java)
+                .setAction(ACTION_NOTIF_DISMISSED)
+            val deletePendingIntent = PendingIntent.getBroadcast(
+                context, SUMMARY_NOTIFICATION_ID, deleteIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val summary = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+                .setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setGroup(GROUP_KEY_MESSAGES)
+                .setGroupSummary(true)
+                .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
+                .setContentTitle("LocalChat")
+                .setContentText("${notificationLog.size} 个群聊共 $total 条新消息")
+                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                .setAutoCancel(true)
+                .setContentIntent(contentPendingIntent)
+                .setDeleteIntent(deletePendingIntent)
+                .build()
+            nm.notify(SUMMARY_NOTIFICATION_ID, summary)
+        }
     }
 }

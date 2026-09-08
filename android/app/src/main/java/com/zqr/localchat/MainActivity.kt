@@ -41,23 +41,50 @@ import com.zqr.localchat.ui.screen.SetupScreen
 import com.zqr.localchat.ui.screen.SettingsScreen
 import com.zqr.localchat.ui.theme.LocalChatTheme
 import com.zqr.localchat.viewmodel.ChatViewModel
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 
 enum class Screen { GroupList, Setup, GroupLobby, Chat, MemberList, DirectChat, Settings }
 
 class MainActivity : ComponentActivity() {
+
+    companion object {
+        const val EXTRA_OPEN_GROUP_ID = "com.zqr.localchat.OPEN_GROUP_ID"
+    }
+
+    // notification tap deep link: the group to jump straight into (null = none)
+    private val openGroupId = mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // only a FRESH create delivers the launch intent's deep link: on
+        // recreation the link was already consumed (or is still pending in
+        // the running effect), and the screen state is restored by
+        // rememberSaveable — re-reading here would re-navigate on rotation
+        if (savedInstanceState == null) {
+            openGroupId.value = intent?.getStringExtra(EXTRA_OPEN_GROUP_ID)
+        }
         enableEdgeToEdge()
         setContent {
             LocalChatTheme {
-                LocalChatApp()
+                LocalChatApp(openGroupId = openGroupId)
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        intent.getStringExtra(EXTRA_OPEN_GROUP_ID)?.let { openGroupId.value = it }
     }
 }
 
 @Composable
-fun LocalChatApp(viewModel: ChatViewModel = viewModel()) {
+fun LocalChatApp(
+    viewModel: ChatViewModel = viewModel(),
+    openGroupId: MutableState<String?> = remember { mutableStateOf<String?>(null) }
+) {
     val context = LocalContext.current
     var currentScreenName by rememberSaveable { mutableStateOf(Screen.MemberList.name) }
     val currentScreen = runCatching { Screen.valueOf(currentScreenName) }.getOrDefault(Screen.MemberList)
@@ -323,6 +350,27 @@ fun LocalChatApp(viewModel: ChatViewModel = viewModel()) {
         }
     }
 
+    LaunchedEffect(Unit) {
+        // notification tap: jump straight into that group's chat. Collected
+        // as a flow, NOT keyed on the state — nulling the state inside a
+        // keyed effect would change the key and cancel the effect mid-wait.
+        // On a cold start the persisted-group load is async, so wait for the
+        // target to appear (timeout = drop a link to a group that no longer
+        // exists).
+        snapshotFlow { openGroupId.value }
+            .filterNotNull()
+            .collect { gid ->
+                openGroupId.value = null
+                val found = withTimeoutOrNull(5000) {
+                    snapshotFlow { groups.any { it.groupId == gid } }.first { it }
+                } ?: false
+                if (!found) return@collect
+                viewModel.switchToGroup(gid)
+                viewModel.clearUnread(gid)
+                currentScreenName = Screen.Chat.name
+            }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
     when (currentScreen) {
         Screen.GroupList -> {
@@ -342,7 +390,8 @@ fun LocalChatApp(viewModel: ChatViewModel = viewModel()) {
                 },
                 onRemoveGroup = { groupId ->
                     viewModel.removeGroup(groupId)
-                }
+                },
+                onToggleMute = viewModel::setGroupMuted
             )
         }
         Screen.Settings -> {
