@@ -293,23 +293,37 @@ class SetupPage(QWidget):
                 ("你的昵称", ""),
                 ("群组数字ID", "例如: 4829 1357"),
                 ("创建者的IP地址（可含端口）", "例如: 192.168.1.100:9999"),
+                ("中继服务器（跨网段加入，可选）", "例如: relay.example.com:25000"),
                 ("群组密码（可选）", "创建者分享的8位密码"),
             ],
             "查找群组",
             self._on_query,
             lambda: self.show_mode(MODE_SELECT),
         )
-        self.join_name_edit, self.join_group_edit, self.join_ip_edit, self.join_password_edit = inputs
+        (
+            self.join_name_edit,
+            self.join_group_edit,
+            self.join_ip_edit,
+            self.join_server_edit,
+            self.join_password_edit,
+        ) = inputs
         self.join_submit_btn = btn
         self.join_name_edit.setMaxLength(MAX_NAME_LENGTH)
-        ip_hint = QLabel("ID 由创建者设备指纹生成，与群名无关；地址可在创建者的“本机地址”卡片中点击复制")
+        ip_hint = QLabel(
+            "ID 由创建者设备指纹生成，与群名无关；地址可在创建者的“本机地址”卡片中点击复制。"
+            "不同网段时无需 IP：双方填写同一个中继服务器，凭 ID 即可加入"
+        )
         ip_hint.setObjectName("faint")
         ip_hint.setWordWrap(True)
         page.layout().insertWidget(page.layout().indexOf(self.join_submit_btn), ip_hint)
-        self.join_name_edit.textChanged.connect(self._on_join_input_changed)
-        self.join_group_edit.textChanged.connect(self._on_join_input_changed)
-        self.join_ip_edit.textChanged.connect(self._on_join_input_changed)
-        self.join_password_edit.textChanged.connect(self._on_join_input_changed)
+        for edit in (
+            self.join_name_edit,
+            self.join_group_edit,
+            self.join_ip_edit,
+            self.join_server_edit,
+            self.join_password_edit,
+        ):
+            edit.textChanged.connect(self._on_join_input_changed)
         self._on_join_input_changed()
         return page
 
@@ -407,6 +421,17 @@ class SetupPage(QWidget):
 
     def _on_query(self):
         self._set_error(None)
+        server_text = self.join_server_edit.text().strip()
+        if server_text:
+            # cross-NAT path: punch/relay through the signaling server —
+            # no host IP needed, no query/confirm step (join starts now)
+            self.vm.join_via_server(
+                self.join_name_edit.text(),
+                self.join_group_edit.text(),
+                server_text,
+                password=self.join_password_edit.text().strip() or None,
+            )
+            return
         self.vm.query_group(
             self.join_name_edit.text(),
             self.join_group_edit.text(),
@@ -414,35 +439,35 @@ class SetupPage(QWidget):
             password=self.join_password_edit.text().strip() or None,
         )
 
-    def _on_join_input_changed(self):
+    def _join_inputs_ready(self) -> bool:
         join_id = "".join(ch for ch in self.join_group_edit.text() if ch.isdigit())
-        enabled = bool(
+        has_endpoint = bool(
+            self.join_ip_edit.text().strip() or self.join_server_edit.text().strip()
+        )
+        return bool(
             self.join_name_edit.text().strip()
             and len(join_id) == 8
-            and self.join_ip_edit.text().strip()
+            and has_endpoint
         )
-        self.join_submit_btn.setEnabled(enabled)
+
+    def _on_join_input_changed(self):
+        via_server = bool(self.join_server_edit.text().strip())
+        self.join_submit_btn.setText("直接加入" if via_server else "查找群组")
+        self.join_submit_btn.setEnabled(self._join_inputs_ready())
         self._clear_error()
 
     def _on_query_state_changed(self):
         error = self.vm.query_error()
         if error:
             self._set_error(error)
-        join_id = "".join(ch for ch in self.join_group_edit.text() if ch.isdigit())
         self.join_submit_btn.setEnabled(
-            not self.vm.is_querying_group()
-            and bool(self.join_name_edit.text().strip())
-            and len(join_id) == 8
-            and bool(self.join_ip_edit.text().strip())
+            not self.vm.is_querying_group() and self._join_inputs_ready()
         )
         self._update_confirm_dialog()
 
     def _on_join_state_changed(self):
         self.join_submit_btn.setEnabled(
-            not self.vm.is_joining()
-            and bool(self.join_name_edit.text().strip())
-            and bool(self.join_group_edit.text().strip())
-            and bool(self.join_ip_edit.text().strip())
+            not self.vm.is_joining() and self._join_inputs_ready()
         )
         result = self.vm.connection_result()
         if result is not None and not result[0] and self.stack.currentIndex() == MODE_JOIN:

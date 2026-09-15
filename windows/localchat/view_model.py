@@ -1,5 +1,7 @@
 import json
+import os
 import re
+import shutil
 import socket
 import threading
 import uuid
@@ -12,6 +14,7 @@ from .call import CallManager
 from .crypto import random_password
 from .hardware import get_hardware_id, get_local_ip_address
 from .models import (
+    FILE_KIND_IMAGE,
     TCP_PORT,
     ChatMessage,
     ContactRequest,
@@ -19,9 +22,12 @@ from .models import (
     GroupInfo,
     NetworkPacket,
     Peer,
+    detect_media_kind,
+    sanitize_file_name,
 )
 from . import network as network_module
 from .network import DirectChatListener, DirectChatManager, P2PListener, P2PManager, Protocol
+from .punch import DEFAULT_SIGNALING_PORT, parse_server_endpoint
 from .securewire import DeviceIdentity
 from .storage import ChatStore, SavedGroup, to_saved_message
 
@@ -63,6 +69,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # (file_id, ok, message) after a download finishes (emitted on the main
     # thread; the download itself runs on a worker thread).
     file_download_finished = pyqtSignal(str, bool, str)
+    # An own sent image finished copying into the media dir: the chat pages
+    # re-layout so the sender's own bubble flips to the inline render.
+    media_ready = pyqtSignal()
     # Emitted from network threads with (group_id, sender_name, body); the
     # aggregator slot runs on the main thread (queued connection).
     raw_tray = pyqtSignal(str, str, str)
@@ -89,6 +98,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     def __init__(self, store: ChatStore, data_dir: str = "."):
         super().__init__()
         self.store = store
+        self.data_dir = data_dir
         self._lock = threading.RLock()
 
         # Long-term device identity for direct chats and call media (loaded
@@ -162,6 +172,13 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # a group we belong to as a MEMBER are answered here, so newcomers
         # only need the IP of SOME member, not the creator's.
         self.host_server.member_group_handler = self._handle_member_group_request
+        # Cross-NAT joins (optional): when a signaling/relay server is
+        # configured, hosted groups are announced there and members on other
+        # NAT segments can join by the numeric id alone (punch or relay).
+        self._signaling_server: str = ""
+        self._apply_signaling_setting(
+            self.store.get_setting("signaling_server", "") or "", persist=False
+        )
         saved_contacts = self._load_direct_contacts()
         # honor contact removals from previous processes BEFORE announcing:
         # a peer that keeps presenting itself must not resurrect a contact
@@ -560,11 +577,13 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         session, and the sender's download server dies with its process — once
         EITHER side restarted, a stale address only produces a failed
         download. The bubble renders it as "已过期" instead of offering a
-        download that can no longer succeed (Android parity)."""
+        download that can no longer succeed (Android parity). The kind is
+        preserved so image/video messages keep rendering inline (from their
+        local media copy) across restarts."""
         if m.file_size <= 0 and not m.download_host:
             return None
         # blank the address for every restored offer, own or received
-        return FileInfo(m.id, m.content, m.file_size, "", 0)
+        return FileInfo(m.id, m.content, m.file_size, "", 0, kind=m.kind)
 
     def send_direct_message(self, peer_id: str, content: str) -> bool:
         # peers are first-class: a message may queue as pending while the peer
@@ -692,7 +711,38 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     def send_direct_file(self, peer_id: str, path: str) -> bool:
         """Offer a local file over a direct session (download server + shared
         file_message protocol). Returns False when it cannot be served."""
-        return self.direct.send_file(peer_id, path) is not None
+        msg = self.direct.send_file(peer_id, path)
+        if msg is None:
+            return False
+        self._mirror_own_media(msg, path)
+        return True
+
+    def _mirror_own_media(self, msg: ChatMessage, source_path: str) -> None:
+        """After an own IMAGE goes out, copy it into the media dir on a worker
+        thread so the sender's own bubble renders inline like a received one —
+        and keeps doing so after a restart. Videos are NOT copied: they are
+        far larger and the placeholder card already opens fine for the
+        sender. Failures are ignored: the copy is a rendering convenience,
+        the offer itself was already delivered."""
+        fi = msg.file_info
+        if fi is None or fi.kind != FILE_KIND_IMAGE:
+            return
+
+        def run():
+            try:
+                target = self.media_target_path(fi.file_id, fi.file_name)
+                os.makedirs(self.media_dir, exist_ok=True)
+                if not os.path.isfile(target):
+                    # .part + atomic replace so a half-copied image is never
+                    # visible to the UI's media path probe
+                    tmp = target + ".part"
+                    shutil.copyfile(source_path, tmp)
+                    os.replace(tmp, target)
+                self.media_ready.emit()
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
 
     def download_direct_file(self, peer_id: str, file_id: str, target_path: str) -> None:
         """Download a direct-chat file offer by file_id on a worker thread;
@@ -706,6 +756,13 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         file_info = msg.file_info
         if not file_info.download_host or file_info.download_port <= 0:
             self.file_download_finished.emit(file_id, False, "文件已过期，请对方重新发送")
+            return
+        # media targets live in the app media dir; ensure it exists before the
+        # worker thread opens the output file
+        try:
+            os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+        except OSError:
+            self.file_download_finished.emit(file_id, False, "无法创建保存目录")
             return
 
         def run() -> None:
@@ -1279,6 +1336,86 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             port = self.pending_host_port or network_module.TCP_PORT
         p2p.confirm_join(self.pending_host_ip, port)
 
+    # ------------------------------------------------------------ signaling
+
+    @property
+    def signaling_server(self) -> str:
+        """The configured signaling/relay server endpoint ('' = off)."""
+        return self._signaling_server
+
+    def set_signaling_server(self, text: str) -> bool:
+        """Enable/disable cross-NAT joining. Returns False (with a status
+        toast) when the endpoint is malformed; the previous setting stays
+        active in that case."""
+        text = (text or "").strip()
+        if text:
+            host, port = parse_server_endpoint(text)
+            if host is None:
+                self.status_message.emit("服务器地址无效（格式：IP或域名:端口）")
+                return False
+        self._apply_signaling_setting(text)
+        self.status_message.emit(
+            "已启用中继服务器" if text else "已关闭中继服务器"
+        )
+        return True
+
+    def _apply_signaling_setting(self, text: str, persist: bool = True) -> None:
+        text = (text or "").strip()
+        if persist:
+            self.store.set_setting("signaling_server", text)
+        self._signaling_server = text
+        if not text:
+            self.host_server.disable_signaling()
+            return
+        host, port = parse_server_endpoint(text)
+        if host is None:
+            self.host_server.disable_signaling()
+            return
+        self.host_server.enable_signaling(host, port)
+
+    def join_via_server(
+        self,
+        user_name: str,
+        group_id: str,
+        server: str,
+        password: Optional[str] = None,
+    ) -> None:
+        """Join a group through the signaling server by its numeric id alone:
+        punch a direct hole to the host (or fall back to the encrypted relay)
+        instead of needing a reachable host IP."""
+        join_id = "".join(ch for ch in group_id.strip() if ch.isdigit())
+        host, port = parse_server_endpoint(server)
+        if len(join_id) != 8:
+            self.status_message.emit("群组数字ID必须是8位")
+            return
+        if host is None:
+            self.status_message.emit("服务器地址无效（格式：IP或域名:端口）")
+            return
+        nick = user_name.strip()[:MAX_NAME_LENGTH]
+        if not nick:
+            return
+        self.nickname = nick
+        self.store.set_setting("nickname", nick)
+        self._stop_pending_p2p()
+        self.rejoin_in_progress = False
+        self.rejoin_failed = False
+        p2p = P2PManager(
+            self, port=self.port, device_id=self._device_id(), hardware_id=self._hardware_fingerprint()
+        )
+        self.call_manager.attach(p2p)
+        p2p.initialize_as_client(nick, "", password)
+        p2p.set_join_id(join_id)
+        self.pending_p2p = p2p
+        self.setup_p2p = p2p
+        # no host address is known on this path: the group row is saved
+        # without one and LAN rejoins fall back to a manual server join
+        self.pending_host_ip = ""
+        self.pending_host_port = None
+        self.pending_group_id = None
+        p2p.clear_query_state()
+        p2p.clear_join_result()
+        p2p.confirm_join_via_server(host, port)
+
     def cancel_join(self) -> None:
         self._stop_pending_p2p()
         self.setup_p2p = None
@@ -1499,6 +1636,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # mesh delivers it to every linked member either way (receivers dedup
         # by message id)
         self.mesh.broadcast(gid, msg)
+        self._mirror_own_media(msg, path)
         return True
 
     def download_file(self, file_id: str, target_path: str) -> None:
@@ -1517,12 +1655,43 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             self.file_download_finished.emit(file_id, False, "文件消息不存在")
             return
         file_info = msg.file_info
+        # media targets live in the app media dir; ensure it exists before the
+        # worker thread opens the output file
+        try:
+            os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+        except OSError:
+            self.file_download_finished.emit(file_id, False, "无法创建保存目录")
+            return
 
         def run() -> None:
             ok, message = p2p.download_file(file_info, target_path)
             self.file_download_finished.emit(file_id, ok, message)
 
         threading.Thread(target=run, daemon=True).start()
+
+    # ------------------------------------------------- media (image / video)
+
+    @property
+    def media_dir(self) -> str:
+        """App-media directory for downloaded image/video messages. Media is
+        stored here (NOT wherever the user points a save dialog) so the
+        conversation can render it inline, including after a restart."""
+        return os.path.join(self.data_dir, "media")
+
+    def media_target_path(self, file_id: str, file_name: str) -> str:
+        """Deterministic download target for one media message: keyed by the
+        file id so same-named files from different messages never collide,
+        with the sanitized display name kept for readability. Pure path
+        math (called from paint-time probes too); the download entry points
+        create the directory."""
+        safe = sanitize_file_name(file_name or "")
+        return os.path.join(self.media_dir, f"{file_id}_{safe}")
+
+    def downloaded_media_path(self, file_id: str, file_name: str) -> Optional[str]:
+        """Path of an already-downloaded media copy, or None. The UI uses this
+        to render image/video messages inline after a process restart."""
+        path = self.media_target_path(file_id, file_name)
+        return path if os.path.isfile(path) else None
 
     # ------------------------------------------------------------- video call
 

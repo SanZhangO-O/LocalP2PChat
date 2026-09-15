@@ -11,8 +11,8 @@ import os
 import sys
 import time
 
-from PyQt6.QtCore import QSize, Qt
-from PyQt6.QtGui import QIcon, QStandardItem, QStandardItemModel
+from PyQt6.QtCore import QSize, QUrl, Qt
+from PyQt6.QtGui import QDesktopServices, QIcon, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -29,9 +29,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..models import MAX_CONTENT_LENGTH, Peer
+from ..models import MAX_CONTENT_LENGTH, MEDIA_KINDS, Peer
 from ..view_model import ChatViewModel
-from .chat_page import HEADER_ROLE, MSG_ROLE, MessageDelegate, _safe_save_name, file_offer_expired
+from .chat_page import (
+    HEADER_ROLE,
+    MSG_ROLE,
+    MessageDelegate,
+    _safe_save_name,
+    file_offer_expired,
+)
 from .theme import PRIMARY, TEXT_SUBTLE
 from .widgets import Toast, date_header_text, format_message_time, is_same_day
 
@@ -104,6 +110,8 @@ class DirectChatPage(QWidget):
                 self.list_view,
                 on_file_click=self._download_file,
                 file_states=self._file_states,
+                media_resolver=self._media_path,
+                on_media_open=self._open_media,
                 parent=self,
             )
         )
@@ -170,6 +178,7 @@ class DirectChatPage(QWidget):
         self.vm.direct_contacts_signal.connect(self._on_contacts_changed)
         self.vm.direct_session_closed.connect(self._on_session_closed)
         self.vm.file_download_finished.connect(self._on_file_download_finished)
+        self.vm.media_ready.connect(self._on_media_ready)
         self.vm.direct_chat_migrated.connect(self._on_chat_migrated)
 
     def open_chat(self, contact: Peer) -> None:
@@ -318,7 +327,36 @@ class DirectChatPage(QWidget):
         if not self.vm.send_direct_file(peer_id, path):
             Toast(self.window()).show_message("无法发送文件：未连接或文件不可用")
 
+    def _media_path(self, msg):
+        fi = msg.file_info
+        if fi is None:
+            return None
+        return self.vm.downloaded_media_path(fi.file_id, fi.file_name)
+
+    def _open_media(self, path: str):
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            Toast(self.window()).show_message("无法打开文件")
+
     def _download_file(self, msg):
+        peer_id = self._peer_id
+        fi = msg.file_info
+        if peer_id is None or fi is None or file_offer_expired(fi):
+            return
+        if fi.kind in MEDIA_KINDS:
+            # media: NO save dialog — download into the app media dir so the
+            # message renders inline; "另存为" in the context menu saves a copy
+            target = self.vm.media_target_path(fi.file_id, fi.file_name)
+            if os.path.isfile(target):
+                self._file_states[msg.id] = ("done", target, "")
+                self._open_media(target)
+                return
+            self._file_states[msg.id] = ("downloading", target, "")
+            self.list_view.viewport().update()
+            self.vm.download_direct_file(peer_id, msg.id, target)
+            return
+        self._save_file_as(msg)
+
+    def _save_file_as(self, msg):
         peer_id = self._peer_id
         fi = msg.file_info
         if peer_id is None or fi is None or file_offer_expired(fi):
@@ -343,6 +381,15 @@ class DirectChatPage(QWidget):
             self._file_states[file_id] = ("failed", "", message)
             Toast(self.window()).show_message(f"下载失败：{message}")
         self.list_view.viewport().update()
+        # a downloaded image swaps its placeholder card for a much taller
+        # inline bubble: repaint alone keeps the stale row height
+        self.list_view.doItemsLayout()
+
+    def _on_media_ready(self):
+        """An own sent image landed in the media dir: re-render so the
+        sender's own bubble flips to the inline image."""
+        self.list_view.viewport().update()
+        self.list_view.doItemsLayout()
 
     def _show_message_menu(self, pos):
         index = self.list_view.indexAt(pos)
@@ -351,17 +398,25 @@ class DirectChatPage(QWidget):
             return
         menu = QMenu(self.list_view)
         if msg.file_info is not None:
+            is_media = msg.file_info.kind in MEDIA_KINDS
+            open_action = None
+            if is_media:
+                local = self._media_path(msg)
+                if local:
+                    open_action = menu.addAction("打开")
             download_action = None
             if not file_offer_expired(msg.file_info):
-                download_action = menu.addAction("下载 / 另存为")
+                download_action = menu.addAction("另存为..." if is_media else "下载 / 另存为")
             copy_name_action = menu.addAction("复制文件名")
             delete_action = None
             if msg.is_from_me:
                 menu.addSeparator()
                 delete_action = menu.addAction("删除")
             chosen = menu.exec(self.list_view.viewport().mapToGlobal(pos))
-            if download_action is not None and chosen is download_action:
-                self._download_file(msg)
+            if open_action is not None and chosen is open_action:
+                self._open_media(self._media_path(msg))
+            elif download_action is not None and chosen is download_action:
+                self._save_file_as(msg)
             elif chosen is copy_name_action:
                 QApplication.clipboard().setText(msg.file_info.file_name)
             elif chosen is delete_action:

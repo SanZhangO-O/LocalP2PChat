@@ -29,6 +29,12 @@ from .models import (
     Peer,
     is_valid_content,
 )
+from .punch import (
+    PUNCH_TIMEOUT,
+    PunchError,
+    ROLE_MEMBER,
+    punch_connect,
+)
 from .securewire import (
     DeviceIdentity,
     Handshake,
@@ -409,6 +415,10 @@ class HostGroupServer:
         # packet was handled. The wire is already secured (password verified
         # during the handshake).
         self.member_group_handler = None
+        # Cross-NAT join support: the bridge that registers hosted groups on
+        # the public signaling server and feeds punched/relayed member
+        # connections into _handle (set by enable_signaling).
+        self._signaling_bridge = None
 
     # ------------------------------------------------------------- lifecycle
 
@@ -421,6 +431,7 @@ class HostGroupServer:
         # conditionally, so it cannot remove the fresh registration.
         if old is not None and old is not p2p:
             old.stop()
+        self._notify_signaling()
         self._ensure_running()
 
     def unregister(self, p2p: "P2PManager") -> None:
@@ -429,6 +440,7 @@ class HostGroupServer:
             # not unregister the replacement that is already registered
             if self._groups.get(p2p.group_name) is p2p:
                 self._groups.pop(p2p.group_name, None)
+        self._notify_signaling()
         # keep listening: the shared port also serves direct member chats
 
     def restart(self, port: Optional[int] = None) -> None:
@@ -441,12 +453,46 @@ class HostGroupServer:
 
     def shutdown(self) -> None:
         """Stop the listener for good (app teardown)."""
+        self.disable_signaling()
         self.stop()
 
     def ensure_running(self) -> None:
         """Make sure the shared port is being listened on (direct chats need
         it even on devices with no host group)."""
         self._ensure_running()
+
+    # ------------------------------------------------------------- signaling
+
+    def enable_signaling(self, server_host: str, server_port: int) -> None:
+        """Start announcing every hosted group on the public signaling server
+        (punch.py.SignalingHostBridge) so members on other NAT segments can
+        join without this device being reachable directly."""
+        from .punch import SignalingHostBridge
+
+        self.disable_signaling()
+        self._signaling_bridge = SignalingHostBridge(server_host, server_port, self)
+        self._signaling_bridge.start()
+
+    def disable_signaling(self) -> None:
+        bridge = self._signaling_bridge
+        self._signaling_bridge = None
+        if bridge is not None:
+            bridge.stop()
+
+    def signaling_groups(self) -> list:
+        """[(numeric join id, group name)] for every group currently hosted
+        here (read by the signaling bridge on socket threads)."""
+        with self._lock:
+            return [
+                (p2p.numeric_group_id, p2p.group_name)
+                for p2p in self._groups.values()
+                if p2p.is_host
+            ]
+
+    def _notify_signaling(self) -> None:
+        bridge = self._signaling_bridge
+        if bridge is not None:
+            bridge.notify_groups_changed()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -558,71 +604,80 @@ class HostGroupServer:
             pass
         self._server_socket = None
 
-    def _handle(self, sock: socket.socket) -> None:
+    def _handle(self, sock: socket.socket, allow_query_join: bool = False) -> None:
         """Read the hs_start handshake line, secure the connection, then
         dispatch by mode. Only the secured handshake is accepted — a legacy
-        plaintext query_group/join/direct_hello/mesh_hello never works."""
+        plaintext query_group/join/direct_hello/mesh_hello never works.
+
+        [allow_query_join] (signaling-server path) lets one connection carry
+        a query FIRST (the member learns the group display name) and then a
+        follow-up join handshake on the SAME socket: the punched/relayed
+        cross-NAT channel is far too expensive to establish twice. LAN
+        connections keep the one-mode-per-connection behavior.
+        """
         try:
             sock.settimeout(15)
             reader = sock.makefile("r", encoding="utf-8", newline="\n")
-            first_line = _read_line_bounded(reader)
-            if first_line is None:
-                self._safe_close(sock)
-                return
-            try:
-                start = NetworkPacket.from_json(first_line)
-            except Exception:
-                self._safe_close(sock)
-                return
-            if start.type != Protocol.HS_START:
-                self._safe_close(sock)
-                return
-            wire = make_wire(sock, reader)
-            mode = start.hs_mode
-            if mode == Protocol.MODE_DIRECT:
-                secured = Handshake.accept_direct(wire, start, None)
-                if secured is None:
-                    self._safe_close(sock)
+            while True:
+                first_line = _read_line_bounded(reader)
+                if first_line is None:
                     return
                 try:
-                    hello = wire.recv_packet()
-                except WireException:
+                    start = NetworkPacket.from_json(first_line)
+                except Exception:
+                    return
+                if start.type != Protocol.HS_START:
+                    return
+                wire = make_wire(sock, reader)
+                mode = start.hs_mode
+                if mode == Protocol.MODE_DIRECT:
+                    secured = Handshake.accept_direct(wire, start, None)
+                    if secured is None:
+                        self._safe_close(sock)
+                        return
+                    try:
+                        hello = wire.recv_packet()
+                    except WireException:
+                        self._safe_close(sock)
+                        return
+                    if hello is None or hello.type != Protocol.DIRECT_HELLO:
+                        self._safe_close(sock)
+                        return
+                    dm = self.direct_manager
+                    if dm is None:
+                        self._safe_close(sock)
+                        return
+                    dm.handle_direct_hello(sock, wire, hello, secured.peer_ident)
+                    return
+                if mode == Protocol.MODE_MESH:
+                    mm = self.mesh_manager
+                    lookup = self.password_lookup
+                    if mm is None or lookup is None:
+                        self._safe_close(sock)
+                        return
+                    secured = Handshake.accept(wire, start, lookup)
+                    if secured is None:
+                        self._safe_close(sock)
+                        return
+                    try:
+                        hello = wire.recv_packet()
+                    except WireException:
+                        self._safe_close(sock)
+                        return
+                    if hello is None or hello.type != "mesh_hello":
+                        self._safe_close(sock)
+                        return
+                    if hello.group_id != start.group_id:
+                        # same rule as query/join: the password was verified for
+                        # start.groupId, so the hello must not name another group
+                        # (whose mesh state and history it must not reach)
+                        self._safe_close(sock)
+                        return
+                    mm.handle_mesh_hello(sock, wire, hello)
+                    return
+                if mode not in (Protocol.MODE_QUERY, Protocol.MODE_JOIN):
                     self._safe_close(sock)
                     return
-                if hello is None or hello.type != Protocol.DIRECT_HELLO:
-                    self._safe_close(sock)
-                    return
-                dm = self.direct_manager
-                if dm is None:
-                    self._safe_close(sock)
-                    return
-                dm.handle_direct_hello(sock, wire, hello, secured.peer_ident)
-            elif mode == Protocol.MODE_MESH:
-                mm = self.mesh_manager
-                lookup = self.password_lookup
-                if mm is None or lookup is None:
-                    self._safe_close(sock)
-                    return
-                secured = Handshake.accept(wire, start, lookup)
-                if secured is None:
-                    self._safe_close(sock)
-                    return
-                try:
-                    hello = wire.recv_packet()
-                except WireException:
-                    self._safe_close(sock)
-                    return
-                if hello is None or hello.type != "mesh_hello":
-                    self._safe_close(sock)
-                    return
-                if hello.group_id != start.group_id:
-                    # same rule as query/join: the password was verified for
-                    # start.groupId, so the hello must not name another group
-                    # (whose mesh state and history it must not reach)
-                    self._safe_close(sock)
-                    return
-                mm.handle_mesh_hello(sock, wire, hello)
-            elif mode in (Protocol.MODE_QUERY, Protocol.MODE_JOIN):
                 p2p = self.resolve_group(start.group_id)
                 lookup = self.password_lookup
                 if lookup is None:
@@ -662,14 +717,20 @@ class HostGroupServer:
                         except Exception:
                             pass
                         self._safe_close(sock)
-                elif mode == Protocol.MODE_QUERY:
-                    p2p._handle_query_group(sock, wire, packet)
-                else:
-                    # the group's P2PManager takes over the socket (join_ack,
-                    # member registration, then its read loop)
-                    p2p._handle_join(sock, wire, packet)
-            else:
-                self._safe_close(sock)
+                    return
+                if mode == Protocol.MODE_QUERY:
+                    kept = p2p._handle_query_group(
+                        sock, wire, packet, keep_open=allow_query_join
+                    )
+                    if not kept:
+                        return
+                    # query answered with the socket kept open: the next
+                    # hs_start on this connection must be the join
+                    continue
+                # the group's P2PManager takes over the socket (join_ack,
+                # member registration, then its read loop)
+                p2p._handle_join(sock, wire, packet)
+                return
         except Exception:
             self._safe_close(sock)
 
@@ -1001,101 +1062,203 @@ class P2PManager:
         self.query_error = None
 
     def confirm_join(self, target_ip: str, target_port: int = TCP_PORT) -> None:
+        """Join by the host's direct (LAN or public) IP:port."""
         if self.is_joining:
             return
-        self.is_joining = True
-        self.connection_lost = False
-        self.connection_result = None
-        self.listener.join_state_changed(self)
+        self._begin_join()
 
         def run() -> None:
             sock: Optional[socket.socket] = None
-            handed_off = False
+            consumed = False
             try:
                 sock = socket.create_connection((target_ip, target_port), timeout=5)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock.settimeout(15)
-                reader = sock.makefile("r", encoding="utf-8", newline="\n")
-                # password-bound secured handshake: the join (and everything
-                # after it) is encrypted and the host is authenticated by its
-                # knowledge of the group password
-                wire = make_wire(sock, reader)
-                Handshake.initiate(
-                    wire,
-                    Protocol.MODE_JOIN,
-                    self.join_id or self.group_name,
-                    self.group_password,
-                )
-                my_peer = Peer(self.my_id, self.my_name, self.my_ip_address, self.port)
-                # no password field: the password-bound handshake already
-                # authenticated the joiner — it never appears in a packet
-                wire.send_packet(
-                    NetworkPacket(
-                        type=Protocol.MODE_JOIN,
-                        group_id=self.join_id or self.group_name,
-                        peer=my_peer,
-                    )
-                )
-                try:
-                    response = wire.recv_packet()
-                except WireException:
-                    response = None
-                if response is None:
-                    self._set_join_result(False, "连接被关闭")
-                elif response.type == "join_ack" and response.members is not None:
-                    with self._lock:
-                        self.group_id = response.group_id or self.group_id
-                        for peer in response.members:
-                            if peer.id != self.my_id:
-                                self.peers[peer.id] = peer
-                    self.listener.peers_changed(self)
-                    host = response.host
-                    if host is not None and (
-                        host.ip_address != target_ip or host.port != target_port
-                    ):
-                        # joined through a member sponsor: the ack reveals the
-                        # host, so complete the join by connecting to the host
-                        # for the relay path (best effort — mesh works without
-                        # it). Record the REAL host address synchronously
-                        # (before the join result) so the ViewModel can persist
-                        # the right rejoin address — never the sponsor the
-                        # user typed (Android parity).
-                        self.connected_host = host
-                        self.is_joining = False
-                        self._set_join_result(True, "")
-                        # the sponsor socket only served the join ack; it is
-                        # not the relay path, so close it (a leak otherwise)
-                        # and let _connect_to_host establish the real link.
-                        self._safe_close(sock)
-                        sock = None
-                        self._connect_to_host(host)
-                        return
-                    self._host_socket = sock
-                    self._host_wire = wire
-                    self.is_joining = False
-                    self._set_join_result(True, "")
-                    self.listener.peers_changed(self)
-                    handed_off = True
-                    self._start_heartbeat()
-                    self._read_loop_from_host(sock, wire)
-                    return
-                elif response.type == "join_rejected":
-                    self._set_join_result(False, "群组不匹配，连接被拒绝")
-                elif response.type == "error":
-                    self._set_join_result(False, response.error_message or "加入被拒绝")
-                else:
-                    self._set_join_result(False, "未知的响应")
+                consumed = self._join_exchange(sock, typed_endpoint=(target_ip, target_port))
             except WireException as e:
                 self._set_join_result(False, str(e))
             except Exception as e:
                 self._set_join_result(False, f"连接失败: {e}")
             finally:
-                if sock is not None and not handed_off:
+                if sock is not None and not consumed:
                     self._safe_close(sock)
                 self.is_joining = False
                 self.listener.join_state_changed(self)
 
         self._spawn(run)
+
+    def confirm_join_via_server(
+        self,
+        server_host: str,
+        server_port: int,
+        punch_timeout: float = PUNCH_TIMEOUT,
+    ) -> None:
+        """Join through the public signaling server (punch.py): punch a
+        direct hole to the host (TCP simultaneous open) or fall back to an
+        encrypted server relay. The group is identified by its numeric join
+        id — no host address needed. The host display name is learned with
+        a keep-open query on the SAME channel, then the regular secured
+        join handshake runs on it."""
+        if self.is_joining:
+            return
+        self._begin_join()
+
+        def run() -> None:
+            sock: Optional[socket.socket] = None
+            consumed = False
+            try:
+                sock = punch_connect(
+                    server_host,
+                    server_port,
+                    self.join_id or self.group_name,
+                    ROLE_MEMBER,
+                    self.my_id,
+                    self.my_name,
+                    punch_timeout=punch_timeout,
+                )
+                sock.settimeout(15)
+                reader = self._server_path_query(sock)
+                consumed = self._join_exchange(sock, reader=reader)
+            except PunchError as e:
+                self._set_join_result(False, str(e))
+            except WireException as e:
+                self._set_join_result(False, str(e))
+            except Exception as e:
+                self._set_join_result(False, f"连接失败: {e}")
+            finally:
+                if sock is not None and not consumed:
+                    self._safe_close(sock)
+                self.is_joining = False
+                self.listener.join_state_changed(self)
+
+        self._spawn(run)
+
+    def _begin_join(self) -> None:
+        self.is_joining = True
+        self.connection_lost = False
+        self.connection_result = None
+        self.listener.join_state_changed(self)
+
+    def _server_path_query(self, sock: socket.socket):
+        """Run a secured MODE_QUERY on the punched/relayed socket so the
+        group display name (and member count) is known before joining. The
+        host keeps the connection open ([_handle allow_query_join]) and the
+        returned reader is reused by the follow-up join exchange."""
+        reader = sock.makefile("r", encoding="utf-8", newline="\n")
+        wire = make_wire(sock, reader)
+        Handshake.initiate(
+            wire,
+            Protocol.MODE_QUERY,
+            self.join_id or self.group_name,
+            self.group_password,
+        )
+        wire.send_packet(
+            NetworkPacket(
+                type=Protocol.MODE_QUERY,
+                group_id=self.join_id or self.group_name,
+            )
+        )
+        try:
+            response = wire.recv_packet()
+        except WireException:
+            response = None
+        if response is None:
+            raise WireException("无响应")
+        if response.type == "group_info" and response.group_info is not None:
+            # display name only — deliberately NOT p2p.queried_group_info:
+            # the setup page shows the confirm dialog whenever a queried
+            # info is present, and this path has no confirm step
+            self.group_name = response.group_info.group_name
+        elif response.type == "join_rejected":
+            raise WireException("该设备不存在此群组")
+        else:
+            raise WireException("未知的响应")
+        return reader
+
+    def _join_exchange(
+        self,
+        sock: socket.socket,
+        reader=None,
+        typed_endpoint: Optional[tuple] = None,
+    ) -> bool:
+        """Run the secured MODE_JOIN handshake and join_ack handling on an
+        already-connected socket. [typed_endpoint] is the address the user
+        typed (direct joins only): a join_ack naming a DIFFERENT host means
+        the join went through a member sponsor. Returns True when this
+        method took ownership of [sock] (the host relay path keeps it);
+        False on rejection (result already recorded, caller closes)."""
+        if reader is None:
+            reader = sock.makefile("r", encoding="utf-8", newline="\n")
+        wire = make_wire(sock, reader)
+        # password-bound secured handshake: the join (and everything
+        # after it) is encrypted and the host is authenticated by its
+        # knowledge of the group password
+        Handshake.initiate(
+            wire,
+            Protocol.MODE_JOIN,
+            self.join_id or self.group_name,
+            self.group_password,
+        )
+        my_peer = Peer(self.my_id, self.my_name, self.my_ip_address, self.port)
+        # no password field: the password-bound handshake already
+        # authenticated the joiner — it never appears in a packet
+        wire.send_packet(
+            NetworkPacket(
+                type=Protocol.MODE_JOIN,
+                group_id=self.join_id or self.group_name,
+                peer=my_peer,
+            )
+        )
+        try:
+            response = wire.recv_packet()
+        except WireException:
+            response = None
+        if response is None:
+            self._set_join_result(False, "连接被关闭")
+            return False
+        if response.type == "join_ack" and response.members is not None:
+            with self._lock:
+                self.group_id = response.group_id or self.group_id
+                for peer in response.members:
+                    if peer.id != self.my_id:
+                        self.peers[peer.id] = peer
+            self.listener.peers_changed(self)
+            host = response.host
+            if host is not None and (
+                typed_endpoint is None
+                or host.ip_address != typed_endpoint[0]
+                or host.port != typed_endpoint[1]
+            ):
+                # joined through a member sponsor: the ack reveals the
+                # host, so complete the join by connecting to the host
+                # for the relay path (best effort — mesh works without
+                # it). Record the REAL host address synchronously
+                # (before the join result) so the ViewModel can persist
+                # the right rejoin address — never the sponsor the
+                # user typed (Android parity).
+                self.connected_host = host
+                self.is_joining = False
+                self._set_join_result(True, "")
+                # the sponsor socket only served the join ack; it is
+                # not the relay path, so close it (a leak otherwise)
+                # and let _connect_to_host establish the real link.
+                self._safe_close(sock)
+                self._connect_to_host(host)
+                return True
+            self._host_socket = sock
+            self._host_wire = wire
+            self.is_joining = False
+            self._set_join_result(True, "")
+            self.listener.peers_changed(self)
+            self._start_heartbeat()
+            self._read_loop_from_host(sock, wire)
+            return True
+        if response.type == "join_rejected":
+            self._set_join_result(False, "群组不匹配，连接被拒绝")
+        elif response.type == "error":
+            self._set_join_result(False, response.error_message or "加入被拒绝")
+        else:
+            self._set_join_result(False, "未知的响应")
+        return False
 
     def clear_join_result(self) -> None:
         self.connection_result = None
@@ -1158,19 +1321,34 @@ class P2PManager:
         (primary) or the legacy group name."""
         return id_or_name == self.numeric_group_id or id_or_name == self.group_name
 
-    def _handle_query_group(self, sock: socket.socket, wire: Wire, packet: NetworkPacket) -> None:
+    def _handle_query_group(
+        self,
+        sock: socket.socket,
+        wire: Wire,
+        packet: NetworkPacket,
+        keep_open: bool = False,
+    ) -> bool:
+        """Answer a group query. Returns True only when the answer was sent
+        AND [keep_open] is set (signaling-server path): the socket stays
+        open for the follow-up join handshake on the same connection.
+        Otherwise the socket is closed and False returned."""
+        matched = bool(packet.group_id) and self._matches_group(packet.group_id)
+        answered = False
         try:
-            if not packet.group_id or not self._matches_group(packet.group_id):
+            if not matched:
                 wire.send_packet(NetworkPacket(type="join_rejected"))
-            else:
-                with self._lock:
-                    count = len(self.peers) + 1
-                info = GroupInfo(self.group_name, self.my_name, self.my_id, count)
-                wire.send_packet(NetworkPacket(type="group_info", group_info=info))
+                return False
+            with self._lock:
+                count = len(self.peers) + 1
+            info = GroupInfo(self.group_name, self.my_name, self.my_id, count)
+            wire.send_packet(NetworkPacket(type="group_info", group_info=info))
+            answered = True
+            return bool(keep_open)
         except Exception:
-            pass
+            return False
         finally:
-            self._safe_close(sock)
+            if not answered:
+                self._safe_close(sock)
 
     def _handle_join(self, sock: socket.socket, wire: Wire, packet: NetworkPacket) -> None:
         # The handshake already verified the group password (password-bound
@@ -1649,7 +1827,15 @@ class P2PManager:
         # download host
         advertised = get_local_ip_address() or self.my_ip_address
         file_key = random_bytes(KEY_LEN)
-        file_info = FileInfo(file_id, file_name, file_size, advertised, port, to_b64(file_key))
+        file_info = FileInfo(
+            file_id,
+            file_name,
+            file_size,
+            advertised,
+            port,
+            to_b64(file_key),
+            kind=detect_media_kind(file_name),
+        )
         with self._lock:
             self._file_servers[file_id] = srv
         message = ChatMessage(
@@ -2899,7 +3085,15 @@ class DirectChatManager:
         # per-file random key: travels INSIDE the encrypted message channel
         # and protects the raw download stream
         file_key = random_bytes(KEY_LEN)
-        file_info = FileInfo(file_id, file_name, file_size, my_ip, port, to_b64(file_key))
+        file_info = FileInfo(
+            file_id,
+            file_name,
+            file_size,
+            my_ip,
+            port,
+            to_b64(file_key),
+            kind=detect_media_kind(file_name),
+        )
         with self._lock:
             self._file_servers[file_id] = srv
         msg = ChatMessage(

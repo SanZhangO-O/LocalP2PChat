@@ -8,6 +8,7 @@ import com.zqr.localchat.ChatApp
 import com.zqr.localchat.crypto.Crypto
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.FileInfo
+import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.data.Peer
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -1179,7 +1180,8 @@ class P2PManager(
         fileName: String,
         resolver: ContentResolver,
         uri: Uri,
-        fileSize: Long
+        fileSize: Long,
+        kind: String = FileKind.FILE
     ): ChatMessage? {
         if (!isValidContent(fileName)) return null
         if (fileSize > FileTransfer.MAX_DOWNLOAD_BYTES) {
@@ -1202,7 +1204,7 @@ class P2PManager(
         // switched Wi-Fi since would otherwise advertise a stale, unreachable
         // download host
         val advertised = P2PManager.getLocalIpAddress().ifBlank { myIpAddress }
-        val fileInfo = FileInfo(fileId, fileName, fileSize, advertised, port, Crypto.toB64(fileKey))
+        val fileInfo = FileInfo(fileId, fileName, fileSize, advertised, port, Crypto.toB64(fileKey), kind)
         fileServers[fileId] = server
         val msg = ChatMessage(
             id = fileId,

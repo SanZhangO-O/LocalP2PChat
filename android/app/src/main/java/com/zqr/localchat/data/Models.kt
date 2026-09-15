@@ -11,6 +11,34 @@ data class Peer(
     val port: Int
 )
 
+/** File-message kind: a plain file card, or media that renders inline in the
+ *  conversation once downloaded. Serialized only when not "file" (kotlinx
+ *  omits defaults), so packets stay byte-compatible with older clients. */
+object FileKind {
+    const val FILE = "file"
+    const val IMAGE = "image"
+    const val VIDEO = "video"
+}
+
+/** Image extensions recognized for media classification (lowercase, with
+ *  dot); mirrors the Windows client's models.IMAGE_EXTENSIONS. */
+val IMAGE_EXTENSIONS = setOf(".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic")
+
+/** Video extensions recognized for media classification (lowercase, with
+ *  dot); mirrors the Windows client's models.VIDEO_EXTENSIONS. */
+val VIDEO_EXTENSIONS = setOf(".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".3gp")
+
+/** Classify a file by name for the send path: "image", "video" or "file". */
+fun detectMediaKind(fileName: String): String {
+    val ext = fileName.substringAfterLast('.', "").lowercase()
+    if (ext.isEmpty()) return FileKind.FILE
+    return when {
+        ".$ext" in IMAGE_EXTENSIONS -> FileKind.IMAGE
+        ".$ext" in VIDEO_EXTENSIONS -> FileKind.VIDEO
+        else -> FileKind.FILE
+    }
+}
+
 /**
  * Metadata for a file offered in chat. The file bytes themselves are NOT sent
  * over the message stream: the sender opens a short-lived download server and
@@ -27,7 +55,8 @@ data class FileInfo(
     val fileSize: Long,
     val downloadHost: String,
     val downloadPort: Int,
-    val fileKey: String = ""
+    val fileKey: String = "",
+    val kind: String = FileKind.FILE
 )
 
 @Serializable

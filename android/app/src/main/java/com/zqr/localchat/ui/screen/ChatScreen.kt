@@ -1,8 +1,12 @@
 package com.zqr.localchat.ui.screen
 
 import android.content.ClipData
+import android.graphics.BitmapFactory
+import android.media.ThumbnailUtils
+import android.provider.MediaStore
 import android.widget.Toast
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
@@ -10,6 +14,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -22,12 +27,18 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalConfiguration
@@ -39,9 +50,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.FileInfo
+import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.viewmodel.ChatViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Calendar
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -57,7 +71,15 @@ fun ChatScreen(
     onForward: (groupId: String, content: String) -> Boolean,
     onDelete: (String) -> Unit,
     onPickFile: () -> Unit = {},
+    onPickImage: () -> Unit = {},
+    onPickVideo: () -> Unit = {},
     onDownloadFile: (FileInfo) -> Unit = {},
+    onDownloadMedia: (FileInfo) -> Unit = {},
+    resolveMedia: (FileInfo) -> String? = { null },
+    /** Bumped by the ViewModel when an own sent image lands in the media
+     *  dir: re-keys the local-path lookups so the sender's own bubble flips
+     *  to the inline render without any other recomposition trigger. */
+    mediaVersion: Int = 0,
     onOpenFile: (String) -> Unit = {},
     onBack: () -> Unit
 ) {
@@ -162,6 +184,32 @@ fun ChatScreen(
                                 MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+                    IconButton(
+                        onClick = onPickImage,
+                        enabled = !connectionLost
+                    ) {
+                        Icon(
+                            Icons.Default.Image,
+                            contentDescription = "发送图片",
+                            tint = if (!connectionLost)
+                                MaterialTheme.colorScheme.primary
+                            else
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    IconButton(
+                        onClick = onPickVideo,
+                        enabled = !connectionLost
+                    ) {
+                        Icon(
+                            Icons.Default.Movie,
+                            contentDescription = "发送视频",
+                            tint = if (!connectionLost)
+                                MaterialTheme.colorScheme.primary
+                            else
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     Spacer(modifier = Modifier.width(4.dp))
                     OutlinedTextField(
                         value = inputText,
@@ -238,14 +286,30 @@ fun ChatScreen(
                         DateHeader(timestamp = message.timestamp)
                     }
                     if (message.fileInfo != null) {
-                        val saved = downloadStates[message.id] as? ChatViewModel.DownloadState.Done
-                        FileMessageBubble(
-                            message = message,
-                            state = downloadStates[message.id],
-                            onDownload = { onDownloadFile(message.fileInfo!!) },
-                            onOpen = saved?.let { done -> { onOpenFile(done.uri) } },
-                            onDelete = { pendingDelete = message.id }
-                        )
+                        val fi = message.fileInfo!!
+                        if (fi.kind == FileKind.IMAGE || fi.kind == FileKind.VIDEO) {
+                            val saved =
+                                downloadStates[message.id] as? ChatViewModel.DownloadState.Done
+                            MediaMessageBubble(
+                                message = message,
+                                state = downloadStates[message.id],
+                                localPath = saved?.uri ?: resolveMedia(fi),
+                                onDownload = { onDownloadMedia(fi) },
+                                onSaveAs = { onDownloadFile(fi) },
+                                onOpen = onOpenFile,
+                                onDelete = { pendingDelete = message.id }
+                            )
+                        } else {
+                            val saved =
+                                downloadStates[message.id] as? ChatViewModel.DownloadState.Done
+                            FileMessageBubble(
+                                message = message,
+                                state = downloadStates[message.id],
+                                onDownload = { onDownloadFile(message.fileInfo!!) },
+                                onOpen = saved?.let { done -> { onOpenFile(done.uri) } },
+                                onDelete = { pendingDelete = message.id }
+                            )
+                        }
                     } else {
                         MessageBubble(
                             message = message,
@@ -661,5 +725,309 @@ internal fun FileMessageBubble(
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------- media
+// Image/video messages: media received from a peer is downloaded into the
+// app's media dir and rendered INLINE (image decoded, video thumbnail with a
+// play overlay); tapping a downloaded item opens the system viewer/player.
+
+/**
+ * Decode an image file off the main thread with power-of-two downsampling so
+ * a 12-megapixel photo does not allocate a full bitmap just to sit in a
+ * ~260dp bubble. Returns null for unreadable/missing files.
+ */
+@Composable
+internal fun rememberSampledBitmap(path: String, targetSize: Int = 1024): androidx.compose.ui.graphics.ImageBitmap? =
+    produceState<androidx.compose.ui.graphics.ImageBitmap?>(initialValue = null, path) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(path, bounds)
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@withContext null
+                var sample = 1
+                while (bounds.outWidth / (sample * 2) >= targetSize ||
+                    bounds.outHeight / (sample * 2) >= targetSize
+                ) {
+                    sample *= 2
+                }
+                BitmapFactory.decodeFile(
+                    path,
+                    BitmapFactory.Options().apply { inSampleSize = sample }
+                )
+            }.getOrNull()?.asImageBitmap()
+        }
+    }.value
+
+/**
+ * Extract a video frame off the main thread for the inline thumbnail
+ * (MINI_KIND keeps the decode small). Returns null when the platform cannot
+ * produce a thumbnail — the bubble then renders a neutral placeholder.
+ */
+@Composable
+internal fun rememberVideoThumbnail(path: String): androidx.compose.ui.graphics.ImageBitmap? =
+    produceState<androidx.compose.ui.graphics.ImageBitmap?>(initialValue = null, path) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                ThumbnailUtils.createVideoThumbnail(
+                    path,
+                    MediaStore.Images.Thumbnails.MINI_KIND
+                )
+            }.getOrNull()?.takeIf { it.width > 0 && it.height > 0 }?.asImageBitmap()
+        }
+    }.value
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+internal fun MediaMessageBubble(
+    message: ChatMessage,
+    state: ChatViewModel.DownloadState?,
+    localPath: String?,
+    onDownload: () -> Unit,
+    onSaveAs: () -> Unit,
+    onOpen: (String) -> Unit,
+    onDelete: () -> Unit
+) {
+    val fileInfo = message.fileInfo ?: return
+    val isVideo = fileInfo.kind == FileKind.VIDEO
+    val isFromMe = message.isFromMe
+    val alignment = if (isFromMe) Alignment.End else Alignment.Start
+
+    var showMenu by remember { mutableStateOf(false) }
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+
+    // an offer without a download address expired with its sender's previous
+    // session (the short-lived download server is gone)
+    val expired = fileInfo.downloadHost.isBlank()
+    val downloading = state is ChatViewModel.DownloadState.Downloading
+    val statusText = when (state) {
+        is ChatViewModel.DownloadState.Downloading -> "下载中..."
+        is ChatViewModel.DownloadState.Failed -> state.message
+        else -> when {
+            localPath != null -> if (isVideo) "点击播放" else "点击查看"
+            isFromMe -> "已发送"
+            expired -> "已过期"
+            else -> "点击查看"
+        }
+    }
+    val clickable = localPath != null || (
+        !expired && !downloading && !isFromMe
+        )
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = alignment
+    ) {
+        Box(
+            modifier = Modifier
+                .widthIn(max = 280.dp)
+                .combinedClickable(
+                    onClick = {
+                        when {
+                            localPath != null -> onOpen(localPath)
+                            clickable -> onDownload()
+                        }
+                    },
+                    onLongClick = { showMenu = true }
+                )
+        ) {
+            when {
+                // downloaded image: render it directly in the conversation
+                !isVideo && localPath != null -> {
+                    val bitmap = rememberSampledBitmap(localPath)
+                    if (bitmap != null) {
+                        // fit the bitmap's own ratio into the bubble box
+                        // (px used as dp — only the ratio matters here)
+                        val maxW = minOf(260.dp, (LocalConfiguration.current.screenWidthDp * 0.72f).dp)
+                        val w = bitmap.width.coerceAtLeast(1).toFloat()
+                        val h = bitmap.height.coerceAtLeast(1).toFloat()
+                        val fit = minOf(1f, maxW.value / w, 320f / h)
+                        Image(
+                            bitmap = bitmap,
+                            contentDescription = fileInfo.fileName,
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier
+                                .width((w * fit).dp)
+                                .height((h * fit).dp)
+                                .clip(RoundedCornerShape(14.dp))
+                        )
+                    } else {
+                        MediaPlaceholderCard(
+                            isVideo = false,
+                            fileInfo = fileInfo,
+                            isFromMe = isFromMe,
+                            statusText = statusText
+                        )
+                    }
+                }
+                // downloaded video: thumbnail with a play overlay
+                isVideo && localPath != null -> {
+                    val thumbnail = rememberVideoThumbnail(localPath)
+                    val maxW = minOf(260.dp, (LocalConfiguration.current.screenWidthDp * 0.72f).dp)
+                    Box(
+                        modifier = Modifier
+                            .widthIn(max = maxW)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color(0xFF1B1B1F))
+                    ) {
+                        if (thumbnail != null) {
+                            val w = thumbnail.width.coerceAtLeast(1).toFloat()
+                            val h = thumbnail.height.coerceAtLeast(1).toFloat()
+                            val fit = minOf(1f, maxW.value / w, 320f / h)
+                            Image(
+                                bitmap = thumbnail,
+                                contentDescription = fileInfo.fileName,
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier
+                                    .width((w * fit).dp)
+                                    .height((h * fit).dp)
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .width(220.dp)
+                                    .height(140.dp)
+                            )
+                        }
+                        Surface(
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .size(48.dp),
+                            shape = CircleShape,
+                            color = Color.Black.copy(alpha = 0.45f)
+                        ) {
+                            Icon(
+                                Icons.Filled.PlayArrow,
+                                contentDescription = "播放视频",
+                                tint = Color.White,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
+                }
+                // not downloaded yet (or unreadable): compact placeholder card
+                else -> {
+                    MediaPlaceholderCard(
+                        isVideo = isVideo,
+                        fileInfo = fileInfo,
+                        isFromMe = isFromMe,
+                        statusText = statusText
+                    )
+                }
+            }
+            DropdownMenu(
+                expanded = showMenu,
+                onDismissRequest = { showMenu = false }
+            ) {
+                if (localPath != null) {
+                    DropdownMenuItem(
+                        text = { Text(if (isVideo) "播放" else "打开") },
+                        onClick = {
+                            showMenu = false
+                            onOpen(localPath)
+                        },
+                        leadingIcon = {
+                            Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null)
+                        }
+                    )
+                }
+                if (!isFromMe && !expired) {
+                    DropdownMenuItem(
+                        text = { Text("保存到...") },
+                        onClick = {
+                            showMenu = false
+                            onSaveAs()
+                        }
+                    )
+                }
+                DropdownMenuItem(
+                    text = { Text("复制文件名") },
+                    onClick = {
+                        scope.launch {
+                            clipboard.setClipEntry(
+                                ClipEntry(ClipData.newPlainText("LocalChat", fileInfo.fileName))
+                            )
+                        }
+                        showMenu = false
+                    }
+                )
+                if (isFromMe) {
+                    DropdownMenuItem(
+                        text = { Text("删除") },
+                        onClick = {
+                            showMenu = false
+                            onDelete()
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MediaPlaceholderCard(
+    isVideo: Boolean,
+    fileInfo: FileInfo,
+    isFromMe: Boolean,
+    statusText: String
+) {
+    val bgColor = if (isFromMe)
+        MaterialTheme.colorScheme.primary
+    else
+        MaterialTheme.colorScheme.surfaceVariant
+    val textColor = if (isFromMe)
+        MaterialTheme.colorScheme.onPrimary
+    else
+        MaterialTheme.colorScheme.onSurfaceVariant
+    Row(
+        modifier = Modifier
+            .widthIn(max = 280.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(bgColor)
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Surface(
+            modifier = Modifier.size(40.dp),
+            shape = RoundedCornerShape(8.dp),
+            color = if (isFromMe)
+                MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.15f)
+            else
+                MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    if (isVideo) Icons.Default.Movie else Icons.Default.Image,
+                    contentDescription = if (isVideo) "视频" else "图片",
+                    tint = textColor
+                )
+            }
+        }
+        Spacer(modifier = Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = fileInfo.fileName,
+                color = textColor,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 2,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = formatFileSize(fileInfo.fileSize),
+                color = textColor.copy(alpha = 0.7f),
+                fontSize = 11.sp
+            )
+        }
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = statusText,
+            color = textColor.copy(alpha = 0.8f),
+            fontSize = 11.sp
+        )
     }
 }

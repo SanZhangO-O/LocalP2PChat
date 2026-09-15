@@ -1,4 +1,5 @@
 import json
+import os
 from dataclasses import dataclass
 from typing import Optional, List
 
@@ -37,6 +38,33 @@ def _strict_port(value, field: str) -> int:
     if not 0 <= port <= 65535:
         raise ValueError(f"{field} must be a port in 0..65535")
     return port
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".3gp"}
+
+FILE_KIND_FILE = "file"
+FILE_KIND_IMAGE = "image"
+FILE_KIND_VIDEO = "video"
+MEDIA_KINDS = (FILE_KIND_IMAGE, FILE_KIND_VIDEO)
+
+
+def detect_media_kind(name: str) -> str:
+    """Classify a file by extension: "image", "video" or "file". Used on the
+    send path so an image/video is offered as a viewable media message; the
+    receiving end renders it inline instead of as a plain file card."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in IMAGE_EXTENSIONS:
+        return FILE_KIND_IMAGE
+    if ext in VIDEO_EXTENSIONS:
+        return FILE_KIND_VIDEO
+    return FILE_KIND_FILE
+
+
+def normalize_media_kind(kind: str) -> str:
+    """Keep only the known kinds on parse; anything else (future sender kinds,
+    crafted values) degrades to a plain file message."""
+    return kind if kind in (FILE_KIND_IMAGE, FILE_KIND_VIDEO) else FILE_KIND_FILE
 
 
 def sanitize_file_name(name: str) -> str:
@@ -92,6 +120,11 @@ class FileInfo:
     download_host: str
     download_port: int
     file_key: str = ""
+    # "file" (plain file card), "image" or "video": media kinds are rendered
+    # inline in the conversation after download. Default "file" is omitted on
+    # the wire so packets match kotlinx.serialization's output (defaults are
+    # not encoded), keeping old clients interoperable.
+    kind: str = FILE_KIND_FILE
 
     def to_dict(self) -> dict:
         d = {
@@ -103,6 +136,8 @@ class FileInfo:
         }
         if self.file_key:
             d["fileKey"] = self.file_key
+        if self.kind != FILE_KIND_FILE:
+            d["kind"] = self.kind
         return d
 
     @staticmethod
@@ -117,6 +152,7 @@ class FileInfo:
             download_host=str(d.get("downloadHost", "")),
             download_port=_strict_port(d.get("downloadPort", 0), "downloadPort"),
             file_key=str(d.get("fileKey", "")),
+            kind=normalize_media_kind(str(d.get("kind", FILE_KIND_FILE))),
         )
 
 

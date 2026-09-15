@@ -128,6 +128,38 @@ class SettingsPage(QWidget):
         port_layout.addWidget(port_save, alignment=Qt.AlignmentFlag.AlignRight)
         body_layout.addWidget(port_card)
 
+        # ---- 中继/打洞服务器 ----
+        sig_card = QFrame()
+        sig_card.setObjectName("card")
+        sig_layout = QVBoxLayout(sig_card)
+        sig_layout.setContentsMargins(16, 14, 16, 14)
+        sig_layout.setSpacing(8)
+        sig_title = QLabel("中继/打洞服务器（跨网段加入）")
+        sig_title.setStyleSheet("font-size: 14px; font-weight: 600;")
+        sig_layout.addWidget(sig_title)
+        sig_hint = QLabel(
+            "填写后，本机创建的群组会注册到该服务器；其它网段的成员凭群组数字ID即可加入"
+            "（优先打洞直连，失败时经服务器加密中继）。留空则仅限局域网。"
+            "格式：IP或域名:端口"
+        )
+        sig_hint.setObjectName("faint")
+        sig_hint.setWordWrap(True)
+        sig_layout.addWidget(sig_hint)
+        self.sig_edit = QLineEdit()
+        self.sig_edit.setPlaceholderText("例如: relay.example.com:25000")
+        self.sig_edit.setMaximumWidth(320)
+        self.sig_edit.setMinimumHeight(36)
+        sig_layout.addWidget(self.sig_edit)
+        self.sig_error = QLabel("")
+        self.sig_error.setStyleSheet("font-size: 12px; color: #B3261E;")
+        self.sig_error.hide()
+        sig_layout.addWidget(self.sig_error)
+        sig_save = QPushButton("保存服务器")
+        sig_save.setObjectName("outline")
+        sig_save.clicked.connect(self._save_signaling_server)
+        sig_layout.addWidget(sig_save, alignment=Qt.AlignmentFlag.AlignRight)
+        body_layout.addWidget(sig_card)
+
         # ---- 本机安全码 ----
         sec_card = QFrame()
         sec_card.setObjectName("card")
@@ -163,6 +195,7 @@ class SettingsPage(QWidget):
         ip = self.vm.local_ip
         self.ip_label.setText(ip if ip else "未连接到网络")
         self.port_edit.setText(str(self.vm.local_port))
+        self.sig_edit.setText(self.vm.signaling_server or "")
         code = self.vm.security_code
         self.security_label.setText(code if code else "未生成")
         self.copy_security_btn.setEnabled(bool(code))
@@ -199,3 +232,11 @@ class SettingsPage(QWidget):
             return
         self.port_error.hide()
         self.vm.set_port(int(text))
+
+    def _save_signaling_server(self):
+        if self.vm.set_signaling_server(self.sig_edit.text()):
+            self.sig_error.hide()
+            Toast(self.window()).show_message("中继服务器设置已保存")
+        else:
+            self.sig_error.setText("地址无效，应为 IP或域名:端口")
+            self.sig_error.show()

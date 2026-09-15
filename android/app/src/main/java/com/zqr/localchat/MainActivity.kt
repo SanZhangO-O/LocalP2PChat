@@ -27,9 +27,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zqr.localchat.call.CallManager
 import com.zqr.localchat.data.FileInfo
+import com.zqr.localchat.data.FileKind
+import com.zqr.localchat.data.detectMediaKind
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.ui.screen.CallOverlay
 import com.zqr.localchat.ui.screen.ChatScreen
@@ -86,6 +89,7 @@ fun LocalChatApp(
     openGroupId: MutableState<String?> = remember { mutableStateOf<String?>(null) }
 ) {
     val context = LocalContext.current
+    val mediaVersion by viewModel.mediaVersion.collectAsState()
     var currentScreenName by rememberSaveable { mutableStateOf(Screen.MemberList.name) }
     val currentScreen = runCatching { Screen.valueOf(currentScreenName) }.getOrDefault(Screen.MemberList)
 
@@ -302,18 +306,25 @@ fun LocalChatApp(
     // --- file transfer ---
     // null = the ACTIVE GROUP chat, otherwise the direct-chat peer id
     var pendingFileChat by remember { mutableStateOf<String?>(null) }
+    // kind preset for the pending pick: FILE = the generic picker (kind is
+    // detected from the picked document), IMAGE/VIDEO = the media pickers
+    var pendingFileKind by remember { mutableStateOf(FileKind.FILE) }
     var pendingDownload by remember { mutableStateOf<FileInfo?>(null) }
     var pendingDownloadIsDirect by remember { mutableStateOf(false) }
     val filePickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
         val target = pendingFileChat
+        val presetKind = pendingFileKind
         pendingFileChat = null
+        pendingFileKind = FileKind.FILE
         if (uri != null) {
             val name = queryFileName(context, uri)
             val size = queryFileSize(context, uri)
-            val sent = if (target != null) viewModel.sendDirectFile(target, uri, name, size)
-            else viewModel.sendFile(uri, name, size)
+            val kind = if (presetKind != FileKind.FILE) presetKind
+            else detectKind(context, uri, name)
+            val sent = if (target != null) viewModel.sendDirectFile(target, uri, name, size, kind)
+            else viewModel.sendFile(uri, name, size, kind)
             if (!sent) {
                 Toast.makeText(context, "文件发送失败：文件过大或未连接", Toast.LENGTH_SHORT).show()
             }
@@ -333,6 +344,12 @@ fun LocalChatApp(
             }
         }
         pendingDownload = null
+    }
+
+    fun launchFilePicker(chatId: String?, kind: String, mimes: Array<String>) {
+        pendingFileChat = chatId
+        pendingFileKind = kind
+        filePickerLauncher.launch(mimes)
     }
 
     LaunchedEffect(Unit) {
@@ -486,14 +503,25 @@ fun LocalChatApp(
                         }
                     },
                     onPickFile = {
-                        pendingFileChat = peerId
-                        filePickerLauncher.launch(arrayOf("*/*"))
+                        launchFilePicker(peerId, FileKind.FILE, arrayOf("*/*"))
+                    },
+                    onPickImage = {
+                        launchFilePicker(peerId, FileKind.IMAGE, arrayOf("image/*"))
+                    },
+                    onPickVideo = {
+                        launchFilePicker(peerId, FileKind.VIDEO, arrayOf("video/*"))
                     },
                     onDownloadFile = { fileInfo ->
                         pendingDownload = fileInfo
                         pendingDownloadIsDirect = true
                         fileSaverLauncher.launch(fileInfo.fileName)
-                    }
+                    },
+                    onDownloadMedia = { fileInfo ->
+                        viewModel.downloadMedia(fileInfo, isDirect = true)
+                    },
+                    resolveMedia = { fileInfo -> viewModel.localMediaPath(fileInfo) },
+                    mediaVersion = mediaVersion,
+                    onOpenFile = { uriString -> openDownloadedFile(context, uriString) }
                 )
             } else {
                 LaunchedEffect(Unit) { currentScreenName = Screen.MemberList.name }
@@ -582,12 +610,23 @@ fun LocalChatApp(
                 onForward = viewModel::sendMessageToGroup,
                 onDelete = viewModel::deleteMessage,
                 onPickFile = {
-                    filePickerLauncher.launch(arrayOf("*/*"))
+                    launchFilePicker(null, FileKind.FILE, arrayOf("*/*"))
+                },
+                onPickImage = {
+                    launchFilePicker(null, FileKind.IMAGE, arrayOf("image/*"))
+                },
+                onPickVideo = {
+                    launchFilePicker(null, FileKind.VIDEO, arrayOf("video/*"))
                 },
                 onDownloadFile = { fileInfo ->
                     pendingDownload = fileInfo
                     fileSaverLauncher.launch(fileInfo.fileName)
                 },
+                onDownloadMedia = { fileInfo ->
+                    viewModel.downloadMedia(fileInfo, isDirect = false)
+                },
+                resolveMedia = { fileInfo -> viewModel.localMediaPath(fileInfo) },
+                mediaVersion = mediaVersion,
                 onOpenFile = { uriString -> openDownloadedFile(context, uriString) },
                 onBack = {
                     currentScreenName = Screen.GroupLobby.name
@@ -687,13 +726,58 @@ private fun queryFileSize(context: Context, uri: Uri): Long {
     return 0L
 }
 
-/** Open a downloaded file with the default viewer. The stored uri is a
- *  content uri from CreateDocument; request read access for the target app. */
+/** Classify a picked document: the provider-reported MIME type wins, the
+ *  file-name extension is the fallback. Used so an image/video picked with
+ *  the GENERIC picker still goes out as an inline media message. */
+private fun detectKind(context: Context, uri: Uri, fileName: String): String {
+    return when (context.contentResolver.getType(uri)) {
+        "image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp",
+        "image/heic", "image/heif" -> FileKind.IMAGE
+        "video/mp4", "video/quicktime", "video/x-matroska", "video/webm",
+        "video/x-msvideo", "video/3gpp" -> FileKind.VIDEO
+        else -> detectMediaKind(fileName)
+    }
+}
+
+/** MIME type for a local media file path (by extension). */
+private fun mimeForPath(path: String): String {
+    return when (path.substringAfterLast('.', "").lowercase()) {
+        "jpg", "jpeg" -> "image/jpeg"
+        "png" -> "image/png"
+        "gif" -> "image/gif"
+        "webp" -> "image/webp"
+        "bmp" -> "image/bmp"
+        "heic" -> "image/heic"
+        "mp4", "m4v" -> "video/mp4"
+        "mov" -> "video/quicktime"
+        "mkv" -> "video/x-matroska"
+        "webm" -> "video/webm"
+        "avi" -> "video/x-msvideo"
+        "3gp" -> "video/3gpp"
+        else -> "application/octet-stream"
+    }
+}
+
+/** Open a downloaded file with the default viewer. The stored value is either
+ *  a content uri from CreateDocument or a local media path from downloadMedia
+ *  (shared through FileProvider, which the target app is allowed to read). */
 private fun openDownloadedFile(context: Context, uriString: String) {
-    val uri = runCatching { Uri.parse(uriString) }.getOrNull() ?: return
+    val parsed = runCatching { Uri.parse(uriString) }.getOrNull() ?: return
+    val uri = if (parsed.scheme == null || parsed.scheme == "file") {
+        val file = java.io.File(uriString)
+        if (!file.isFile) {
+            Toast.makeText(context, "文件不存在", Toast.LENGTH_SHORT).show()
+            return
+        }
+        runCatching {
+            FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        }.getOrNull() ?: Uri.fromFile(file)
+    } else {
+        parsed
+    }
     runCatching {
         val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/octet-stream")
+            setDataAndType(uri, mimeForPath(uriString))
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         context.startActivity(intent)

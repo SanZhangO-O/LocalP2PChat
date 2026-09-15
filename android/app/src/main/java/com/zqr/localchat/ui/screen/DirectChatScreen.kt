@@ -13,6 +13,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -24,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.FileInfo
+import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.viewmodel.ChatViewModel
 import java.text.SimpleDateFormat
@@ -49,7 +52,16 @@ fun DirectChatScreen(
     onCopy: (String) -> Unit,
     onCall: () -> Unit = {},
     onPickFile: () -> Unit = {},
-    onDownloadFile: (FileInfo) -> Unit = {}
+    onPickImage: () -> Unit = {},
+    onPickVideo: () -> Unit = {},
+    onDownloadFile: (FileInfo) -> Unit = {},
+    onDownloadMedia: (FileInfo) -> Unit = {},
+    resolveMedia: (FileInfo) -> String? = { null },
+    /** Bumped by the ViewModel when an own sent image lands in the media
+     *  dir: re-keys the local-path lookups so the sender's own bubble flips
+     *  to the inline render without any other recomposition trigger. */
+    mediaVersion: Int = 0,
+    onOpenFile: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     var input by remember { mutableStateOf("") }
@@ -131,7 +143,20 @@ fun DirectChatScreen(
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     items(messages, key = { it.id }) { msg ->
-                        if (msg.fileInfo != null) {
+                        val fi = msg.fileInfo
+                        if (fi != null && (fi.kind == FileKind.IMAGE || fi.kind == FileKind.VIDEO)) {
+                            val saved =
+                                downloadStates[msg.id] as? ChatViewModel.DownloadState.Done
+                            MediaMessageBubble(
+                                message = msg,
+                                state = downloadStates[msg.id],
+                                localPath = saved?.uri ?: resolveMedia(fi),
+                                onDownload = { onDownloadMedia(fi) },
+                                onSaveAs = { onDownloadFile(fi) },
+                                onOpen = onOpenFile,
+                                onDelete = { pendingDelete = msg }
+                            )
+                        } else if (msg.fileInfo != null) {
                             FileMessageBubble(
                                 message = msg,
                                 state = downloadStates[msg.id],
@@ -164,6 +189,22 @@ fun DirectChatScreen(
                     Icon(
                         Icons.Filled.AttachFile,
                         contentDescription = "发送文件",
+                        tint = if (connected) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(onClick = onPickImage, enabled = connected) {
+                    Icon(
+                        Icons.Filled.Image,
+                        contentDescription = "发送图片",
+                        tint = if (connected) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(onClick = onPickVideo, enabled = connected) {
+                    Icon(
+                        Icons.Filled.Movie,
+                        contentDescription = "发送视频",
                         tint = if (connected) MaterialTheme.colorScheme.primary
                         else MaterialTheme.colorScheme.onSurfaceVariant
                     )

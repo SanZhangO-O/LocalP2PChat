@@ -8,6 +8,7 @@ import android.util.Log
 import com.zqr.localchat.crypto.Crypto
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.FileInfo
+import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.data.Peer
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -1044,19 +1045,20 @@ object DirectChatManager {
         fileName: String,
         resolver: ContentResolver,
         uri: Uri,
-        fileSize: Long
-    ): Boolean {
+        fileSize: Long,
+        kind: String = FileKind.FILE
+    ): ChatMessage? {
         // same rule as message content: the receiver drops an invalid file
         // name silently, so reject it on the sending side
-        if (!P2PManager.isValidContent(fileName)) return false
-        if (fileSize > FileTransfer.MAX_DOWNLOAD_BYTES) return false
-        val s = sessions[peerId] ?: return false
+        if (!P2PManager.isValidContent(fileName)) return null
+        if (fileSize > FileTransfer.MAX_DOWNLOAD_BYTES) return null
+        val s = sessions[peerId] ?: return null
         val fileId = UUID.randomUUID().toString()
         val server = try {
             ServerSocket(0)
         } catch (e: Exception) {
             Log.w(TAG, "failed to open file server", e)
-            return false
+            return null
         }
         val port = server.localPort
         // per-file random key: travels INSIDE the encrypted message channel
@@ -1066,7 +1068,7 @@ object DirectChatManager {
         // myPeer()): myIp was set at app start and may be stale after a
         // network change, which would make the download host unreachable
         val advertised = P2PManager.getLocalIpAddress().ifBlank { myIp }
-        val fileInfo = FileInfo(fileId, fileName, fileSize, advertised, port, Crypto.toB64(fileKey))
+        val fileInfo = FileInfo(fileId, fileName, fileSize, advertised, port, Crypto.toB64(fileKey), kind)
         fileServers[fileId] = server
         val msg = ChatMessage(
             id = fileId,
@@ -1090,7 +1092,7 @@ object DirectChatManager {
             isActive = { fileServers[fileId] === server },
             onRemove = { fileServers.remove(it) }
         )
-        return true
+        return msg
     }
 
     /** Download a file offered via [fileInfo] into [out]. Blocking; call from

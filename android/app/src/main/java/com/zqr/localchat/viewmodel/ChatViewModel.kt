@@ -35,6 +35,7 @@ import com.zqr.localchat.data.ChatDao
 import com.zqr.localchat.data.ChatDatabase
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.FileInfo
+import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.data.Peer
 import com.zqr.localchat.data.SavedChatMessage
 import com.zqr.localchat.data.SavedGroup
@@ -187,12 +188,128 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Bumped whenever an own sent image finishes copying into the media dir;
+     *  the chat UI keys its media path lookups on it so the sender's own
+     *  image bubble flips to the inline render as soon as the copy lands. */
+    private val _mediaVersion = MutableStateFlow(0)
+    val mediaVersion: StateFlow<Int> = _mediaVersion.asStateFlow()
+
     /** Offer a file to a direct-chat member. */
-    fun sendDirectFile(peerId: String, uri: Uri, fileName: String, fileSize: Long): Boolean {
+    fun sendDirectFile(
+        peerId: String,
+        uri: Uri,
+        fileName: String,
+        fileSize: Long,
+        kind: String = FileKind.FILE
+    ): Boolean {
         if (fileName.isBlank()) return false
-        return DirectChatManager.sendFile(
-            peerId, fileName, getApplication<Application>().contentResolver, uri, fileSize
-        )
+        val msg = DirectChatManager.sendFile(
+            peerId, fileName, getApplication<Application>().contentResolver, uri, fileSize, kind
+        ) ?: return false
+        mirrorOwnMedia(msg.id, uri, fileName, kind)
+        return true
+    }
+
+    /** After an own IMAGE goes out, copy it into the media dir (worker
+     *  thread) so the sender's own bubble renders inline like a received one
+     *  — and keeps doing so after a restart. Videos are NOT copied: they are
+     *  far larger and the placeholder card already opens fine for the
+     *  sender. Failures are silently ignored: the copy is a rendering
+     *  convenience, the offer itself was already delivered. */
+    private fun mirrorOwnMedia(fileId: String, uri: Uri, fileName: String, kind: String) {
+        if (kind != FileKind.IMAGE) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = runCatching {
+                val target = mediaTargetFile(fileId, fileName)
+                target.parentFile?.mkdirs()
+                // .part + rename so a half-copied image is never visible to
+                // the UI's media path probe (Windows parity)
+                val tmp = java.io.File(target.absolutePath + ".part")
+                tmp.outputStream().use { output ->
+                    getApplication<Application>().contentResolver.openInputStream(uri)?.use { input ->
+                        input.copyTo(output)
+                    } ?: return@runCatching false
+                }
+                if (!tmp.renameTo(target)) {
+                    tmp.delete()
+                    return@runCatching false
+                }
+                true
+            }.getOrDefault(false)
+            if (ok) _mediaVersion.update { it + 1 }
+        }
+    }
+
+    /** Download a media (image/video) message into the app's media dir so it
+     *  renders inline in the conversation; NO system save dialog. Progress is
+     *  surfaced via [downloadStates] keyed by the file message id. */
+    fun downloadMedia(fileInfo: FileInfo, isDirect: Boolean) {
+        val fileId = fileInfo.fileId
+        val target = mediaTargetFile(fileId, fileInfo.fileName)
+        if (fileInfo.fileSize > 0 && target.isFile && target.length() == fileInfo.fileSize) {
+            _downloadStates.update { map ->
+                map + (fileId to DownloadState.Done(target.absolutePath))
+            }
+            return
+        }
+        _downloadStates.update { it + (fileId to DownloadState.Downloading) }
+        viewModelScope.launch(Dispatchers.IO) {
+            // download to a .part file and rename on success: the UI probes
+            // the target path to render inline media, so a partially written
+            // target must never be visible there (Windows parity)
+            val tmp = java.io.File(target.absolutePath + ".part")
+            val result = runCatching {
+                tmp.parentFile?.mkdirs()
+                tmp.outputStream().use { out ->
+                    if (isDirect) DirectChatManager.downloadFile(fileInfo, out)
+                    else {
+                        val gid = _activeGroupId.value
+                        val p2p = gid?.let { groupP2pMap[it] }
+                            ?: return@runCatching FileTransfer.DownloadResult(false, "未连接到群组")
+                        p2p.downloadFile(fileInfo, out)
+                    }
+                }
+                FileTransfer.DownloadResult(true)
+            }.getOrElse { FileTransfer.DownloadResult(false, it.message ?: "未知错误") }
+            if (result.ok) {
+                if (!tmp.renameTo(target)) {
+                    tmp.delete()
+                    _downloadStates.update { map ->
+                        map + (fileId to DownloadState.Failed("无法保存媒体文件"))
+                    }
+                    return@launch
+                }
+            } else {
+                tmp.delete()
+            }
+            _downloadStates.update { map ->
+                map + (fileId to if (result.ok)
+                    DownloadState.Done(target.absolutePath)
+                else
+                    DownloadState.Failed(result.message))
+            }
+        }
+    }
+
+    /** Deterministic local target for a downloaded media message, keyed by
+     *  the file id so same-named files from different messages never collide.
+     *  The UI checks [File.exists] on this path to re-render inline media
+     *  after a restart. */
+    fun mediaTargetFile(fileId: String, fileName: String): java.io.File {
+        val dir = java.io.File(getApplication<Application>().filesDir, "media")
+        val safe = fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .trim('.', ' ')
+            .ifBlank { "file" }
+            .take(80)
+        return java.io.File(dir, "${fileId}_$safe")
+    }
+
+    /** Path of an already-downloaded media copy, or null. Lets the chat UI
+     *  render image/video messages inline (also after a restart). */
+    fun localMediaPath(fileInfo: FileInfo): String? {
+        if (fileInfo.kind != FileKind.IMAGE && fileInfo.kind != FileKind.VIDEO) return null
+        val f = mediaTargetFile(fileInfo.fileId, fileInfo.fileName)
+        return if (f.isFile) f.absolutePath else null
     }
 
     /** Download a file offered in a direct chat into [targetUri]; progress is
@@ -414,6 +531,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                         fileSize = msg.fileInfo?.fileSize ?: 0L,
                                         downloadHost = msg.fileInfo?.downloadHost ?: "",
                                         downloadPort = msg.fileInfo?.downloadPort ?: 0,
+                                        kind = msg.fileInfo?.kind ?: FileKind.FILE,
                                         pending = msg.pending
                                     )
                                 })
@@ -1117,11 +1235,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      *  side restarted, a stale address only produces a failed download. The
      *  bubble renders it as "已过期" instead of offering a download that can
      *  no longer succeed; the sender can re-share the file for a fresh
-     *  address. */
+     *  address. The kind is preserved so image/video messages keep rendering
+     *  inline (from their local media copy) across restarts. */
     private fun restoredFileInfo(sm: SavedChatMessage): FileInfo? {
         if (sm.fileSize <= 0 && sm.downloadHost.isEmpty()) return null
         // blank the address for every restored offer, own or received
-        return FileInfo(sm.id, sm.content, sm.fileSize, "", 0)
+        return FileInfo(sm.id, sm.content, sm.fileSize, "", 0, kind = sm.kind)
     }
 
     private fun loadPersistedGroups() {
@@ -1629,18 +1748,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Offer a file (from a content Uri) to the active group. */
-    fun sendFile(uri: Uri, fileName: String, fileSize: Long): Boolean {
+    fun sendFile(
+        uri: Uri,
+        fileName: String,
+        fileSize: Long,
+        kind: String = FileKind.FILE
+    ): Boolean {
         if (fileName.isBlank()) return false
         val gid = _activeGroupId.value ?: return false
         val p2p = groupP2pMap[gid] ?: return false
         // Sending depends only on the SENDER being online: the host relay OR a
         // live mesh link is enough, so the host going offline never blocks it.
         if (!p2p.isConnected && !GroupMeshManager.hasLinks(gid)) return false
-        val msg = p2p.sendFile(fileName, getApplication<Application>().contentResolver, uri, fileSize) ?: return false
+        val msg = p2p.sendFile(fileName, getApplication<Application>().contentResolver, uri, fileSize, kind)
+            ?: return false
         // p2p.sendFile relays the offer to the group when the host is up; the
         // mesh delivers it to every linked member either way (receivers dedup
         // by message id)
         GroupMeshManager.broadcast(gid, msg)
+        mirrorOwnMedia(msg.id, uri, fileName, kind)
         return true
     }
 
@@ -1837,7 +1963,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                         isFromMe = msg.isFromMe,
                                         fileSize = msg.fileInfo?.fileSize ?: 0L,
                                         downloadHost = msg.fileInfo?.downloadHost ?: "",
-                                        downloadPort = msg.fileInfo?.downloadPort ?: 0
+                                        downloadPort = msg.fileInfo?.downloadPort ?: 0,
+                                        kind = msg.fileInfo?.kind ?: FileKind.FILE
                                     )
                                 }
                                 val inserted = runCatching { chatDao.insertMessages(saved) }.isSuccess
