@@ -76,8 +76,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # (file_id, received, total) while a download runs, throttled to at most
     # one emission per 250ms or 64KB (whichever comes first).
     file_progress = pyqtSignal(str, int, int)
-    # Emitted from network threads with (group_id, sender_name, body); the
-    # aggregator slot runs on the main thread (queued connection).
+    # Emitted from network threads with (group_id | "direct:<peer_id>",
+    # sender_name, body); the aggregator slot runs on the main thread (queued
+    # connection).
     raw_tray = pyqtSignal(str, str, str)
     # Aggregated (group_id, title, body); emitted on the main thread.
     tray_notification = pyqtSignal(str, str, str)
@@ -1055,11 +1056,22 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 pending_map.pop(mid, None)
                 self.store.delete_message("direct:" + peer_id, mid)
         new = [m for m in msgs if m.id not in stored]
+        peer = next((c for c in self.direct.contacts_list() if c.id == peer_id), None)
+        new_incoming = [m for m in new if not m.is_from_me]
+        if new_incoming and not self.window_active:
+            # window hidden/minimized: pop a tray bubble for the 1:1 chat too.
+            # The "direct:" prefix identifies the conversation for the tray
+            # aggregator and for the click-to-open handler (Android parity:
+            # background message notifications cover direct chats).
+            self.raw_tray.emit(
+                "direct:" + peer_id,
+                peer.name if peer else peer_id,
+                new_incoming[-1].content,
+            )
         if new:
             # Direct chats live under a synthetic "direct:<peerId>" key in the
             # messages table, which has a foreign key to saved_groups — ensure
             # the placeholder group row exists so the insert never violates it
-            peer = next((c for c in self.direct.contacts_list() if c.id == peer_id), None)
             self.store.upsert_group(
                 SavedGroup(
                     group_id="direct:" + peer_id,
@@ -2028,12 +2040,17 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 for m in new_messages:
                     self.mesh.note_message(gid, m)
                 incoming = [m for m in new_messages if not m.is_from_me]
-                if gid != self.active_group_id and incoming:
+                if incoming and gid != self.active_group_id:
+                    # unread counts only accrue off the open group
                     if meta is not None:
                         meta.unread_count += len(incoming)
-                    if not self.window_active:
-                        # send to the aggregator; it emits the merged bubble
-                        self.raw_tray.emit(gid, new_messages[0].sender_name, incoming[-1].content)
+                if incoming and not self.window_active:
+                    # window hidden/minimized: notify for EVERY group,
+                    # including the one currently open -- the user cannot see
+                    # the open chat (Android parity: notifyNewMessages runs
+                    # for the active group when the app is not foreground).
+                    # send to the aggregator; it emits the merged bubble
+                    self.raw_tray.emit(gid, new_messages[0].sender_name, incoming[-1].content)
                 persisted.update(m.id for m in new_messages)
                 self.store.insert_messages([to_saved_message(gid, m) for m in new_messages])
                 if last is not None:

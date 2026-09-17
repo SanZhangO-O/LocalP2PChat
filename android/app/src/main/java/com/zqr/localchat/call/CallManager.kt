@@ -731,7 +731,7 @@ object CallManager {
             }
             if (timedOut) _events.tryEmit("对方未接听")
         } catch (e: Exception) {
-            // server closed (call cancelled)
+            endCall("媒体通道校验失败，通话已结束", isError = true, scopeCallId = currentCallId)
         } finally {
             // Before activation the socket is not tracked by any field, so
             // every bail-out path (verification failure, stale call state,

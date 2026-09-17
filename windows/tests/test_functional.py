@@ -1189,6 +1189,127 @@ class ViewModelFlowTest(unittest.TestCase):
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0][1], "\u738b\u4e94")
 
+    def test_current_group_tray_when_window_inactive(self):
+        """An incoming message in the group the user has OPEN but cannot see
+        (window minimized/hidden) must still pop a tray bubble; unread stays 0
+        for the current group (Android parity: notifyNewMessages covers the
+        active group when the app is not foreground)."""
+        from localchat.models import ChatMessage
+
+        network_module.TCP_PORT = 10047
+        vm = make_vm(_fresh_db("lc_test_tray_current.db"))
+        self._vms = [vm]
+        vm.create_group("\u4e3b\u673a", "\u5f53\u524d\u7fa4")
+        gid = vm.active_group_id
+        self.assertIsNotNone(gid)
+        p2p = vm.group_p2p_map[gid]
+        vm.TRAY_AGGREGATE_MS = 80
+        received = []
+        vm.tray_notification.connect(lambda g, t, b: received.append((g, t, b)))
+
+        # window hidden: a new incoming message in the OPEN group notifies
+        vm.set_window_active(False)
+        p2p.messages.append(
+            ChatMessage(
+                "m-cur-1",
+                "\u5f53\u524d\u7fa4\u65b0\u6d88\u606f",
+                1700000000000,
+                "peer-1",
+                "\u5f20\u4e09",
+            )
+        )
+        vm.messages_changed(p2p)
+        self.assertTrue(
+            wait_until(lambda: received, timeout=2.0, pump=self.pump),
+            "the open group must notify while the window is hidden",
+        )
+        self.assertEqual(received[-1][0], gid)
+        meta = next(g for g in vm.groups_list() if g.group_id == gid)
+        self.assertEqual(meta.unread_count, 0, "current group keeps unread 0")
+
+        # window active again: no bubble for the open group
+        received.clear()
+        vm.set_window_active(True)
+        p2p.messages.append(
+            ChatMessage(
+                "m-cur-2",
+                "\u7b2c\u4e8c\u6761",
+                1700000001000,
+                "peer-1",
+                "\u5f20\u4e09",
+            )
+        )
+        vm.messages_changed(p2p)
+        self.pump()
+        self.assertIsNone(vm._tray_accum, "active window must not queue a bubble")
+        self.assertEqual(received, [])
+
+    def test_direct_tray_when_window_inactive(self):
+        """A 1:1 message received while the window is hidden pops a tray
+        bubble keyed "direct:<peerId>" with the contact name as sender; own
+        messages stay silent."""
+        from localchat.models import ChatMessage
+
+        network_module.TCP_PORT = 10048
+        vm = make_vm(_fresh_db("lc_test_tray_direct.db"))
+        self._vms = [vm]
+        vm.direct.add_contact(Peer("peer-9", "\u5c0f\u674e", "127.0.0.1", 9))
+        vm.TRAY_AGGREGATE_MS = 80
+        vm.set_window_active(False)
+        received = []
+        vm.tray_notification.connect(lambda g, t, b: received.append((g, t, b)))
+
+        vm.direct.seed_messages(
+            "peer-9",
+            [
+                ChatMessage(
+                    "dm-1", "\u4f60\u597d", 1700000000000, "peer-9", "\u5c0f\u674e"
+                )
+            ],
+        )
+        self.assertTrue(
+            wait_until(lambda: received, timeout=2.0, pump=self.pump),
+            "an incoming 1:1 message must notify while the window is hidden",
+        )
+        self.assertEqual(received[-1][0], "direct:peer-9")
+        self.assertEqual(received[-1][1], "\u5c0f\u674e")
+        self.assertEqual(received[-1][2], "\u4f60\u597d")
+
+        # an OWN message never notifies
+        vm.direct.seed_messages(
+            "peer-9",
+            [
+                ChatMessage(
+                    "dm-2",
+                    "\u56de\u590d",
+                    1700000001000,
+                    "me",
+                    "\u6211",
+                    is_from_me=True,
+                )
+            ],
+        )
+        self.pump()
+        self.assertIsNone(vm._tray_accum)
+        self.assertEqual(len(received), 1)
+
+    def test_tray_click_opens_direct_chat(self):
+        """Clicking a "direct:<peerId>" tray bubble returns to the window and
+        opens the matching 1:1 chat page (group ids keep the old behavior)."""
+        from localchat.ui.main_window import MainWindow
+
+        network_module.TCP_PORT = 10049
+        vm = make_vm(_fresh_db("lc_ui_tray_direct_click.db"))
+        self._vms = [vm]
+        vm.direct.add_contact(Peer("peer-9", "\u5c0f\u674e", "127.0.0.1", 9))
+        win = MainWindow(vm)
+        win._last_notify_gid = "direct:peer-9"
+        win._on_message_clicked()
+        self.pump()
+        self.assertEqual(win.stack.currentIndex(), 5, "PAGE_DIRECT must be shown")
+        self.assertEqual(win.pages[5]._peer_id, "peer-9")
+        win.close()
+
     def test_add_direct_contact_normalizes_and_validates(self):
         """Regression: adding a member by IP must NORMALIZE full-width IME
         punctuation (a Chinese IME emits \uff1a/\uff0e/\u3002) and REJECT

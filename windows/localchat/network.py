@@ -407,6 +407,11 @@ def _download_file_offer(
             expected = min(offer_size, meta_size)
         else:
             expected = offer_size or meta_size
+        # expected == 0 means the size is unknown (some content providers do
+        # not report one): the completeness checks below are skipped, and
+        # progress falls back to the offer's declared size (Android parity:
+        # FileTransfer.totalForProgress).
+        progress_total = expected if expected > 0 else file_info.file_size
         sock.settimeout(120)
         received = 0
         eof_marker = False
@@ -435,17 +440,18 @@ def _download_file_offer(
                 except Exception:
                     return False, "文件数据校验失败（可能被篡改）"
                 received += len(plain)
-                if received > expected:
+                if expected > 0 and received > expected:
                     return False, f"文件大小不符（已接收 {received} 字节，超过声明大小）"
                 if received > MAX_DOWNLOAD_BYTES:
                     return False, f"文件超过 {MAX_DOWNLOAD_BYTES // 1024 // 1024} MB 限制"
                 f.write(plain)
                 if progress is not None:
                     try:
-                        progress(received, expected)
+                        progress(received, progress_total)
                     except Exception:
                         pass
-        if received != expected:
+        # only verify a known target size; 0 means unknown (Android parity)
+        if expected > 0 and received != expected:
             return False, f"文件不完整（{received}/{expected} 字节）"
         os.replace(tmp_path, target_path)
         return True, ""
@@ -1711,12 +1717,15 @@ class P2PManager:
                 )
             if (
                 target is not None
-                and packet.sender_id is not None
-                and packet.sender_id != target.sender_id
+                and (
+                    packet.sender_id is None
+                    or packet.sender_id != target.sender_id
+                )
             ):
                 # the relayed delete must come from the message's original
                 # author (same authorization as the host applies before
-                # forwarding); anything else is a forged request
+                # forwarding); a missing or mismatched senderId is a forged
+                # request
                 logger.warning(
                     "reject relay delete_message %s: packet senderId=%r, message senderId=%r",
                     packet.message_id,
@@ -4034,31 +4043,23 @@ class GroupMeshManager:
         """Push history in size-capped batches (see HISTORY_CHUNK_BYTES): the
         receiver reads with a bounded line reader, so each packet must stay
         under the cap or the link would be dropped. Receivers merge each batch
-        independently and dedup by message id (Android parity). The FIRST
-        batch also carries the group's delete tombstones (deletedIds) so a
-        member that was offline during a delete converges instead of
-        resurrecting the message; with no tombstones the field stays absent
-        (older peers ignore unknown keys)."""
+        independently and dedup by message id (Android parity). After the
+        batches a dedicated tombstone history_reply carries the group's delete
+        tombstones (deletedIds) — sent even when the history is empty, since
+        everything the peer missed may have been deleted while it was away —
+        so an offline member converges instead of resurrecting the message.
+        Tombstones travel outside the batch size budget, which does not
+        account for them (Android parity: sendHistory/sendDeletedIds)."""
         batch = []
         estimated = 0
-        first = True
-        deleted_ids = None
-        if self.deleted_ids_provider is not None:
-            try:
-                deleted_ids = self.deleted_ids_provider(group_id) or None
-            except Exception:
-                deleted_ids = None
 
         def flush() -> None:
-            nonlocal batch, estimated, first
+            nonlocal batch, estimated
             if not batch:
                 return
             packet = NetworkPacket(
                 type="history_reply", group_id=group_id, messages=batch
             )
-            if first and deleted_ids:
-                packet.deleted_ids = list(deleted_ids)
-            first = False
             try:
                 wire.send_packet(packet)
             except Exception:
@@ -4077,6 +4078,21 @@ class GroupMeshManager:
             batch.append(msg)
             estimated += size
         flush()
+        deleted_ids = []
+        if self.deleted_ids_provider is not None:
+            try:
+                deleted_ids = sanitize_deleted_ids(self.deleted_ids_provider(group_id))
+            except Exception:
+                deleted_ids = []
+        if deleted_ids:
+            try:
+                wire.send_packet(
+                    NetworkPacket(
+                        type="history_reply", group_id=group_id, deleted_ids=deleted_ids
+                    )
+                )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------- listeners
 

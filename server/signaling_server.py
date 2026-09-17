@@ -17,6 +17,9 @@
   {"type":"hello","proto":1}                      必须是第一条
   {"type":"host","groupId":"12345678",...}        主机 armed 等待成员
   {"type":"member","groupId":"12345678",...}      成员等待匹配
+  （同一条连接可重复发 host/member 注册多个 groupId：role 只取第一次
+    出现的 host 或 member，重复的 (role, groupId) 幂等；旧客户端只发
+    一个 groupId，行为不变。）
   {"type":"punch_result","session":..,"ok":bool,"role":"host"|"member"}
   {"type":"relay_request","session":..,"role":..} 单侧打洞失败强制中继
   {"type":"pong"}                                  心跳应答
@@ -52,6 +55,10 @@ HELLO_TIMEOUT = 10.0
 CONTROL_IDLE_TIMEOUT = 45.0
 DECISION_TIMEOUT = 20.0
 RELAY_IDLE_TIMEOUT = 120.0
+# "punch" 只是配对到中继之间的过渡态：双方 punch_result 都成功、服务器发出
+# use_punch 后，若一侧控制连接一直存活（另一侧已断开），会话必须有界回收，
+# 否则 _sessions 条目常驻。窗口取客户端的决策等待（30s）+ 补打/中继回退余量。
+PUNCH_IDLE_TIMEOUT = 60.0
 PING_INTERVAL = 20.0
 MAX_CONNECTIONS = 512
 MAX_PER_IP = 32
@@ -82,7 +89,9 @@ class ClientConn:
         self.ip = addr[0]
         self.port = addr[1]
         self.role = None  # "host" | "member"
-        self.group_id = ""
+        self.group_id = ""  # most recently registered group (debug)
+        self.groups = set()  # every groupId registered on this connection
+        self.group_meta = {}  # group_id -> {"id": client_id, "nick": nick}
         self.client_id = ""
         self.nick = ""
         # The endpoint the client must punch to (its public mapped address).
@@ -281,13 +290,19 @@ class SignalingServer:
         if not _valid_group_id(group_id):
             conn.send_json({"type": "error", "errorMessage": "invalid groupId"})
             return False
-        if conn.role is not None:
-            return True  # one role per connection
-        conn.role = role
-        conn.group_id = group_id
-        conn.client_id = _clip(msg.get("clientId"), MAX_ID_LEN)
-        conn.nick = _clip(msg.get("nick"), MAX_NICK_LEN)
+        if conn.role is not None and conn.role != role:
+            return True  # one role per connection: host and member never mix
+        client_id = _clip(msg.get("clientId"), MAX_ID_LEN)
+        nick = _clip(msg.get("nick"), MAX_NICK_LEN)
         with self._lock:
+            conn.role = role
+            conn.group_id = group_id
+            conn.client_id = client_id
+            conn.nick = nick
+            conn.group_meta[group_id] = {"id": client_id, "nick": nick}
+            if group_id in conn.groups:
+                return True  # idempotent re-registration of (role, group)
+            conn.groups.add(group_id)
             if role == "host":
                 self._hosts.setdefault(group_id, []).append(conn)
             else:
@@ -316,13 +331,14 @@ class SignalingServer:
                 group_id, host.ip, member.ip, session.token,
             )
 
-    def _peer_desc(self, conn: ClientConn) -> dict:
+    def _peer_desc(self, conn: ClientConn, group_id: str) -> dict:
+        meta = conn.group_meta.get(group_id, {"id": conn.client_id, "nick": conn.nick})
         return {
             "ip": conn.endpoint[0],
             "port": conn.endpoint[1],
             "role": conn.role,
-            "id": conn.client_id,
-            "nick": conn.nick,
+            "id": meta["id"],
+            "nick": meta["nick"],
         }
 
     def _send_matched(self, session: Session, to_role: str, peer: ClientConn):
@@ -332,7 +348,7 @@ class SignalingServer:
                 "type": "matched",
                 "session": session.token,
                 "groupId": session.group_id,
-                "peer": self._peer_desc(peer),
+                "peer": self._peer_desc(peer, session.group_id),
             }
         )
 
@@ -376,12 +392,22 @@ class SignalingServer:
     def _decision_watch(self, session: Session):
         while True:
             delay = session.deadline - time.monotonic()
-            if delay <= 0:
-                break
-            time.sleep(min(delay, 0.5))
-        with self._lock:
-            if session.mode == "wait" and self._sessions.get(session.token) is session:
-                self._decide(session)
+            if delay > 0:
+                time.sleep(min(delay, 0.5))
+                continue
+            with self._lock:
+                if self._sessions.get(session.token) is not session:
+                    return  # already reaped (relay cleanup / both conns gone)
+                if session.mode == "wait":
+                    self._decide(session)
+                    continue  # _decide set a fresh deadline (punch) or ended us
+                if session.mode == "punch":
+                    # A punch session is transient: normally _cleanup reaps it
+                    # once both control connections are gone, but one surviving
+                    # control link must not pin it forever.
+                    log.info("session %s expired in punch mode", session.token)
+                    self._end_session(session)
+                return
 
     def _decide(self, session: Session):
         # caller holds self._lock; session.mode == "wait"
@@ -398,6 +424,9 @@ class SignalingServer:
             results = [r if r is not None else False for r in results]
         if all(results):
             session.mode = "punch"
+            # Bound the transient punch state from the moment it is entered;
+            # _decision_watch wakes on this deadline if no relay_request comes.
+            session.deadline = time.monotonic() + PUNCH_IDLE_TIMEOUT
             for role in ("host", "member"):
                 conn = session.roles[role]["conn"]
                 if conn is not None and conn.alive:
@@ -507,14 +536,16 @@ class SignalingServer:
         conn.close()
         with self._lock:
             self._conns.discard(conn)
-            if conn.role == "host" and conn.group_id:
-                lst = self._hosts.get(conn.group_id, [])
-                if conn in lst:
-                    lst.remove(conn)
-            elif conn.role == "member" and conn.group_id:
-                lst = self._waiting.get(conn.group_id, [])
-                if conn in lst:
-                    lst.remove(conn)
+            if conn.role == "host":
+                for group_id in conn.groups:
+                    lst = self._hosts.get(group_id, [])
+                    if conn in lst:
+                        lst.remove(conn)
+            elif conn.role == "member":
+                for group_id in conn.groups:
+                    lst = self._waiting.get(group_id, [])
+                    if conn in lst:
+                        lst.remove(conn)
             for session in list(self._sessions.values()):
                 for role, entry in session.roles.items():
                     if entry["conn"] is conn:

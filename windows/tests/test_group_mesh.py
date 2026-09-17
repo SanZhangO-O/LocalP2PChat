@@ -253,8 +253,13 @@ class GroupMeshTest(unittest.TestCase):
         self.assertEqual(len(hits), 1, "sender-side state must dedupe by message id")
 
     def test_history_push_carries_deleted_ids_byte_contract(self):
-        """The FIRST history batch carries deletedIds when tombstones exist;
-        with none the key stays absent entirely (byte-level wire compat)."""
+        """Tombstones travel in a DEDICATED history_reply after the batches
+        (Android parity: sendHistory/sendDeletedIds). Batches never carry
+        deletedIds, so the HISTORY_CHUNK_BYTES budget never has to account for
+        them; the tombstone packet is also sent when the history is empty
+        (everything the peer missed may have been deleted while it was away),
+        and with no tombstones no extra packet is written (byte-level wire
+        compat: the key stays absent entirely)."""
         self.a.deleted_ids_provider = lambda gid: []
         old = make_msg("\u5386\u53f2", "aaa-member", "\u6210\u5458A", "h-x")
         key = os.urandom(32)
@@ -266,16 +271,34 @@ class GroupMeshTest(unittest.TestCase):
         packet = NetworkPacket.from_json(
             aes_gcm_decrypt(key, from_b64(lines[0])).decode("utf-8")
         )
-        self.assertIsNone(packet.deleted_ids, "empty tombstones must omit deletedIds")
+        self.assertIsNone(packet.deleted_ids, "batches must never carry deletedIds")
         self.assertNotIn("deletedIds", packet.to_dict())
 
+        # history + tombstones: batch first (no deletedIds), then the
+        # dedicated tombstone-only packet
         self.a.deleted_ids_provider = lambda gid: ["h-x", "h-gone"]
         lines.clear()
         self.a._send_history(wire, GRP, [old])
-        packet = NetworkPacket.from_json(
+        self.assertEqual(len(lines), 2)
+        batch = NetworkPacket.from_json(
             aes_gcm_decrypt(key, from_b64(lines[0])).decode("utf-8")
         )
-        self.assertEqual(packet.deleted_ids, ["h-x", "h-gone"])
+        self.assertIsNone(batch.deleted_ids)
+        tomb = NetworkPacket.from_json(
+            aes_gcm_decrypt(key, from_b64(lines[1])).decode("utf-8")
+        )
+        self.assertEqual(tomb.deleted_ids, ["h-x", "h-gone"])
+        self.assertFalse(tomb.messages)
+
+        # empty history + tombstones: the dedicated packet still goes out
+        lines.clear()
+        self.a._send_history(wire, GRP, [])
+        self.assertEqual(len(lines), 1)
+        tomb = NetworkPacket.from_json(
+            aes_gcm_decrypt(key, from_b64(lines[0])).decode("utf-8")
+        )
+        self.assertEqual(tomb.deleted_ids, ["h-x", "h-gone"])
+        self.assertFalse(tomb.messages)
 
     def test_mesh_deleted_ids_converge_without_rebroadcast(self):
         """Received deletedIds drop the named messages from the local mesh

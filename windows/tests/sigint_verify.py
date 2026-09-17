@@ -37,6 +37,20 @@ def send_ctrl_c(child_pid: int) -> bool:
     return bool(ok)
 
 
+def parse_app_exit_code(text: str):
+    seen = False
+    rc = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("APP_EXITED rc="):
+            seen = True
+            try:
+                rc = int(line.split("rc=", 1)[1].strip())
+            except (IndexError, ValueError):
+                rc = None
+    return seen, rc
+
+
 def main() -> int:
     child = subprocess.Popen(
         [sys.executable, "-X", "faulthandler", "-c", CHILD],
@@ -47,11 +61,13 @@ def main() -> int:
         errors="replace",
         creationflags=CREATE_NEW_CONSOLE,
     )
+    captured = []
     deadline = time.time() + 20
     while time.time() < deadline:
         line = child.stdout.readline()
         if not line:
             break
+        captured.append(line)
         sys.stdout.write(line)
         sys.stdout.flush()
         if "APP_READY" in line:
@@ -65,9 +81,20 @@ def main() -> int:
         child.kill()
         child.wait(timeout=5)
         return 1
+    if out:
+        captured.append(out)
     print(out)
-    print("RESULT: rc=%d" % child.returncode)
-    return 0 if child.returncode == 0 else 1
+    seen, app_rc = parse_app_exit_code("".join(captured))
+    if not seen:
+        print("RESULT: rc=unknown (APP_EXITED marker missing; child.returncode=%d)"
+              % child.returncode)
+        return 1
+    if app_rc is None:
+        print("RESULT: rc=unparsable (APP_EXITED malformed; child.returncode=%d)"
+              % child.returncode)
+        return 1
+    print("RESULT: rc=%d (child.returncode=%d)" % (app_rc, child.returncode))
+    return 0 if app_rc == 0 else 1
 
 
 if __name__ == "__main__":

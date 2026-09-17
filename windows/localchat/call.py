@@ -897,6 +897,10 @@ class CallManager(QObject):
             run_catching_close(sock)
             self._sig_media_ended.emit(call_id, "安全握手失败，通话已结束")
             return
+        except Exception:
+            run_catching_close(sock)
+            self._sig_media_ended.emit(call_id, "媒体通道校验失败，通话已结束")
+            return
         self._sig_media_socket.emit(call_id, sock, key)
 
     def _start_read_loop(self, sock) -> None:

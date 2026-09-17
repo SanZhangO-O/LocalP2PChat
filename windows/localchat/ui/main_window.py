@@ -181,12 +181,22 @@ class MainWindow(QMainWindow):
 
     def _on_message_clicked(self):
         """Clicking the tray bubble brings the window back and opens the
-        group the notification came from."""
+        conversation the notification came from: a group chat, or a 1:1 chat
+        when the key is "direct:<peerId>"."""
         self._show_window()
-        gid = self._last_notify_gid
-        if gid:
-            self.vm.switch_to_group(gid)
-            self._go_lobby()
+        key = self._last_notify_gid
+        if not key:
+            return
+        if key.startswith("direct:"):
+            peer_id = key[len("direct:"):]
+            contact = next(
+                (c for c in self.vm.direct_contacts_list() if c.id == peer_id), None
+            )
+            if contact is not None:
+                self._go_direct(contact)
+            return
+        self.vm.switch_to_group(key)
+        self._go_lobby()
 
     def _check_host_hint(self):
         if not self.vm.can_create_group():

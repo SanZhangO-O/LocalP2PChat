@@ -952,7 +952,18 @@ class P2PManager(
             "peer_left" -> packet.peer?.id?.let { peerId ->
                 _peers.update { it - peerId }
             }
-            "delete_message" -> packet.messageId?.let { id ->
+            "delete_message" -> {
+                val id = packet.messageId
+                val sender = packet.senderId
+                if (id == null || sender == null) {
+                    Log.w(TAG, "drop delete_message from host: messageId=$id packet senderId=$sender")
+                    return
+                }
+                val target = _messages.value.firstOrNull { it.id == id } ?: return
+                if (target.senderId != sender) {
+                    Log.w(TAG, "reject delete_message $id from $sender: message senderId=${target.senderId}")
+                    return
+                }
                 _messages.update { list -> list.filterNot { it.id == id } }
             }
             "ping" -> {
