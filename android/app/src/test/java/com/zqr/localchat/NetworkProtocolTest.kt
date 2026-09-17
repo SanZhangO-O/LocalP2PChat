@@ -1,9 +1,15 @@
 package com.zqr.localchat
 
 import com.zqr.localchat.data.ChatMessage
+import com.zqr.localchat.data.DeletedMessage
 import com.zqr.localchat.data.FileInfo
+import com.zqr.localchat.data.Peer
+import com.zqr.localchat.network.FileTransfer
+import com.zqr.localchat.network.GroupMeshManager
+import com.zqr.localchat.network.LineIn
 import com.zqr.localchat.network.NetworkPacket
 import com.zqr.localchat.network.P2PManager
+import com.zqr.localchat.network.Wire
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
@@ -12,7 +18,10 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.BufferedReader
+import java.io.PrintWriter
 import java.io.StringReader
+import java.io.StringWriter
+import java.net.Socket
 
 class NetworkProtocolTest {
 
@@ -191,5 +200,170 @@ class NetworkProtocolTest {
         val withPort = com.zqr.localchat.ui.screen.parseHostPort("192.168.1.5:4242")
         assertEquals("192.168.1.5", withPort.host)
         assertEquals(4242, withPort.port)
+    }
+
+    @Test
+    fun `deletedIds omitted when null`() {
+        // byte contract with the Windows peer (encodeDefaults=false): a
+        // packet without tombstones must not carry the field at all
+        val encoded = json.encodeToString(NetworkPacket(type = "join_ack", groupId = "g"))
+
+        assertFalse("null deletedIds must not be serialized", encoded.contains("deletedIds"))
+        assertNull(json.decodeFromString<NetworkPacket>(encoded).deletedIds)
+    }
+
+    @Test
+    fun `deletedIds serializes and round-trips`() {
+        val packet = NetworkPacket(type = "join_ack", groupId = "g", deletedIds = listOf("m-1", "m-2"))
+        val encoded = json.encodeToString(packet)
+
+        assertTrue(encoded.contains("\"deletedIds\":[\"m-1\",\"m-2\"]"))
+        assertEquals(listOf("m-1", "m-2"), json.decodeFromString<NetworkPacket>(encoded).deletedIds)
+    }
+
+    @Test
+    fun `history_reply tombstone packet parses without messages`() {
+        // the tombstone sync rides a dedicated history_reply: no messages,
+        // only the ids deleted while the returning member was offline
+        val wire = """{"type":"history_reply","groupId":"g","deletedIds":["a","b"]}"""
+        val decoded = json.decodeFromString<NetworkPacket>(wire)
+
+        assertEquals("history_reply", decoded.type)
+        assertEquals("g", decoded.groupId)
+        assertNull(decoded.messages)
+        assertEquals(listOf("a", "b"), decoded.deletedIds)
+    }
+
+    @Test
+    fun `packets without deletedIds are tolerated (old peers)`() {
+        // backward compatibility: an old peer never sends the field, and our
+        // decoder must accept that (null default) — same for legacy senders
+        // that receive it and ignore the unknown field via ignoreUnknownKeys
+        val decoded = json.decodeFromString<NetworkPacket>("""{"type":"mesh_chat","groupId":"g"}""")
+
+        assertNull(decoded.deletedIds)
+    }
+
+    @Test
+    fun `mesh hello naming an unjoined group is rejected before any state is touched`() {
+        // a handshake bound to group A must not be able to reach group B's
+        // mesh state: a hello whose groupId names a group we are not in is
+        // dropped and its socket closed (listener-side binding guard parity)
+        val socket = Socket()
+        val wire = Wire(LineIn { null }, PrintWriter(StringWriter(), true))
+        try {
+            GroupMeshManager.enterGroup(
+                "g1",
+                Peer("me", "Me", "192.168.1.2", 9999),
+                emptyList(),
+                emptyList(),
+                "pw"
+            )
+            GroupMeshManager.handleMeshHello(
+                socket,
+                wire,
+                NetworkPacket(
+                    type = "mesh_hello",
+                    groupId = "other-group",
+                    peer = Peer("intruder", "A", "192.168.1.9", 9999)
+                )
+            )
+            assertTrue("mismatched-group socket must be closed", socket.isClosed)
+            assertFalse(GroupMeshManager.hasLinks("g1"))
+        } finally {
+            GroupMeshManager.leaveGroup("g1")
+            runCatching { socket.close() }
+        }
+    }
+
+    @Test
+    fun `sanitizeFileName strips separators and dotdot`() {
+        assertEquals("a_b.txt", P2PManager.sanitizeFileName("a/b.txt"))
+        assertEquals("a_b.txt", P2PManager.sanitizeFileName("a\\b.txt"))
+        assertEquals("a_b", P2PManager.sanitizeFileName("a..b"))
+        assertEquals("__x", P2PManager.sanitizeFileName("../x"))
+        assertEquals("__x", P2PManager.sanitizeFileName("..\\x"))
+        assertEquals("报告.pdf", P2PManager.sanitizeFileName("报告.pdf"))
+    }
+
+    @Test
+    fun `numericGroupIdOf fixed vector 测试😀群`() {
+        // Cross-platform contract with the Windows client (Windows parity):
+        // FNV-1a over the UTF-16 CODE UNITS of "groupName + \\u0000 +
+        // fingerprint" (so 😀 contributes its surrogate PAIR, not a code
+        // point), Long multiply wrapping mod 2^32, final value mod 1e8
+        // zero-padded to 8 digits. Both sides must produce the identical id
+        // for the same (name, fingerprint).
+        assertEquals(
+            "54153344",
+            P2PManager.numericGroupIdOf("测试😀群", "0123456789abcdef")
+        )
+    }
+
+    @Test
+    fun `numericGroupIdOf is sensitive to name and fingerprint`() {
+        val base = P2PManager.numericGroupIdOf("测试😀群", "0123456789abcdef")
+        assertTrue(
+            P2PManager.numericGroupIdOf("测试😀群2", "0123456789abcdef") != base
+        )
+        assertTrue(
+            P2PManager.numericGroupIdOf("测试😀群", "fedcba9876543210") != base
+        )
+    }
+
+    @Test
+    fun `file_download token field serializes and legacy packets parse`() {
+        // the downloader always attaches the download token; the field must
+        // round-trip and old senders/receivers that never send it stay valid
+        val packet = NetworkPacket(type = "file_download", fileId = "f-1", token = "abc+/=")
+        val encoded = json.encodeToString(packet)
+        assertTrue(encoded.contains("\"token\":\"abc+/=\""))
+        val decoded = json.decodeFromString<NetworkPacket>(encoded)
+        assertEquals("f-1", decoded.fileId)
+        assertEquals("abc+/=", decoded.token)
+
+        // legacy peer (no token field) must still parse
+        val legacy = json.decodeFromString<NetworkPacket>(
+            """{"type":"file_download","fileId":"f-1"}"""
+        )
+        assertNull(legacy.token)
+    }
+
+    @Test
+    fun `downloadToken fixed vector and determinism`() {
+        // Windows contract: token = Base64(HMAC-SHA256(key=fileKey,
+        // msg=ASCII("lc-file-dl-v1:" + fileId))). Independent vector computed
+        // with .NET HMACSHA256: key = 0x01..0x20 (32 bytes).
+        val key = ByteArray(32) { (it + 1).toByte() }
+        assertEquals(
+            "IHKQaivs7b+e+A5fQZ+f7o+6IPWES+VsYeiz4KuDU5Y=",
+            FileTransfer.downloadToken("vector-file", key)
+        )
+        // deterministic: same key + id -> same token; different id -> differs
+        assertEquals(
+            FileTransfer.downloadToken("vector-file", key),
+            FileTransfer.downloadToken("vector-file", key)
+        )
+        assertTrue(
+            FileTransfer.downloadToken("other-file", key) !=
+                FileTransfer.downloadToken("vector-file", key)
+        )
+    }
+
+    @Test
+    fun `sanitizeDeletedIds dedupes caps and drops junk`() {
+        // the table keeps at most CAP ids per group, so accepting more from a
+        // single wire packet only buys the sender unbounded work here
+        assertEquals(DeletedMessage.CAP, P2PManager.MAX_DELETED_IDS)
+        assertEquals(listOf("a", "b"), P2PManager.sanitizeDeletedIds(listOf("a", "", "b", "a")))
+        assertEquals(emptyList<String>(), P2PManager.sanitizeDeletedIds(null))
+        assertEquals(emptyList<String>(), P2PManager.sanitizeDeletedIds(listOf("  ")))
+        val tooLong = "x".repeat(P2PManager.MAX_DELETED_ID_LEN + 1)
+        assertEquals(emptyList<String>(), P2PManager.sanitizeDeletedIds(listOf(tooLong)))
+        val many = (1..P2PManager.MAX_DELETED_IDS + 25).map { "m-$it" }
+        val capped = P2PManager.sanitizeDeletedIds(many)
+        assertEquals(P2PManager.MAX_DELETED_IDS, capped.size)
+        assertEquals("m-1", capped.first())
+        assertEquals("m-${P2PManager.MAX_DELETED_IDS}", capped.last())
     }
 }

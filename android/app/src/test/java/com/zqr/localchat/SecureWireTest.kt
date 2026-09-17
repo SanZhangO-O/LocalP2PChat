@@ -219,4 +219,73 @@ class SecureWireTest {
         assertFalse(line.contains("秘密消息"))
         assertFalse(line.contains("\"type\""))
     }
+
+    @Test
+    fun `replayed encrypted line is rejected and unique ones accepted`() {
+        // replay protection: the same encrypted line delivered twice must
+        // fail the second time (same path as a decrypt failure), while a
+        // freshly encrypted packet passes
+        val key = Crypto.randomBytes(32)
+        val line = Crypto.toB64(Crypto.aesGcmEncrypt(key, """{"type":"ping"}""".toByteArray(Charsets.UTF_8)))
+        val fresh = Crypto.toB64(Crypto.aesGcmEncrypt(key, """{"type":"pong"}""".toByteArray(Charsets.UTF_8)))
+        val lines = ArrayDeque(listOf(line, fresh, line))
+        val wire = Wire(
+            com.zqr.localchat.network.LineIn { lines.removeFirstOrNull() },
+            PrintWriter(java.io.StringWriter(), true)
+        )
+        wire.activate(key)
+
+        assertNotNull(wire.recvPacket()) // first delivery: accepted
+        assertNotNull(wire.recvPacket()) // a different (fresh) nonce: accepted
+        val ex = assertThrows(WireException::class.java) { wire.recvPacket() }
+        assertTrue("replay must be named", ex.message!!.contains("replay"))
+    }
+
+    @Test
+    fun `nonce cache evicts oldest beyond capacity`() {
+        // 4096-entry window: a packet sent once must be receivable again
+        // only after 4096 other packets pushed it out of the window
+        val key = Crypto.randomBytes(32)
+        val old = Crypto.toB64(Crypto.aesGcmEncrypt(key, """{"type":"ping"}""".toByteArray(Charsets.UTF_8)))
+        val lines = ArrayDeque<String>()
+        lines.addLast(old)
+        repeat(4096) {
+            lines.addLast(
+                Crypto.toB64(Crypto.aesGcmEncrypt(key, """{"type":"ping"}""".toByteArray(Charsets.UTF_8)))
+            )
+        }
+        lines.addLast(old) // evicted from the window: accepted again
+        val wire = Wire(
+            com.zqr.localchat.network.LineIn { lines.removeFirstOrNull() },
+            PrintWriter(java.io.StringWriter(), true)
+        )
+        wire.activate(key)
+        assertNotNull(wire.recvPacket())
+        repeat(4096) { assertNotNull(wire.recvPacket()) }
+        assertNotNull("oldest nonce outside the window must be accepted again", wire.recvPacket())
+    }
+
+    @Test
+    fun `raw IO is rejected after activation`() {
+        // once the wire is secured, plaintext handshake IO must throw rather
+        // than silently downgrade the connection
+        val wire = Wire(
+            com.zqr.localchat.network.LineIn { null },
+            PrintWriter(java.io.StringWriter(), true)
+        )
+        assertFalse(wire.isSecure)
+        wire.sendRaw(NetworkPacket(type = Protocol.HS_START, hsMode = Protocol.MODE_JOIN, groupId = "g"))
+        wire.activate(Crypto.randomBytes(32))
+        assertTrue(wire.isSecure)
+        val sendEx = assertThrows(IllegalStateException::class.java) {
+            wire.sendRaw(NetworkPacket(type = "ping"))
+        }
+        val recvEx = assertThrows(IllegalStateException::class.java) { wire.recvRaw() }
+        val rejectEx = assertThrows(IllegalStateException::class.java) {
+            wire.sendRawReject("no")
+        }
+        assertTrue(sendEx.message!!.contains("secured"))
+        assertTrue(recvEx.message!!.contains("secured"))
+        assertTrue(rejectEx.message!!.contains("secured"))
+    }
 }

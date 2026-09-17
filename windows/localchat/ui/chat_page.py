@@ -242,8 +242,11 @@ class MessageDelegate(QStyledItemDelegate):
         else:
             status_text = {
                 "idle": "点击下载",
-                "downloading": "下载中...",
+                "downloading": (
+                    f"下载中 {state[2]}%" if state[0] == "downloading" and state[2] else "下载中..."
+                ),
                 "done": "已保存",
+                "cancelled": "已取消",
                 "failed": state[2] or "下载失败",
             }.get(state[0], "点击下载")
         text_color = QColor("#FFFFFF" if msg.is_from_me else BUBBLE_TEXT_OTHER)
@@ -414,6 +417,7 @@ class ChatPage(QWidget):
         self.vm.active_messages_changed.connect(self._on_messages_changed)
         self.vm.active_connection_lost_changed.connect(self._on_connection_state_changed)
         self.vm.file_download_finished.connect(self._on_file_download_finished)
+        self.vm.file_progress.connect(self._on_file_progress)
 
     def _on_group_changed(self):
         self.title_label.setText(self.vm.active_group_name)
@@ -524,15 +528,36 @@ class ChatPage(QWidget):
         )
         if not path:
             return
-        self._file_states[msg.id] = ("downloading", path, "")
+        self._file_states[msg.id] = ("downloading", path, "0")
         self.list_view.viewport().update()
         self.vm.download_file(msg.id, path)
+
+    def _on_file_progress(self, file_id: str, received: int, total: int):
+        state = self._file_states.get(file_id)
+        if state is None or state[0] != "downloading":
+            return
+        if total > 0:
+            percent = min(99, int(received * 100 / total))
+            self._file_states[file_id] = ("downloading", state[1], str(percent))
+            self.list_view.viewport().update()
+
+    def _cancel_download(self, msg):
+        gid = self.vm.active_group_id
+        if gid is None:
+            return
+        self.vm.cancel_download(gid, msg.id)
+        state = self._file_states.get(msg.id)
+        if state is not None and state[0] == "downloading":
+            self._file_states[msg.id] = ("cancelled", "", "")
+            self.list_view.viewport().update()
 
     def _on_file_download_finished(self, file_id: str, ok: bool, message: str):
         if ok:
             path = self._file_states.get(file_id, ("", "", ""))[1]
             self._file_states[file_id] = ("done", path, "")
             Toast(self.window()).show_message("文件已保存")
+        elif "取消" in message:
+            self._file_states[file_id] = ("cancelled", "", "")
         else:
             self._file_states[file_id] = ("failed", "", message)
             Toast(self.window()).show_message(f"下载失败：{message}")
@@ -546,8 +571,12 @@ class ChatPage(QWidget):
         menu = QMenu(self.list_view)
         if msg.file_info is not None:
             download_action = None
-            if not file_offer_expired(msg.file_info):
+            cancel_action = None
+            state = self._file_states.get(msg.id, ("idle", "", ""))[0]
+            if not file_offer_expired(msg.file_info) and state != "downloading":
                 download_action = menu.addAction("下载 / 另存为")
+            if state == "downloading":
+                cancel_action = menu.addAction("取消下载")
             copy_name_action = menu.addAction("复制文件名")
             delete_action = None
             if msg.is_from_me:
@@ -556,6 +585,8 @@ class ChatPage(QWidget):
             chosen = menu.exec(self.list_view.viewport().mapToGlobal(pos))
             if download_action is not None and chosen is download_action:
                 self._download_file(msg)
+            elif cancel_action is not None and chosen is cancel_action:
+                self._cancel_download(msg)
             elif chosen is copy_name_action:
                 QApplication.clipboard().setText(msg.file_info.file_name)
             elif chosen is delete_action:

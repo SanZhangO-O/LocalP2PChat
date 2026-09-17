@@ -35,6 +35,7 @@ class Rec(GroupMeshListener):
         self.messages = []  # (group_id, ChatMessage)
         self.link_changes = []
         self.deletes = []  # (group_id, message_id, sender_id)
+        self.deleted_ids = []  # (group_id, [msgId...]) tombstone convergence
 
     def group_mesh_message(self, group_id: str, msgs) -> None:
         for m in msgs:
@@ -45,6 +46,9 @@ class Rec(GroupMeshListener):
 
     def group_mesh_delete(self, group_id: str, message_id: str, sender_id: str) -> None:
         self.deletes.append((group_id, message_id, sender_id))
+
+    def group_mesh_deleted_ids(self, group_id: str, deleted_ids) -> None:
+        self.deleted_ids.append((group_id, list(deleted_ids)))
 
 
 def make_msg(content: str, sender_id: str, sender_name: str, mid: str) -> ChatMessage:
@@ -212,6 +216,93 @@ class GroupMeshTest(unittest.TestCase):
             self.rec_b.deletes[-1][2],
             "aaa-member",
             "the delete must be attributed to the original sender",
+        )
+
+    def test_broadcast_delete_cleans_local_mesh_history(self):
+        """broadcast_delete also removes the message from the SENDER's own
+        mesh history: a member linking up later must not get the deleted
+        message backfilled (regression: deletes resurrected via history
+        push)."""
+        self._link()
+        msg = make_msg(
+            "\u5f85\u5220\u9664", "aaa-member", "\u6210\u5458A", "gone-1"
+        )
+        self.a.broadcast(GRP, msg)
+        self.assertTrue(wait_until(lambda: any(m.id == "gone-1" for _, m in self.rec_b.messages)))
+        self.a.broadcast_delete(GRP, "gone-1")
+        self.assertTrue(
+            wait_until(lambda: any(d[1] == "gone-1" for d in self.rec_a.deletes)),
+            "the sender must run its own local delete path (mesh state cleaned)",
+        )
+        with self.a._lock:
+            ids = [m.id for m in self.a._groups[GRP]["messages"]]
+        self.assertNotIn("gone-1", ids, "the deleted message must leave the mesh history")
+
+    def test_broadcast_dedups_local_mesh_state(self):
+        """A duplicated broadcast keeps ONE copy in the sender's history, so
+        a late joiner backfills the message exactly once (Android
+        noteMessage parity)."""
+        self.a.enter_group(GRP, self.peer_a, [self.peer_b], [], GROUP_PASSWORD)
+        msg = make_msg(
+            "\u53bb\u91cd\u5386\u53f2", "aaa-member", "\u6210\u5458A", "dup-h"
+        )
+        self.a.broadcast(GRP, msg)
+        self.a.broadcast(GRP, msg)
+        with self.a._lock:
+            hits = [m for m in self.a._groups[GRP]["messages"] if m.id == "dup-h"]
+        self.assertEqual(len(hits), 1, "sender-side state must dedupe by message id")
+
+    def test_history_push_carries_deleted_ids_byte_contract(self):
+        """The FIRST history batch carries deletedIds when tombstones exist;
+        with none the key stays absent entirely (byte-level wire compat)."""
+        self.a.deleted_ids_provider = lambda gid: []
+        old = make_msg("\u5386\u53f2", "aaa-member", "\u6210\u5458A", "h-x")
+        key = os.urandom(32)
+        lines = []
+        wire = Wire(lambda: None, lines.append)
+        wire.activate(key)
+        self.a._send_history(wire, GRP, [old])
+        self.assertEqual(len(lines), 1)
+        packet = NetworkPacket.from_json(
+            aes_gcm_decrypt(key, from_b64(lines[0])).decode("utf-8")
+        )
+        self.assertIsNone(packet.deleted_ids, "empty tombstones must omit deletedIds")
+        self.assertNotIn("deletedIds", packet.to_dict())
+
+        self.a.deleted_ids_provider = lambda gid: ["h-x", "h-gone"]
+        lines.clear()
+        self.a._send_history(wire, GRP, [old])
+        packet = NetworkPacket.from_json(
+            aes_gcm_decrypt(key, from_b64(lines[0])).decode("utf-8")
+        )
+        self.assertEqual(packet.deleted_ids, ["h-x", "h-gone"])
+
+    def test_mesh_deleted_ids_converge_without_rebroadcast(self):
+        """Received deletedIds drop the named messages from the local mesh
+        history and surface to the listener — and are never re-broadcast as
+        deletes (convergence is not a new delete event)."""
+        self._link()
+        msg = make_msg(
+            "\u5c06\u88ab\u6536\u655b", "aaa-member", "\u6210\u5458A", "conv-1"
+        )
+        self.a.broadcast(GRP, msg)
+        self.assertTrue(wait_until(lambda: any(m.id == "conv-1" for _, m in self.rec_b.messages)))
+        self.b.apply_deleted_ids(GRP, ["conv-1", "never-seen"])
+        self.assertTrue(
+            wait_until(
+                lambda: any(
+                    d[0] == GRP and d[1] == ["conv-1", "never-seen"]
+                    for d in self.rec_b.deleted_ids
+                )
+            ),
+            "B must surface the convergence data to its listener",
+        )
+        with self.b._lock:
+            ids = [m.id for m in self.b._groups[GRP]["messages"]]
+        self.assertNotIn("conv-1", ids, "the named message must leave B's mesh history")
+        self.assertFalse(
+            any(d[1] == "conv-1" for d in self.rec_b.deletes),
+            "convergence must not be rebroadcast as a delete",
         )
 
     def test_history_pushed_in_bounded_batches(self):

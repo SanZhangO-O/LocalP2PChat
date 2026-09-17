@@ -2,6 +2,7 @@ import json
 import re
 import socket
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -57,6 +58,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # (file_id, ok, message) after a download finishes (emitted on the main
     # thread; the download itself runs on a worker thread).
     file_download_finished = pyqtSignal(str, bool, str)
+    # (file_id, received, total) while a download runs, throttled to at most
+    # one emission per 250ms or 64KB (whichever comes first).
+    file_progress = pyqtSignal(str, int, int)
     # Emitted from network threads with (group_id, sender_name, body); the
     # aggregator slot runs on the main thread (queued connection).
     raw_tray = pyqtSignal(str, str, str)
@@ -80,6 +84,11 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # into a single tray bubble instead of one popup per message.
     TRAY_AGGREGATE_MS = 2000
 
+    # Download progress throttling: emit file_progress when EITHER 250ms
+    # elapsed since the last emission OR 64KB of new bytes arrived.
+    FILE_PROGRESS_MIN_INTERVAL = 0.25
+    FILE_PROGRESS_MIN_DELTA = 64 * 1024
+
     def __init__(self, store: ChatStore, data_dir: str = "."):
         super().__init__()
         self.store = store
@@ -101,6 +110,15 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.persisted_message_ids: Dict[str, set] = {}
         self.persisted_peer_counts: Dict[str, int] = {}
         self.persisted_my_names: Dict[str, str] = {}
+        # Per group: the P2PManager whose saved-history replay finished (or,
+        # for a fresh host group, the one that had nothing to replay). Only
+        # THAT instance may mirror deletes into the database: a stale
+        # connection's in-flight callback carries a message list where the
+        # rows the fresh instance has not loaded yet look deleted (Android
+        # parity: replayDone[groupId] = p2p). An entry is absent while no
+        # replay has completed for the current instance, which also blocks
+        # mirroring mid-replay.
+        self.replay_done: Dict[str, P2PManager] = {}
 
         self.setup_p2p: Optional[P2PManager] = None
         self.pending_p2p: Optional[P2PManager] = None
@@ -133,11 +151,18 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self._direct_persisted_ids: Dict[str, set] = {}
         self._direct_pending: Dict[str, Dict[str, bool]] = {}
         self._direct_last: Dict[str, Optional[ChatMessage]] = {}
+        # Running file downloads: (group_id|peer_id, message_id) ->
+        # (cancel Event, [download socket]). cancel_download sets the event
+        # and shuts the socket down so a blocked read aborts immediately.
+        self._download_registry: Dict[tuple, tuple] = {}
 
         # Group mesh: member-to-member links so chat survives the host going
         # offline, plus history backfill on connect.
         self.mesh = network_module.GroupMeshManager()
         self.mesh.attach(self)
+        # history pushes carry the group's delete tombstones so members that
+        # were offline during a delete converge instead of resurrecting it
+        self.mesh.deleted_ids_provider = self.store.get_deleted_ids
         self.host_server.mesh_manager = self.mesh
         # Resolve the group password for an incoming handshake on the shared
         # listener: host groups by numeric join id, member groups (join
@@ -257,9 +282,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         with self._lock:
             candidates = list(self.group_p2p_map.values())
         for candidate in candidates:
-            if not candidate.is_host and (
-                candidate.join_id == group_id or candidate.group_name == group_id
-            ):
+            if not candidate.is_host and candidate.join_id == group_id:
                 return self.store.get_setting(
                     f"group_password_{candidate.current_group_id}", ""
                 )
@@ -269,6 +292,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         """Aggregate raw tray notifications arriving within the burst window.
         Runs on the main thread via the queued signal connection, so the
         QTimer is only ever touched from the main thread."""
+        if self._tray_accum is not None and self._tray_accum["gid"] != gid:
+            # another group arrived mid-window: flush the accumulated bubble
+            # first so its count/preview never bleed into the new group's
+            self._flush_tray()
         if self._tray_accum is None:
             self._tray_accum = {
                 "gid": gid,
@@ -681,6 +708,55 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         file_message protocol). Returns False when it cannot be served."""
         return self.direct.send_file(peer_id, path) is not None
 
+    def _make_file_progress(self, file_id: str):
+        """Throttled progress callback for a download worker thread: forwards
+        (received, total) into file_progress at most every 250ms or 64KB —
+        whichever comes first — so huge files don't flood the Qt event loop."""
+        state = {"t": 0.0, "bytes": 0}
+
+        def report(received: int, total: int) -> None:
+            now = time.monotonic()
+            with self._lock:
+                due = (
+                    now - state["t"] >= self.FILE_PROGRESS_MIN_INTERVAL
+                    or received - state["bytes"] >= self.FILE_PROGRESS_MIN_DELTA
+                )
+                if due:
+                    state["t"] = now
+                    state["bytes"] = received
+            if due:
+                self.file_progress.emit(file_id, received, total)
+
+        return report
+
+    def _register_download(self, key: tuple) -> tuple:
+        """Create the cancel entry for a download: (Event, [socket holder])."""
+        entry = (threading.Event(), [])
+        with self._lock:
+            self._download_registry[key] = entry
+        return entry
+
+    def _finish_download(self, key: tuple) -> None:
+        with self._lock:
+            self._download_registry.pop(key, None)
+
+    def cancel_download(self, group_id: str, message_id: str) -> None:
+        """Abort a running download: set its cancel event and shut the held
+        socket down (a blocked read returns at once). The worker then reports
+        "下载已取消" via file_download_finished and the .part file is removed."""
+        key = (group_id, message_id)
+        with self._lock:
+            entry = self._download_registry.pop(key, None)
+        if entry is None:
+            return
+        event, socks = entry
+        event.set()
+        for s in tuple(socks):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def download_direct_file(self, peer_id: str, file_id: str, target_path: str) -> None:
         """Download a direct-chat file offer by file_id on a worker thread;
         file_download_finished(file_id, ok, message) fires on completion."""
@@ -694,9 +770,14 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         if not file_info.download_host or file_info.download_port <= 0:
             self.file_download_finished.emit(file_id, False, "文件已过期，请对方重新发送")
             return
+        event, socks = self._register_download((peer_id, file_id))
+        progress = self._make_file_progress(file_id)
 
         def run() -> None:
-            ok, message = self.direct.download_file(file_info, target_path)
+            ok, message = self.direct.download_file(
+                file_info, target_path, progress=progress, cancel=event, sock_holder=socks
+            )
+            self._finish_download((peer_id, file_id))
             self.file_download_finished.emit(file_id, ok, message)
 
         threading.Thread(target=run, daemon=True).start()
@@ -732,6 +813,28 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         p2p = self.group_p2p_map.get(group_id)
         if p2p is not None:
             p2p.remove_local_message(message_id, sender_id)
+
+    def group_mesh_deleted_ids(self, group_id: str, deleted_ids) -> None:
+        """history_reply carried tombstone convergence data: drop the copies
+        this member still holds and record every tombstone — without
+        rebroadcasting (convergence is not a new delete event)."""
+        p2p = self.group_p2p_map.get(group_id)
+        if p2p is not None:
+            p2p.apply_deleted_ids(deleted_ids)
+        with self._lock:
+            self.store.record_deleted_messages(group_id, deleted_ids)
+        if group_id == self.active_group_id:
+            self.active_messages_changed.emit()
+
+    def deleted_ids_received(self, p2p: P2PManager, deleted_ids) -> None:
+        """join_ack carried tombstone convergence data: the still-present
+        copies were already dropped by the network layer; record every id so
+        later history backfills cannot resurrect them."""
+        gid = p2p.current_group_id
+        if not gid or not deleted_ids:
+            return
+        with self._lock:
+            self.store.record_deleted_messages(gid, deleted_ids)
 
     # ------------------------------------------------------------ group mesh
 
@@ -823,9 +926,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             return False
         p2p = None
         for candidate in self.group_p2p_map.values():
-            if not candidate.is_host and (
-                candidate.join_id == id_or_name or candidate.group_name == id_or_name
-            ):
+            if not candidate.is_host and candidate.join_id == id_or_name:
                 p2p = candidate
                 break
         if p2p is None:
@@ -845,7 +946,12 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 members = [p for p in p2p.peers.values() if host is None or p.id != host.id]
                 wire.send_packet(
                     NetworkPacket(
-                        type="join_ack", group_id=gid, members=members, host=host
+                        type="join_ack",
+                        group_id=gid,
+                        members=members,
+                        host=host,
+                        # tombstone convergence: omitted when empty
+                        deleted_ids=self.store.get_deleted_ids(gid) or None,
                     )
                 )
                 self._safe_close_simple(sock)
@@ -1109,24 +1215,42 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 )
 
     def _load_and_replay_messages(self, group_id: str, p2p: P2PManager) -> None:
-        saved = self.store.get_messages_for_group(group_id)
-        self.persisted_message_ids[group_id] = {m.id for m in saved}
-        if saved:
-            p2p.replay_saved_messages(
-                [
-                    ChatMessage(
-                        id=m.id,
-                        content=m.content,
-                        timestamp=m.timestamp,
-                        sender_id=m.sender_id,
-                        sender_name=m.sender_name,
-                        is_from_me=m.is_from_me,
-                        file_info=self._restored_file_info(m),
-                    )
-                    for m in saved
-                ]
-            )
-        self.active_messages_changed.emit()
+        # open the replay window: until it closes, no instance may mirror-delete
+        # (the rows are about to be replayed into this p2p's message list)
+        self.replay_done.pop(group_id, None)
+        try:
+            saved = self.store.get_messages_for_group(group_id)
+            # converge with recorded tombstones BEFORE replaying: a delete that
+            # happened while this member was offline must not resurrect here
+            tombstones = self.store.get_deleted_ids(group_id)
+            if tombstones:
+                doomed = set(tombstones) & {m.id for m in saved}
+                for mid in doomed:
+                    self.store.delete_message(group_id, mid)
+                if doomed:
+                    saved = [m for m in saved if m.id not in doomed]
+            self.persisted_message_ids[group_id] = {m.id for m in saved}
+            if saved:
+                p2p.replay_saved_messages(
+                    [
+                        ChatMessage(
+                            id=m.id,
+                            content=m.content,
+                            timestamp=m.timestamp,
+                            sender_id=m.sender_id,
+                            sender_name=m.sender_name,
+                            is_from_me=m.is_from_me,
+                            file_info=self._restored_file_info(m),
+                        )
+                        for m in saved
+                    ]
+                )
+        finally:
+            # close the window even on failure: a raised replay must not leave
+            # the group permanently unable to persist deletes/tombstones
+            if self.group_p2p_map.get(group_id) is p2p:
+                self.replay_done[group_id] = p2p
+            self.active_messages_changed.emit()
 
     def create_group(self, user_name: str, group_name: str) -> None:
         nick = user_name.strip()
@@ -1149,6 +1273,8 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             hardware_id=self._hardware_fingerprint(),
         )
         self.call_manager.attach(p2p)
+        # join_acks carry the group's delete tombstones (convergence)
+        p2p.deleted_ids_provider = self.store.get_deleted_ids
         p2p.initialize_as_host(nick, name, password)
         group_id = p2p.current_group_id
         # The same group name on this device derives the SAME group id: stop
@@ -1160,6 +1286,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             old.stop()
         self.store.set_setting(f"group_password_{group_id}", password)
         self.group_p2p_map[group_id] = p2p
+        # a fresh group has no saved history to replay, so this instance may
+        # mirror deletes right away (replay_done holds "the instance whose
+        # replay finished": nothing to replay == finished)
+        self.replay_done[group_id] = p2p
         self.groups = [
             GroupMeta(group_id, name, True, host_port=self.port, connected=True)
         ] + [g for g in self.groups if g.group_id != group_id]
@@ -1266,6 +1396,8 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 device_id=self._device_id(),
                 hardware_id=self._hardware_fingerprint(),
             )
+            # join_acks carry the group's delete tombstones (convergence)
+            new_p2p.deleted_ids_provider = self.store.get_deleted_ids
             new_p2p.initialize_as_host(nick, meta.group_name, password)
             self.call_manager.attach(new_p2p)
             self.group_p2p_map[group_id] = new_p2p
@@ -1289,6 +1421,17 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             self.rejoin_failed = True
             self.rejoin_state_changed.emit()
             return
+        join_id = self.store.get_setting(f"group_join_id_{group_id}", "")
+        if not join_id:
+            # the numeric id is the ONLY addressable join identifier (a host
+            # resolves a handshake by id, never by name), so a group whose id
+            # was not remembered cannot be rejoined automatically: fail with a
+            # clear message instead of dialing with a name that gets rejected
+            self.rejoin_in_progress = False
+            self.rejoin_failed = True
+            self.rejoin_state_changed.emit()
+            self.status_message.emit("该群组缺少数字 ID，请重新查询加入")
+            return
         p2p = P2PManager(
             self, port=self.port, device_id=self._device_id(), hardware_id=self._hardware_fingerprint()
         )
@@ -1298,7 +1441,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             sg.group_name,
             self.store.get_setting(f"group_password_{group_id}", "") or None,
         )
-        p2p.set_join_id(self.store.get_setting(f"group_join_id_{group_id}", ""))
+        p2p.set_join_id(join_id)
         self.pending_p2p = p2p
         self.setup_p2p = p2p
         self.pending_host_ip = sg.host_ip
@@ -1368,6 +1511,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self._teardown_group_mesh(group_id)
         self.removed_group_ids.add(group_id)
         self.persisted_message_ids.pop(group_id, None)
+        self.replay_done.pop(group_id, None)
         self.persisted_peer_counts.pop(group_id, None)
         self.persisted_my_names.pop(group_id, None)
         self.groups = [g for g in self.groups if g.group_id != group_id]
@@ -1463,9 +1607,14 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             self.file_download_finished.emit(file_id, False, "文件消息不存在")
             return
         file_info = msg.file_info
+        event, socks = self._register_download((gid, file_id))
+        progress = self._make_file_progress(file_id)
 
         def run() -> None:
-            ok, message = p2p.download_file(file_info, target_path)
+            ok, message = p2p.download_file(
+                file_info, target_path, progress=progress, cancel=event, sock_holder=socks
+            )
+            self._finish_download((gid, file_id))
             self.file_download_finished.emit(file_id, ok, message)
 
         threading.Thread(target=run, daemon=True).start()
@@ -1627,13 +1776,25 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 meta.last_message = last.content if last else ""
                 meta.last_message_time = last.timestamp if last else 0
             persisted = self.persisted_message_ids.setdefault(gid, set())
-            if persisted:
+            if (
+                persisted
+                and self.group_p2p_map.get(gid) is p2p
+                and self.replay_done.get(gid) is p2p
+            ):
+                # mirror deletes relayed from the group into the database —
+                # but only from the CURRENT manager whose saved-history replay
+                # finished: an old connection's in-flight callback (its message
+                # list is missing rows the fresh instance has not loaded yet)
+                # must neither mirror-delete rows nor mint delete tombstones
+                # for peers. Every mirrored delete also becomes a tombstone so
+                # offline members converge instead of resurrecting it.
                 current_ids = {m.id for m in msgs}
                 removed_ids = persisted - current_ids
                 if removed_ids:
                     persisted.difference_update(removed_ids)
                     for mid in removed_ids:
                         self.store.delete_message(gid, mid)
+                    self.store.record_deleted_messages(gid, list(removed_ids))
             new_messages = [m for m in msgs if m.id not in persisted]
             if new_messages:
                 # Keep the mesh history state complete even when the message

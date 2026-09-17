@@ -20,6 +20,7 @@ import androidx.compose.material.icons.automirrored.filled.Forward
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.*
@@ -244,6 +245,7 @@ fun ChatScreen(
                             state = downloadStates[message.id],
                             onDownload = { onDownloadFile(message.fileInfo!!) },
                             onOpen = saved?.let { done -> { onOpenFile(done.uri) } },
+                            onCancel = { ChatViewModel.cancelDownload(message.id) },
                             onDelete = { pendingDelete = message.id }
                         )
                     } else {
@@ -528,6 +530,7 @@ internal fun FileMessageBubble(
     state: ChatViewModel.DownloadState?,
     onDownload: () -> Unit,
     onOpen: (() -> Unit)? = null,
+    onCancel: (() -> Unit)? = null,
     onDelete: () -> Unit
 ) {
     val fileInfo = message.fileInfo ?: return
@@ -549,8 +552,9 @@ internal fun FileMessageBubble(
     // an offer without a download address expired with its sender's previous
     // session (the short-lived download server is gone)
     val expired = fileInfo.downloadHost.isBlank()
+    val downloading = state is ChatViewModel.DownloadState.Downloading && !isFromMe
     val statusText = when (state) {
-        is ChatViewModel.DownloadState.Downloading -> "下载中..."
+        is ChatViewModel.DownloadState.Downloading -> "下载中 ${state.percent}%"
         is ChatViewModel.DownloadState.Done -> "已保存"
         is ChatViewModel.DownloadState.Failed -> state.message
         else -> when {
@@ -559,10 +563,12 @@ internal fun FileMessageBubble(
             else -> "点击下载"
         }
     }
-    val clickable = !expired && (
-        state == null ||
-            state is ChatViewModel.DownloadState.Failed
-        )
+    // While a download is running the bubble tap CANCELS it (when the screen
+    // wired a cancel handler); otherwise the tap (re)starts the download.
+    val clickable = !expired && !isFromMe && when {
+        downloading -> onCancel != null
+        else -> state == null || state is ChatViewModel.DownloadState.Failed
+    }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -574,7 +580,10 @@ internal fun FileMessageBubble(
                 .clip(RoundedCornerShape(16.dp))
                 .background(bgColor)
                 .combinedClickable(
-                    onClick = { if (clickable && !isFromMe) onDownload() },
+                    onClick = {
+                        if (!clickable) return@combinedClickable
+                        if (downloading) onCancel?.invoke() else onDownload()
+                    },
                     onLongClick = { showMenu = true }
                 )
                 .padding(horizontal = 14.dp, vertical = 12.dp)
@@ -627,6 +636,16 @@ internal fun FileMessageBubble(
                             showMenu = false
                             onDownload()
                         }
+                    )
+                }
+                if (downloading && onCancel != null) {
+                    DropdownMenuItem(
+                        text = { Text("取消下载") },
+                        onClick = {
+                            showMenu = false
+                            onCancel()
+                        },
+                        leadingIcon = { Icon(Icons.Default.Close, contentDescription = null) }
                     )
                 }
                 if (onOpen != null) {

@@ -31,6 +31,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 /**
@@ -131,7 +132,33 @@ object DirectChatManager {
         /** FIFO of outbound packets, drained by the session's single sender
          *  thread — enqueue order IS wire order, so a chat sent right before
          *  a delete reaches the peer in that order. */
-        val sendQueue = LinkedBlockingQueue<NetworkPacket>()
+        val sendQueue = LinkedBlockingQueue<Outbound>()
+    }
+
+    /** One queued outbound packet with its delivery callbacks: [onSent] runs
+     *  after the line was actually written, [onFailed] when the write failed
+     *  or the session died before the packet was drained (at-least-once:
+     *  undelivered chat messages go back to the outbox as pending; the
+     *  receiver dedups by id, so an uncertain send is safe to retry).
+     *  Exactly ONE of the two runs even when the enqueue-time dead-session
+     *  check races the sender's drain — a handler like the file-offer
+     *  rollback must not fire twice. Internal for the regression test. */
+    internal class Outbound(
+        val packet: NetworkPacket,
+        val onSent: (() -> Unit)? = null,
+        val onFailed: (() -> Unit)? = null
+    ) {
+        private val settled = AtomicBoolean(false)
+
+        /** Deliver the success callback unless the item already failed. */
+        fun settleSent() {
+            if (settled.compareAndSet(false, true)) runCatching { onSent?.invoke() }
+        }
+
+        /** Deliver the failure callback unless the item already succeeded. */
+        fun settleFailed() {
+            if (settled.compareAndSet(false, true)) runCatching { onFailed?.invoke() }
+        }
     }
 
     private val sessions = ConcurrentHashMap<String, Session>()
@@ -336,28 +363,66 @@ object DirectChatManager {
      *  lines inside the TCP stream. */
     fun sendPacket(peerId: String, packet: NetworkPacket): Boolean {
         val s = sessions[peerId] ?: return false
-        s.sendQueue.put(packet)
+        putSend(s, packet)
         return true
     }
+
+    /** Enqueue [packet] with its delivery callbacks. A session that is
+     *  already dead at enqueue time fails the item at once, so nothing is
+     *  silently stranded in a queue nobody drains ([Outbound.settled] keeps
+     *  the sender's own drain from reporting it a second time). */
+    private fun putSend(
+        s: Session,
+        packet: NetworkPacket,
+        onSent: (() -> Unit)? = null,
+        onFailed: (() -> Unit)? = null
+    ) {
+        val item = Outbound(packet, onSent, onFailed)
+        s.sendQueue.put(item)
+        if (!s.alive) settleFailed(item)
+    }
+
+    /** Run [Outbound.onSent] unless the item was already settled as failed. */
+    private fun settleSent(item: Outbound) = item.settleSent()
+
+    /** Run [Outbound.onFailed] at most once for this item. */
+    private fun settleFailed(item: Outbound) = item.settleFailed()
 
     /** The session's ONLY writer: one thread per session draining the send
      *  queue in order. A write failure means the socket is dead — close it so
      *  the read loop unblocks immediately and the session tears down instead
-     *  of lingering until the peer read timeout. */
+     *  of lingering until the peer read timeout. Items still queued when the
+     *  failure happens get their [Outbound.onFailed] callback (undelivered
+     *  messages go back to the outbox) in FIFO order. */
     private fun sendLoop(s: Session) {
         try {
             while (s.alive && !s.socket.isClosed) {
-                val packet = s.sendQueue.poll(SEND_POLL_MS, TimeUnit.MILLISECONDS) ?: continue
+                val item = s.sendQueue.poll(SEND_POLL_MS, TimeUnit.MILLISECONDS) ?: continue
                 try {
-                    s.wire.sendPacket(packet)
+                    s.wire.sendPacket(item.packet)
                 } catch (e: Exception) {
                     Log.w(TAG, "send on session ${s.peerId} failed", e)
                     closeSocket(s.socket)
+                    settleFailed(item)
+                    drainFailed(s)
                     break
                 }
+                settleSent(item)
             }
         } catch (_: InterruptedException) {
             // closing
+        } finally {
+            // session closed/replaced between enqueue and write: don't strand
+            // items in a queue nobody drains
+            if (!s.alive) drainFailed(s)
+        }
+    }
+
+    /** Run [Outbound.onFailed] for every still-queued item, in FIFO order. */
+    private fun drainFailed(s: Session) {
+        while (true) {
+            val pending = s.sendQueue.poll() ?: break
+            settleFailed(pending)
         }
     }
 
@@ -483,16 +548,37 @@ object DirectChatManager {
         }
     }
 
-    /** The user accepted a request: add the member (clearing any removal
-     *  marks — acceptance is the explicit un-block) and announce right away;
-     *  the presence sweep dials the fresh contact immediately (quiet). A
-     *  failed dial just means the peer went offline — the sweep retries and
-     *  both outboxes flush on the next session. */
+    /**
+     * The user accepted a request: add the member (clearing any removal
+     * marks — acceptance is the explicit un-block) and dial them at once
+     * (quiet), then announce as usual. Previously the session came up only
+     * when the PEER's announce arrived or our presence sweep ran — up to
+     * [PRESENCE_SWEEP_MS] away, and never from our side at all when the
+     * deterministic dialer rule (`myId >= contact.id`) picks the peer.
+     * The dial goes through [startChatSync]: the per-peer dial lock
+     * serializes with the sweep / redial loops, and an already-live session
+     * short-circuits, so double dials cannot race. A failed dial just means
+     * the peer went offline — the sweep retries and both outboxes flush on
+     * the next session.
+     */
     fun acceptContactRequest(requestId: String) {
         val req = _contactRequests.value.firstOrNull { it.id == requestId } ?: return
         _contactRequests.update { list -> list.filterNot { it.id == requestId } }
         addContact(Contact(req.id, req.name, req.ip, req.port))
         _events.tryEmit("已添加 ${req.name}")
+        if (req.ip.isNotBlank() && req.port > 0 && sessions[req.id]?.alive != true &&
+            presenceDialing.add(req.id)
+        ) {
+            thread(name = "direct-accept-${req.id}") {
+                try {
+                    startChatSync(Peer(req.id, req.name, req.ip, req.port), quiet = true)
+                } catch (e: Exception) {
+                    Log.w(TAG, "accept dial to ${req.id} failed", e)
+                } finally {
+                    presenceDialing.remove(req.id)
+                }
+            }
+        }
         announceOnline()
     }
 
@@ -786,7 +872,14 @@ object DirectChatManager {
         // show the message locally right away (pending until delivered)
         appendMessage(peerId, msg)
         if (s != null) {
-            s.sendQueue.put(NetworkPacket(type = "chat", message = msg))
+            // a dead socket must not swallow the message: park it as pending
+            // again and let the redial loop re-deliver (the receiver dedups
+            // by id, so an uncertain send is safe)
+            putSend(
+                s,
+                NetworkPacket(type = "chat", message = msg),
+                onFailed = { restoreUndelivered(peerId, listOf(msg)) }
+            )
         } else if (contact != null) {
             enqueuePending(peerId, contact, msg)
         }
@@ -937,8 +1030,10 @@ object DirectChatManager {
         }
     }
 
-    /** Deliver every queued message for [peerId] over [s], in order, then
-     * flip each one's local state to delivered. */
+    /** Deliver every queued message for [peerId] over [s], in order. Each
+     *  message only flips to delivered (pending=false) once its line is
+     *  actually WRITTEN; a write failure parks it back in the outbox as
+     *  pending (at-least-once delivery — the receiver dedups by id). */
     private fun flushOutbox(peerId: String, s: Session) {
         val q = outbox[peerId] ?: return
         val toSend: List<ChatMessage>
@@ -948,9 +1043,35 @@ object DirectChatManager {
             q.clear()
         }
         for (msg in toSend) {
-            s.sendQueue.put(NetworkPacket(type = "chat", message = msg))
-            markPendingDelivered(peerId, msg.id)
+            putSend(
+                s,
+                NetworkPacket(type = "chat", message = msg),
+                onSent = { markPendingDelivered(peerId, msg.id) },
+                onFailed = { restoreUndelivered(peerId, listOf(msg)) }
+            )
         }
+    }
+
+    /** Put messages whose send FAILED back into the outbox as pending: they
+     *  re-deliver on the next session (ours via the redial loop, or the peer
+     *  dialing us). Re-inserted in call order, so overall FIFO order is
+     *  preserved; the receiver's id dedup absorbs any re-send. */
+    private fun restoreUndelivered(peerId: String, msgs: List<ChatMessage>) {
+        val q = outbox.getOrPut(peerId) { mutableListOf() }
+        val restored: List<ChatMessage>
+        synchronized(q) {
+            val ids = q.mapTo(HashSet()) { it.id }
+            restored = msgs.filter { it.id !in ids }
+            if (restored.isEmpty()) return
+            q.addAll(restored)
+        }
+        for (m in restored) {
+            messageStates[peerId]?.update { list ->
+                list.map { if (it.id == m.id) it.copy(pending = true) else it }
+            }
+        }
+        refreshLastMessage(peerId)
+        ensureRedialLoop(peerId)
     }
 
     private fun markPendingDelivered(peerId: String, messageId: String) {
@@ -1046,9 +1167,13 @@ object DirectChatManager {
         uri: Uri,
         fileSize: Long
     ): Boolean {
+        // receivers use the advertised name as their default save name: strip
+        // path separators and ".." so a crafted offer cannot traverse out of
+        // the directory the user picked (same rule as the group path)
+        val safeName = P2PManager.sanitizeFileName(fileName)
         // same rule as message content: the receiver drops an invalid file
         // name silently, so reject it on the sending side
-        if (!P2PManager.isValidContent(fileName)) return false
+        if (!P2PManager.isValidContent(safeName)) return false
         if (fileSize > FileTransfer.MAX_DOWNLOAD_BYTES) return false
         val s = sessions[peerId] ?: return false
         val fileId = UUID.randomUUID().toString()
@@ -1066,11 +1191,11 @@ object DirectChatManager {
         // myPeer()): myIp was set at app start and may be stale after a
         // network change, which would make the download host unreachable
         val advertised = P2PManager.getLocalIpAddress().ifBlank { myIp }
-        val fileInfo = FileInfo(fileId, fileName, fileSize, advertised, port, Crypto.toB64(fileKey))
+        val fileInfo = FileInfo(fileId, safeName, fileSize, advertised, port, Crypto.toB64(fileKey))
         fileServers[fileId] = server
         val msg = ChatMessage(
             id = fileId,
-            content = fileName,
+            content = safeName,
             timestamp = System.currentTimeMillis(),
             senderId = myId,
             senderName = myName,
@@ -1078,13 +1203,24 @@ object DirectChatManager {
             isFromMe = true
         )
         appendMessage(peerId, msg)
-        s.sendQueue.put(NetworkPacket(type = "file_message", message = msg))
+        putSend(
+            s,
+            NetworkPacket(type = "file_message", message = msg),
+            onFailed = {
+                // the offer never made it onto the wire: close its download
+                // server and remove the local bubble so the UI cannot claim
+                // it was delivered
+                fileServers.remove(fileId)?.let { runCatching { it.close() } }
+                removeMessage(peerId, fileId)
+                _events.tryEmit("文件发送失败，请重试")
+            }
+        )
         FileTransfer.runServer(
             fileId = fileId,
             server = server,
             resolver = resolver,
             uri = uri,
-            fileName = fileName,
+            fileName = safeName,
             fileSize = fileSize,
             fileKey = fileKey,
             isActive = { fileServers[fileId] === server },
@@ -1094,9 +1230,17 @@ object DirectChatManager {
     }
 
     /** Download a file offered via [fileInfo] into [out]. Blocking; call from
-     *  a background thread. */
-    fun downloadFile(fileInfo: FileInfo, out: OutputStream): FileTransfer.DownloadResult =
-        FileTransfer.download(fileInfo, out)
+     *  a background thread. Progress/cancel ride through [FileTransfer]; the
+     *  opened socket is appended to [sockHolder] so the canceller can shut a
+     *  blocked read down immediately. */
+    fun downloadFile(
+        fileInfo: FileInfo,
+        out: OutputStream,
+        onProgress: (Long, Long) -> Unit = { _, _ -> },
+        cancelled: () -> Boolean = { false },
+        sockHolder: MutableList<java.net.Socket>? = null
+    ): FileTransfer.DownloadResult =
+        FileTransfer.download(fileInfo, out, onProgress, cancelled, sockHolder)
 
     /** Delete a message in a direct chat: the sender broadcasts it, everyone
      *  (including the sender) removes it locally. A still-queued (pending)
@@ -1108,7 +1252,8 @@ object DirectChatManager {
                 synchronized(q) { q.removeAll { it.id == messageId } }
             } == true
             if (s != null && !wasPending) {
-                s.sendQueue.put(
+                putSend(
+                    s,
                     NetworkPacket(type = "delete_message", messageId = messageId, senderId = myId)
                 )
             }
@@ -1226,7 +1371,11 @@ object DirectChatManager {
             while (s.alive && !s.socket.isClosed) {
                 Thread.sleep(PING_INTERVAL_MS)
                 if (!s.alive) break
-                runCatching { s.wire.sendPacket(NetworkPacket(type = "ping")) }
+                try {
+                    s.wire.sendPacket(NetworkPacket(type = "ping"))
+                } catch (_: Exception) {
+                    break // write failed: the session is dead, the read loop tears it down
+                }
             }
         } catch (e: InterruptedException) {
             // closing

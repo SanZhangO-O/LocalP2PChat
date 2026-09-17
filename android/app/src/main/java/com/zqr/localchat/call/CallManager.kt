@@ -92,6 +92,11 @@ object CallManager {
      *  GCM nonce and tag [Crypto.aesGcmEncrypt] prepends/appends per frame. */
     private const val MAX_FRAME_WIRE_LEN =
         MAX_FRAME_LEN + Crypto.GCM_NONCE_LEN + Crypto.GCM_TAG_BITS / 8
+    // Seen GCM nonces kept per media connection (raw 12 bytes, LRU, oldest
+    // evicted) so a frame replayed inside the same connection is dropped like
+    // tampered data (parity with the Windows MEDIA_NONCE_CACHE; the wire
+    // format itself stays unchanged).
+    private const val MEDIA_NONCE_CACHE = 4096
     private const val VIDEO_MAX_EDGE = 640
     private const val VIDEO_JPEG_QUALITY = 70
 
@@ -494,7 +499,11 @@ object CallManager {
                 if (!startEnginesSafe()) {
                     // the media socket already connected; end the call with a
                     // clear message instead of blaming the firewall/network
-                    endCall("通话组件启动失败，请重试", isError = true)
+                    endCall(
+                        "通话组件启动失败，请重试",
+                        isError = true,
+                        scopeCallId = currentCallId
+                    )
                     return@Thread
                 }
                 // startReadLoop spawns its own thread and returns immediately:
@@ -502,32 +511,38 @@ object CallManager {
                 // only closed here when the call never took ownership of it
                 // (connect failed / no handoff) — endCall/hangup close it
                 // otherwise.
-                startReadLoop(s)
+                startReadLoop(s, currentCallId)
             } catch (e: Exception) {
                 Log.w(TAG, "media connect failed", e)
-                val ch = channel
-                if (ch != null) {
-                    val call = CallInfo(
-                        callId = currentCallId,
-                        callerId = peerId,
-                        callerName = peerName,
-                        calleeId = myCallerId
-                    )
-                    ch.send(
-                        peerId,
-                        NetworkPacket(
-                            type = "call_failed",
-                            call = call,
-                            errorMessage = "无法连接媒体通道"
+                // Late failure from a PREVIOUS call: drop it — it must neither
+                // answer with call_failed for the current call nor end it
+                // (parity with the Windows _on_connect_failed callId filter).
+                if (isCurrentCall(currentCallId)) {
+                    val ch = channel
+                    if (ch != null) {
+                        val call = CallInfo(
+                            callId = currentCallId,
+                            callerId = peerId,
+                            callerName = peerName,
+                            calleeId = myCallerId
                         )
+                        ch.send(
+                            peerId,
+                            NetworkPacket(
+                                type = "call_failed",
+                                call = call,
+                                errorMessage = "无法连接媒体通道"
+                            )
+                        )
+                    }
+                    // Include the exact target so the user can tell a firewall drop
+                    // (timeout) apart from a wrong/unreachable address.
+                    endCall(
+                        "无法连接媒体通道（$targetIp:$targetPort）。请检查创建者电脑的防火墙，或确认两台设备在同一网络",
+                        isError = true,
+                        scopeCallId = currentCallId
                     )
                 }
-                // Include the exact target so the user can tell a firewall drop
-                // (timeout) apart from a wrong/unreachable address.
-                endCall(
-                    "无法连接媒体通道（$targetIp:$targetPort）。请检查创建者电脑的防火墙，或确认两台设备在同一网络",
-                    isError = true
-                )
             } finally {
                 if (!handedOff) {
                     runCatching { sock?.close() }
@@ -648,7 +663,10 @@ object CallManager {
                 }
             } else null
             if (secured == null) {
-                endCall("安全握手失败，通话已结束", isError = true)
+                // Scoped to THIS call: a late handshake failure from a previous
+                // call's thread must not end the current one — the stale socket
+                // is closed by the finally below instead.
+                endCall("安全握手失败，通话已结束", isError = true, scopeCallId = currentCallId)
                 return
             }
             mediaKey = wire.sessionKey
@@ -659,7 +677,7 @@ object CallManager {
                   helloCall.callerId != myCallerId ||
                   helloCall.calleeId != peerId
               ) {
-                  endCall("媒体通道校验失败，通话已结束", isError = true)
+                  endCall("媒体通道校验失败，通话已结束", isError = true, scopeCallId = currentCallId)
                   return
               }
               // Deferred TOFU binding: acceptDirect ran with remember=false, so
@@ -687,18 +705,24 @@ object CallManager {
             }
             handedOff = true
             if (!startEnginesSafe()) {
-                endCall("通话组件启动失败，请重试", isError = true)
+                endCall("通话组件启动失败，请重试", isError = true, scopeCallId = currentCallId)
                 return
             }
-            startReadLoop(sock)
+            startReadLoop(sock, currentCallId)
         } catch (e: java.net.SocketTimeoutException) {
-            synchronized(lock) {
-                if (_state.value is CallState.Outgoing) {
+            // Ring timeout belongs to THIS call: a late timeout from a
+            // previous ring (cancelled, or replaced by a new call) must not
+            // hang up the current one (Windows _on_ring_timeout callId filter).
+            val timedOut: Boolean = synchronized(lock) {
+                if (_state.value is CallState.Outgoing && liveCallId() == currentCallId) {
                     sendCallPacket("call_hangup", currentCallId)
                     reset()
+                    true
+                } else {
+                    false
                 }
             }
-            _events.tryEmit("对方未接听")
+            if (timedOut) _events.tryEmit("对方未接听")
         } catch (e: Exception) {
             // server closed (call cancelled)
         } finally {
@@ -711,11 +735,29 @@ object CallManager {
         }
     }
 
-    private fun endCall(reason: String, isError: Boolean = false) {
+    /** callId of the live call, or null when idle. */
+    private fun liveCallId(): String? {
+        val cur = _state.value
+        return (cur as? CallState.Outgoing)?.callId
+            ?: (cur as? CallState.Incoming)?.callId
+            ?: (cur as? CallState.Active)?.callId
+    }
+
+    /** True when the live call is still [scopeCallId] (not ended/replaced):
+     *  gates side effects of a late thread from a previous call. */
+    private fun isCurrentCall(scopeCallId: String): Boolean =
+        synchronized(lock) { liveCallId() == scopeCallId }
+
+    private fun endCall(reason: String, isError: Boolean = false, scopeCallId: String? = null) {
         val srv: ServerSocket?
         val sock: Socket?
         synchronized(lock) {
             if (_state.value is CallState.Idle) return
+            // A late failure/ended belonging to a PREVIOUS call (its thread
+            // finished after the call ended or was replaced) is dropped here:
+            // never tear down the current call (parity with the Windows
+            // _on_media_ended/_on_connect_failed callId filter).
+            if (scopeCallId != null && liveCallId() != scopeCallId) return
             srv = mediaServer
             sock = mediaSocket
             reset()
@@ -902,6 +944,10 @@ object CallManager {
      *  Must be called with [lock] held so the isAlive guard is atomic. */
     private fun startSender() {
         if (senderThread?.isAlive == true) return
+        // Call scope captured under the caller-held lock: a late write failure
+        // from this thread after the call ended/replaced must not end the
+        // current call.
+        val scope = liveCallId()
         senderThread = Thread {
             try {
                 while (running) {
@@ -916,7 +962,7 @@ object CallManager {
             } catch (e: InterruptedException) {
                 // shutting down
             } catch (e: Exception) {
-                endCall("连接已断开")
+                endCall("连接已断开", scopeCallId = scope)
             }
         }.apply {
             isDaemon = true
@@ -963,9 +1009,11 @@ object CallManager {
         }
     }
 
-    private fun startReadLoop(sock: Socket) {
+    private fun startReadLoop(sock: Socket, scopeCallId: String) {
         Thread {
             var reason = "对方已挂断"
+            // One guard per media connection (this loop runs once per socket).
+            val nonces = NonceLru()
             try {
                 sock.soTimeout = MEDIA_READ_TIMEOUT_MS
                 val input = sock.getInputStream()
@@ -979,6 +1027,12 @@ object CallManager {
                     if (length < Crypto.GCM_NONCE_LEN + 16 || length > MAX_FRAME_WIRE_LEN) break
                     val blob = readExact(input, length) ?: break
                     val key = mediaKey ?: break
+                    // A nonce already used on this connection means the frame
+                    // is a replay — treat it exactly like tampered data.
+                    if (nonces.isReplay(blob)) {
+                        Log.w(TAG, "media frame nonce replay detected, dropping the connection")
+                        break
+                    }
                     val payload = try {
                         Crypto.aesGcmDecrypt(key, blob)
                     } catch (e: Exception) {
@@ -1002,7 +1056,10 @@ object CallManager {
             } catch (e: Exception) {
                 Log.w(TAG, "media read loop ended", e)
             } finally {
-                endCall(reason)
+                // Scoped: a late end from a PREVIOUS call (this loop outlived
+                // the call and it was replaced) must not tear down the current
+                // one (Windows _on_media_ended callId filter).
+                endCall(reason, scopeCallId = scopeCallId)
             }
         }.start()
     }
@@ -1020,6 +1077,32 @@ object CallManager {
             read += got
         }
         return buf
+    }
+
+    /** LRU set of the raw GCM nonces seen on ONE media connection (capacity
+     *  [MEDIA_NONCE_CACHE], oldest evicted) — Android parity of the Windows
+     *  NonceReplayGuard: the media key is derived per handshake, so a
+     *  cross-connection replay already fails GCM authentication; this guard
+     *  catches a replay WITHIN the live connection. Keys are hex strings
+     *  because ByteArray equality is identity-based. */
+    class NonceLru(private val capacity: Int = MEDIA_NONCE_CACHE) {
+        private val seen = object : LinkedHashMap<String, Unit>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Unit>): Boolean =
+                size > capacity
+        }
+
+        /** Record the leading nonce of [blob]; true when already seen. */
+        fun isReplay(blob: ByteArray): Boolean {
+            val sb = StringBuilder(Crypto.GCM_NONCE_LEN * 2)
+            for (i in 0 until Crypto.GCM_NONCE_LEN) {
+                val v = blob[i].toInt() and 0xFF
+                sb.append("0123456789abcdef"[v ushr 4])
+                sb.append("0123456789abcdef"[v and 0x0F])
+            }
+            // put is an access in this access-ordered map: a hit is refreshed
+            // to most-recent, mirroring the Windows move_to_end.
+            return seen.put(sb.toString(), Unit) != null
+        }
     }
 
     // -------------------------------------------------------------- engines

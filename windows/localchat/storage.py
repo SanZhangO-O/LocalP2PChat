@@ -39,6 +39,10 @@ class SavedMessage:
 
 
 class ChatStore:
+    # Delete tombstones kept per group: enough for convergence after a short
+    # offline period without growing the table forever.
+    TOMBSTONE_CAP = 200
+
     def __init__(self, db_path: str):
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -93,7 +97,19 @@ class ChatStore:
             self._migrate_saved_messages(c)
             c.execute("CREATE INDEX IF NOT EXISTS idx_msgs_group ON saved_messages(groupId)")
             c.execute(
-                "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                """
+                CREATE TABLE IF NOT EXISTS deleted_messages (
+                    group_id TEXT NOT NULL,
+                    msg_id TEXT NOT NULL,
+                    deleted_at INTEGER NOT NULL,
+                    PRIMARY KEY (group_id, msg_id)
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)
+                """
             )
             self._conn.commit()
 
@@ -352,6 +368,7 @@ class ChatStore:
     def delete_group(self, group_id: str) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM saved_messages WHERE groupId = ?", (group_id,))
+            self._conn.execute("DELETE FROM deleted_messages WHERE group_id = ?", (group_id,))
             self._conn.execute("DELETE FROM saved_groups WHERE groupId = ?", (group_id,))
             self._conn.commit()
 
@@ -365,6 +382,42 @@ class ChatStore:
                 (group_id, message_id),
             )
             self._conn.commit()
+
+    def record_deleted_messages(
+        self, group_id: str, msg_ids, deleted_at: Optional[int] = None
+    ) -> None:
+        """Persist delete tombstones for [group_id]: a member that was offline
+        during a delete replays them on rejoin (join_ack / history_reply
+        deletedIds) so deleted messages converge instead of resurrecting.
+        Only the newest TOMBSTONE_CAP ids per group are kept (by deleted_at)."""
+        ids = [str(i) for i in dict.fromkeys(msg_ids or []) if i]
+        if not ids:
+            return
+        ts = int(time.time() * 1000) if deleted_at is None else int(deleted_at)
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO deleted_messages (group_id, msg_id, deleted_at) VALUES (?, ?, ?)",
+                [(group_id, i, ts) for i in ids],
+            )
+            self._conn.execute(
+                """
+                DELETE FROM deleted_messages
+                WHERE group_id = ? AND msg_id NOT IN (
+                    SELECT msg_id FROM deleted_messages WHERE group_id = ?
+                    ORDER BY deleted_at DESC LIMIT ?
+                )
+                """,
+                (group_id, group_id, self.TOMBSTONE_CAP),
+            )
+            self._conn.commit()
+
+    def get_deleted_ids(self, group_id: str) -> List[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT msg_id FROM deleted_messages WHERE group_id = ? ORDER BY deleted_at DESC",
+                (group_id,),
+            ).fetchall()
+        return [r["msg_id"] for r in rows]
 
     def get_setting(self, key: str, default: str = "") -> str:
         with self._lock:

@@ -23,6 +23,12 @@ data class NetworkPacket(
     val message: ChatMessage? = null,
     val messages: List<ChatMessage>? = null,
     val messageId: String? = null,
+    /** Tombstoned message ids carried by a host's join_ack and a mesh
+     *  history_reply (offline-member delete convergence): the receiver
+     *  removes these messages locally and records tombstones, but never
+     *  rebroadcasts (the sender already told everyone). Null is omitted on
+     *  the wire (encodeDefaults=false); old peers ignore the unknown field. */
+    val deletedIds: List<String>? = null,
     val groupInfo: GroupInfo? = null,
     val senderId: String? = null,
     val errorMessage: String? = null,
@@ -43,5 +49,10 @@ data class NetworkPacket(
     /** Handshake: Base64 HMAC confirmation (password modes). */
     val mac: String? = null,
     /** Handshake: Base64 ECDSA signature over the transcript (direct mode). */
-    val sig: String? = null
+    val sig: String? = null,
+    /** file_download request: Base64(HMAC-SHA256(fileKey, "lc-file-dl-v1:"
+     *  + fileId)) — proves the downloader knows the per-file key (see
+     *  [FileTransfer.downloadToken]). Null is omitted on the wire; old
+     *  senders tolerate (ignore) the unknown field. */
+    val token: String? = null
 )

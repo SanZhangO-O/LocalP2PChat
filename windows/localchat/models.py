@@ -252,6 +252,10 @@ class NetworkPacket:
     # The group's host (creator), returned by a member-sponsored join so the
     # newcomer can connect to the host for the relay path.
     host: Optional[Peer] = None
+    # Delete tombstones (message ids deleted while the receiver was away),
+    # attached to join_ack / history_reply for convergence. Optional: omitted
+    # from the wire entirely when empty (byte-compat with older peers).
+    deleted_ids: Optional[List[str]] = None
     # Handshake: which kind of secured connection is being set up
     # (query/join/mesh/direct).
     hs_mode: Optional[str] = None
@@ -263,6 +267,10 @@ class NetworkPacket:
     mac: Optional[str] = None
     # Handshake: Base64 ECDSA signature over the transcript (direct mode).
     sig: Optional[str] = None
+    # file_download request only: Base64(HMAC-SHA256(fileKey,
+    # "lc-file-dl-v1:" + fileId)) — the downloader proves it received the
+    # (encrypted) offer. Optional: omitted by older peers, tolerated here.
+    token: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
@@ -294,6 +302,8 @@ class NetworkPacket:
             d["call"] = self.call.to_dict()
         if self.host is not None:
             d["host"] = self.host.to_dict()
+        if self.deleted_ids:
+            d["deletedIds"] = list(self.deleted_ids)
         if self.hs_mode is not None:
             d["hsMode"] = self.hs_mode
         if self.eph is not None:
@@ -304,6 +314,8 @@ class NetworkPacket:
             d["mac"] = self.mac
         if self.sig is not None:
             d["sig"] = self.sig
+        if self.token is not None:
+            d["token"] = self.token
         return d
 
     def to_json(self) -> str:
@@ -345,6 +357,13 @@ class NetworkPacket:
             pkt.call = CallInfo.from_dict(d["call"])
         if d.get("host") is not None:
             pkt.host = Peer.from_dict(d["host"])
+        if d.get("deletedIds") is not None:
+            raw = d["deletedIds"]
+            # a list is the only valid shape (the Kotlin side declares
+            # List<String>?): a malformed scalar/string must not be iterated
+            # into single-character ids
+            if isinstance(raw, (list, tuple)):
+                pkt.deleted_ids = [str(i) for i in raw]
         if d.get("hsMode") is not None:
             pkt.hs_mode = str(d["hsMode"])
         if d.get("eph") is not None:
@@ -355,6 +374,8 @@ class NetworkPacket:
             pkt.mac = str(d["mac"])
         if d.get("sig") is not None:
             pkt.sig = str(d["sig"])
+        if d.get("token") is not None:
+            pkt.token = str(d["token"])
         if pkt_type == "error" and pkt.error_message is None:
             raise ValueError("error packet missing required field: errorMessage")
         if pkt_type == "chat" and pkt.message is None:

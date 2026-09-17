@@ -5,10 +5,18 @@ import android.util.Log
 import com.zqr.localchat.crypto.Crypto
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import java.io.BufferedReader
 import java.io.InputStream
 import java.io.PrintWriter
 import java.security.KeyPair
+import java.security.KeyStore
+import java.util.LinkedHashMap
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 /**
  * Wire-protocol security layer.
@@ -116,6 +124,17 @@ class Wire(val lineIn: LineIn, val writer: PrintWriter) {
     @Volatile
     private var key: ByteArray? = null
 
+    /** Nonce replay guard: raw 12-byte nonces already seen on THIS
+     *  connection, insertion-ordered, oldest evicted past
+     *  [NONCE_CACHE_CAPACITY]. AES-GCM forbids nonce reuse, so a repeated
+     *  nonce on one connection is a replay (or a broken peer) — the line is
+     *  rejected before decryption and the connection treated as dead,
+     *  exactly like a decrypt failure. */
+    private val seenNonces = object : LinkedHashMap<String, Boolean>(1024, 0.75f, false) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>): Boolean =
+            size > NONCE_CACHE_CAPACITY
+    }
+
     fun activate(sessionKey: ByteArray) {
         key = sessionKey
     }
@@ -142,6 +161,15 @@ class Wire(val lineIn: LineIn, val writer: PrintWriter) {
         if (line.isEmpty()) return null
         val k = key ?: throw WireException("wire not secured yet")
         val blob = Crypto.fromB64(line) ?: throw WireException("malformed encrypted line")
+        if (blob.size > Crypto.GCM_NONCE_LEN) {
+            val nonce = Crypto.hex(blob.copyOfRange(0, Crypto.GCM_NONCE_LEN))
+            synchronized(seenNonces) {
+                if (seenNonces.put(nonce, true) != null) {
+                    Log.w(TAG, "replayed nonce rejected, dropping connection")
+                    throw WireException("replayed nonce (possible replay attack)")
+                }
+            }
+        }
         val plain = try {
             Crypto.aesGcmDecrypt(k, blob)
         } catch (e: Exception) {
@@ -154,6 +182,7 @@ class Wire(val lineIn: LineIn, val writer: PrintWriter) {
     // ---- handshake-phase plaintext IO (never used once activate() ran) ----
 
     fun sendRaw(packet: NetworkPacket) {
+        check(key == null) { "wire already secured: plaintext raw send is forbidden" }
         writer.println(wireJson.encodeToString(packet))
         writer.flush()
     }
@@ -163,11 +192,18 @@ class Wire(val lineIn: LineIn, val writer: PrintWriter) {
     }
 
     fun recvRaw(): NetworkPacket? {
+        check(key == null) { "wire already secured: plaintext raw receive is forbidden" }
         val line = lineIn.readLine() ?: return null
         return runCatching { wireJson.decodeFromString<NetworkPacket>(line) }.getOrNull()
     }
 
     companion object {
+        private const val TAG = "Wire"
+
+        /** Replay-window size per connection: comfortably above any plausible
+         *  in-flight packet count, small enough that memory stays trivial. */
+        private const val NONCE_CACHE_CAPACITY = 4096
+
         private val wireJson = Json { ignoreUnknownKeys = true }
     }
 }
@@ -228,10 +264,11 @@ object Handshake {
         val ok = wire.recvRaw() ?: throw WireException("对方无响应")
         if (ok.type == Protocol.HS_REJECT) throw WireException(ok.errorMessage ?: "连接被拒绝")
         if (ok.type != Protocol.HS_OK || ok.mac.isNullOrBlank()) throw WireException("握手确认无效")
-        val expected = Crypto.toB64(
-            Crypto.hmacSha256(pwKey, "lc-server|$transcript".toByteArray(Charsets.UTF_8))
-        )
-        if (ok.mac != expected) throw WireException("对方密码验证失败")
+        val expected = Crypto.hmacSha256(pwKey, "lc-server|$transcript".toByteArray(Charsets.UTF_8))
+        val provided = Crypto.fromB64(ok.mac!!)
+        if (provided == null || !Crypto.constantTimeEquals(provided, expected)) {
+            throw WireException("对方密码验证失败")
+        }
         wire.activate(
             Crypto.hkdfSha256(shared + pwKey, salt, INFO_SESSION.toByteArray(), Crypto.KEY_LEN)
         )
@@ -415,8 +452,12 @@ object Handshake {
 /**
  * Long-term device identity (EC P-256) for direct chats and call media.
  * Generated once, stored app-privately (SharedPreferences, Base64). The
- * private key never leaves the app sandbox; hardware-backed AndroidKeyStore
- * KeyAgreement needs API 31+, so plain JCE keys are the portable choice.
+ * private key is stored WRAPPED under an AES-256-GCM key generated in the
+ * hardware AndroidKeyStore (alias [WRAP_ALIAS], value format
+ * "enc1:" + Base64(iv || ciphertext)), so the plaintext key material never
+ * sits in storage. A legacy plaintext value found on first read is wrapped
+ * in place (migration). When the KeyStore is unusable on a device, storage
+ * falls back to plaintext with a logged warning — identity must still load.
  *
  * TOFU: the first handshake with a peer remembers its identity key; a later
  * change aborts the connection (possible MITM). [fingerprint] gives the user
@@ -424,15 +465,92 @@ object Handshake {
  */
 object DeviceIdentity {
 
+    private const val TAG = "DeviceIdentity"
     private const val PREFS = "localchat_identity"
     private const val KEY_PRIV = "identity_private"
     private const val KEY_PUB = "identity_public"
     private const val KEY_PEER_PREFIX = "peer_ident_"
 
+    /** AndroidKeyStore alias of the AES-256-GCM key that wraps the private
+     *  identity key. Non-exportable; lives in the device keystore. */
+    private const val WRAP_ALIAS = "localchat_identity_wrap"
+
+    /** Marks a wrapped [KEY_PRIV] value ("enc1:" + Base64(iv || ct)); values
+     *  without it are legacy plaintext and get migrated on first read. */
+    private const val WRAP_PREFIX = "enc1:"
+
     @Volatile
     var current: KeyPair? = null
 
     private var appContext: Context? = null
+
+    /** The AndroidKeyStore AES wrapping key, created on first use. Null when
+     *  the keystore is unavailable — callers fall back to plaintext storage
+     *  (already logged inside). */
+    private fun wrapKey(): SecretKey? = try {
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (ks.getKey(WRAP_ALIAS, null) as? SecretKey) ?: run {
+            val generator = KeyGenerator.getInstance("AES", "AndroidKeyStore")
+            generator.init(
+                KeyGenParameterSpec.Builder(
+                    WRAP_ALIAS,
+                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                )
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .setKeySize(256)
+                    .build()
+            )
+            generator.generateKey()
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "AndroidKeyStore unavailable: identity key will be stored in plaintext", e)
+        null
+    }
+
+    /** Wrap a Base64 private key as "enc1:" + Base64(iv || ciphertext);
+     *  null when wrapping is impossible (plaintext fallback). */
+    private fun wrapPrivateKey(privB64: String): String? {
+        val key = wrapKey() ?: return null
+        return try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, key)
+            val encrypted = cipher.doFinal(privB64.toByteArray(Charsets.UTF_8))
+            WRAP_PREFIX + Crypto.toB64(cipher.iv + encrypted)
+        } catch (e: Exception) {
+            Log.w(TAG, "identity key wrap failed: key will be stored in plaintext", e)
+            null
+        }
+    }
+
+    /** Persisted form of the private key: wrapped under the AndroidKeyStore
+     *  key when possible, otherwise plaintext Base64 (fallback, logged). */
+    private fun storePrivateKey(privB64: String): String =
+        wrapPrivateKey(privB64) ?: privB64
+
+    /** Unwrap a stored [KEY_PRIV] value; legacy plaintext values pass through
+     *  unchanged (they are migrated by the caller). Returns null when the
+     *  wrapped value cannot be decrypted (keystore key lost etc.). */
+    private fun unwrapPrivateKey(stored: String): String? {
+        if (!stored.startsWith(WRAP_PREFIX)) return stored
+        return try {
+            val key = wrapKey() ?: return null
+            val blob = Crypto.fromB64(stored.removePrefix(WRAP_PREFIX))
+                ?: return null
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE, key,
+                GCMParameterSpec(Crypto.GCM_TAG_BITS, blob, 0, Crypto.GCM_NONCE_LEN)
+            )
+            String(
+                cipher.doFinal(blob, Crypto.GCM_NONCE_LEN, blob.size - Crypto.GCM_NONCE_LEN),
+                Charsets.UTF_8
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "stored identity unwrap failed, regenerating", e)
+            null
+        }
+    }
 
     /** Load (or generate once) the device identity. Call at app start. */
     fun ensureLoaded(context: Context): KeyPair {
@@ -442,20 +560,32 @@ object DeviceIdentity {
             appContext = context.applicationContext
             val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val pub = prefs.getString(KEY_PUB, null)
-            val priv = prefs.getString(KEY_PRIV, null)
+            val stored = prefs.getString(KEY_PRIV, null)
+            val priv = stored?.let { unwrapPrivateKey(it) }
             val pair = if (pub != null && priv != null) {
                 try {
                     KeyPair(Crypto.decodePub(pub), Crypto.decodePriv(priv))
                 } catch (e: Exception) {
-                    Log.w("DeviceIdentity", "stored identity unreadable, regenerating", e)
+                    Log.w(TAG, "stored identity unreadable, regenerating", e)
                     null
                 }
             } else null
-            val result = pair ?: Crypto.generateEcKeyPair().also {
-                prefs.edit()
-                    .putString(KEY_PUB, Crypto.encodePub(it.public))
-                    .putString(KEY_PRIV, Crypto.encodePriv(it.private))
-                    .apply()
+            val result = if (pair != null) {
+                // legacy plaintext private key on first read: wrap it in
+                // place, replacing (removing) the plaintext value
+                if (stored != null && !stored.startsWith(WRAP_PREFIX)) {
+                    wrapPrivateKey(priv!!)?.let { wrapped ->
+                        prefs.edit().putString(KEY_PRIV, wrapped).apply()
+                    }
+                }
+                pair
+            } else {
+                Crypto.generateEcKeyPair().also {
+                    prefs.edit()
+                        .putString(KEY_PUB, Crypto.encodePub(it.public))
+                        .putString(KEY_PRIV, storePrivateKey(Crypto.encodePriv(it.private)))
+                        .apply()
+                }
             }
             current = result
             return result

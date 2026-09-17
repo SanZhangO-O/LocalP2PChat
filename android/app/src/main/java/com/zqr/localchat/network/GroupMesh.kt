@@ -80,11 +80,19 @@ object GroupMeshManager {
     @Volatile
     var onGroupMessage: ((String, List<ChatMessage>) -> Unit)? = null
 
-    /** A mesh-received delete: (groupId, messageId, senderId). The ViewModel
-     *  removes the message from the owning group's list so mesh deletes stay
-     *  in sync with the relay/history path. Called on mesh worker threads. */
+    /** A mesh-received delete: (groupId, messageId, senderId), or senderId
+     *  = null for a tombstone-synced delete (a peer's history_reply
+     *  deletedIds — trusted, no author to validate). The ViewModel removes
+     *  the message from the owning group's list so mesh deletes stay in sync
+     *  with the relay/history path. Called on mesh worker threads. */
     @Volatile
-    var onGroupDelete: ((String, String, String) -> Unit)? = null
+    var onGroupDelete: ((String, String, String?) -> Unit)? = null
+
+    /** Tombstoned message ids per group (offline-member delete convergence),
+     *  carried by history_reply so a member that was offline drops what it
+     *  missed. Set by the ViewModel (owns the database); empty when none. */
+    @Volatile
+    var deletedIdsProvider: ((groupId: String) -> List<String>)? = null
 
     // ------------------------------------------------------------ lifecycle
 
@@ -174,10 +182,16 @@ object GroupMeshManager {
     }
 
     /** Tell every linked member that a message was deleted (host-offline
-     *  path) so deletes converge even when the host relay is unreachable. */
+     *  path) so deletes converge even when the host relay is unreachable.
+     *  The sender removes the message from its OWN mesh history too: a later
+     *  history_reply (a peer reconnecting) must not resurrect it — same
+     *  removal as the receiving side in [handleDeleteIncoming]. */
     fun broadcastDelete(groupId: String, messageId: String) {
         val state = groups[groupId] ?: return
         val myId = state.myPeer?.id ?: return
+        synchronized(state) {
+            state.messages.value = state.messages.value.filterNot { it.id == messageId }
+        }
         val packet = NetworkPacket(type = "delete_message", messageId = messageId, senderId = myId)
         val links = state.links.values.toList()
         thread(name = "mesh-delete") {
@@ -237,6 +251,23 @@ object GroupMeshManager {
             estimated += size
         }
         flush()
+        sendDeletedIds(wire, groupId)
+    }
+
+    /** Offline-member delete convergence: a dedicated small packet carries
+     *  the group's tombstoned ids (up to the cap — attaching them to a
+     *  history batch could overflow its size budget). Sent after the batches
+     *  and also when the history is empty (everything the peer missed may
+     *  have been deleted while it was away). The receiver cleans up locally
+     *  and never rebroadcasts (loop prevention). */
+    private fun sendDeletedIds(wire: Wire, groupId: String) {
+        val deletedIds = deletedIdsProvider?.invoke(groupId).orEmpty()
+        if (deletedIds.isEmpty()) return
+        runCatching {
+            wire.sendPacket(NetworkPacket(type = "history_reply", groupId = groupId, deletedIds = deletedIds))
+        }.onFailure { e ->
+            Log.w(TAG, "history deletedIds send to $groupId failed (link likely dead)", e)
+        }
     }
 
     // ------------------------------------------------------------- listeners
@@ -435,6 +466,14 @@ object GroupMeshManager {
                     "history_reply" -> {
                         val incoming = packet.messages.orEmpty().map { P2PManager.markFromMe(it, state.myPeer?.id ?: "") }
                         handleIncoming(state, incoming)
+                        // tombstone sync: drop messages deleted while this
+                        // member was offline (no author check — the link's
+                        // password-bound handshake proved group membership).
+                        // Sanitized first: one packet cannot make us do
+                        // unbounded work or mint tombstones for junk ids.
+                        P2PManager.sanitizeDeletedIds(packet.deletedIds).forEach { id ->
+                            applyPeerDelete(state, id)
+                        }
                     }
                     "mesh_announce" -> packet.peer?.let { peer ->
                         addPeer(state.groupId, peer)
@@ -474,6 +513,26 @@ object GroupMeshManager {
         if (cb != null) {
             try {
                 cb(state.groupId, messageId, senderId)
+            } catch (e: Exception) {
+                Log.w(TAG, "onGroupDelete failed", e)
+            }
+        }
+    }
+
+    /** Apply a delete learned from a peer's tombstone sync (history_reply
+     *  deletedIds): remove the message from the mesh state and forward to the
+     *  ViewModel (list + database + tombstone) via [onGroupDelete] with a
+     *  null sender — trusted cleanup, no author validation. */
+    private fun applyPeerDelete(state: GroupState, messageId: String) {
+        synchronized(state) {
+            val current = state.messages.value
+            if (current.none { it.id == messageId }) return
+            state.messages.value = current.filterNot { it.id == messageId }
+        }
+        val cb = onGroupDelete
+        if (cb != null) {
+            try {
+                cb(state.groupId, messageId, null)
             } catch (e: Exception) {
                 Log.w(TAG, "onGroupDelete failed", e)
             }

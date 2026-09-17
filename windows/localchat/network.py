@@ -13,7 +13,9 @@ from .crypto import (
     KEY_LEN,
     aes_gcm_decrypt,
     aes_gcm_encrypt,
+    constant_time_equals,
     from_b64,
+    hmac_sha256,
     random_bytes,
     to_b64,
 )
@@ -65,6 +67,38 @@ MAX_CHUNK_WIRE = CHUNK_SIZE + 12 + 16
 
 GCM_MIN_FRAME = 12 + 16
 
+# file_download token domain separator (Android parity): the downloader proves
+# it received the encrypted offer by HMAC-ing the fileId with the per-file key.
+FILE_DL_TOKEN_PREFIX = "lc-file-dl-v1:"
+
+# Tombstone intake bounds for ONE packet (see ChatStore.TOMBSTONE_CAP): the
+# deleted_messages table keeps at most that many ids per group, so a peer gains
+# nothing by sending more — but a hostile or merely large list must not make us
+# do unbounded work (state updates, DB rows). Message ids are UUID-sized.
+MAX_DELETED_IDS = 200
+MAX_DELETED_ID_LEN = 128
+
+
+def sanitize_deleted_ids(deleted_ids) -> list:
+    """Dedupe, drop blanks/oversized ids and cap the tombstone list of ONE
+    packet (join_ack / history_reply). Android parity:
+    P2PManager.sanitizeDeletedIds."""
+    if isinstance(deleted_ids, str):
+        # a malformed wire value ("deletedIds": "abc") must not iterate into
+        # single-character ids
+        deleted_ids = [deleted_ids]
+    out = []
+    seen = set()
+    for raw in deleted_ids or []:
+        mid = str(raw)
+        if not mid.strip() or len(mid) > MAX_DELETED_ID_LEN or mid in seen:
+            continue
+        seen.add(mid)
+        out.append(mid)
+        if len(out) >= MAX_DELETED_IDS:
+            break
+    return out
+
 
 
 def _configure_server_socket(srv: socket.socket) -> None:
@@ -81,12 +115,16 @@ def _configure_server_socket(srv: socket.socket) -> None:
 
 def numeric_group_id_of(group_name: str, fingerprint: str) -> str:
     """Stable 8-digit numeric id for a group: FNV-1a hash of the machine
-    fingerprint + group name (same algorithm as the Android side), so it is
-    machine-bound yet distinct per group. Used as the join identifier — members
+    fingerprint + group name, iterated over UTF-16 code units — Kotlin's
+    `for (ch in s)` walks UTF-16 units (surrogate PAIRS for astral chars),
+    while Python code points would differ once a name contains e.g. emoji.
+    BMP-only names hash identically to the old code-point iteration, so
+    existing groups keep their ids. Used as the join identifier — members
     type this instead of the group name."""
     hash_ = 0x811C9DC5
-    for ch in f"{group_name}\u0000{fingerprint}":
-        hash_ ^= ord(ch)
+    units = f"{group_name}\u0000{fingerprint}".encode("utf-16-le")
+    for i in range(0, len(units), 2):
+        hash_ ^= units[i] | (units[i + 1] << 8)
         hash_ = (hash_ * 0x01000193) & 0xFFFFFFFF
     digits = (hash_ % 100_000_000 + 100_000_000) % 100_000_000
     return str(digits).zfill(8)
@@ -177,20 +215,34 @@ def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
     return bytes(buf)
 
 
+def file_download_token(file_key: bytes, file_id: str) -> str:
+    """Sender-proof token for a file_download request (Android parity,
+    contract "lc-file-dl-v1"): base64_std(HMAC-SHA256(key=fileKey (32B),
+    msg=ascii("lc-file-dl-v1:" + fileId))). Only a peer that received the
+    encrypted offer knows the per-file key, so the sender can refuse
+    un-invited download probes that already know just the (plaintext)
+    request format. Standard Base64 with padding, byte-comparable."""
+    return to_b64(
+        hmac_sha256(file_key, f"{FILE_DL_TOKEN_PREFIX}{file_id}".encode("ascii"))
+    )
+
+
 def _serve_file_download(
     sock: socket.socket, file_id: str, path: str, file_size: int, file_key: bytes
 ) -> None:
     """Serve one file-download connection. Handshake (Android parity, see
     FileTransfer.kt):
 
-        receiver -> "file_download" {fileId}                          (plaintext)
+        receiver -> "file_download" {fileId[, token]}                  (plaintext)
         sender   -> ENCRYPTED LINE: AES-GCM(fileKey, file_meta JSON)
         sender   -> [4B ctLen][12B nonce][AES-GCM chunk]... [4B zero EOF]
 
     The per-file key travels only inside the (itself encrypted) chat message
     that offered the file, so a passive sniffer sees ciphertext for the meta
     line AND the byte stream, and tampering anywhere trips the GCM tag and
-    aborts the download.
+    aborts the download. An offered token is verified in constant time; a
+    mismatch closes the connection without meta or data. No token (older
+    peer) is still served for compatibility.
     """
     try:
         sock.settimeout(30)
@@ -204,6 +256,24 @@ def _serve_file_download(
             return
         if req.type != "file_download" or req.file_id != file_id:
             return
+        if req.token is not None:
+            # a token that is present but wrong (including an empty string)
+            # means the client does NOT know the per-file key: refuse without
+            # sending meta or bytes. ABSENT (None) is an older peer and is
+            # still served — Android parity (FileTransfer.kt checks
+            # `providedToken != null`).
+            try:
+                expected = hmac_sha256(
+                    file_key, f"{FILE_DL_TOKEN_PREFIX}{file_id}".encode("ascii")
+                )
+                provided = from_b64(req.token)
+            except Exception:
+                return
+            if not constant_time_equals(provided, expected):
+                logger.warning(
+                    "file download rejected: token mismatch for %s", file_id
+                )
+                return
         meta = NetworkPacket(
             type="file_meta",
             file_info=FileInfo(file_id, os.path.basename(path), file_size, "", 0),
@@ -238,13 +308,28 @@ def _serve_file_download(
             pass
 
 
-def _download_file_offer(file_info: FileInfo, target_path: str) -> tuple:
+def _download_file_offer(
+    file_info: FileInfo,
+    target_path: str,
+    progress=None,
+    cancel: Optional[threading.Event] = None,
+    sock_holder: Optional[list] = None,
+) -> tuple:
     """Download a file offered via [file_info] to [target_path]. Blocks the
     calling thread. Returns (ok: bool, message: str). The meta line and every
     chunk are decrypted with the per-file key from the (encrypted) offer; any
-    tampering or key mismatch aborts."""
+    tampering or key mismatch aborts.
+
+    [progress](received, total) fires per decrypted chunk (the caller
+    throttles); [cancel] (threading.Event) aborts with "下载已取消"; and
+    [sock_holder] (a caller-owned list) receives the socket so the canceler
+    can shut a blocked read down immediately. The request always carries the
+    file_download token (Android parity; older senders without verification
+    simply ignore the extra field)."""
     if file_info.file_size < 0:
         return False, "文件大小无效"
+    if cancel is not None and cancel.is_set():
+        return False, "下载已取消"
     if file_info.file_size > MAX_DOWNLOAD_BYTES:
         return False, f"文件过大（超过 {MAX_DOWNLOAD_BYTES // 1024 // 1024} MB 限制）"
     try:
@@ -259,18 +344,31 @@ def _download_file_offer(file_info: FileInfo, target_path: str) -> tuple:
         )
     except OSError as e:
         return False, f"连接失败: {e}"
+    if sock_holder is not None:
+        sock_holder.append(sock)
     tmp_path = target_path + ".part"
     try:
+        if cancel is not None and cancel.is_set():
+            # the cancel landed during connect: fall through (do NOT return
+            # before the try) so the socket/tmp cleanup in `finally` runs
+            return False, "下载已取消"
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(10)
         _send_line_simple(
-            sock, NetworkPacket(type="file_download", file_id=file_info.file_id).to_json()
+            sock,
+            NetworkPacket(
+                type="file_download",
+                file_id=file_info.file_id,
+                token=file_download_token(file_key, file_info.file_id),
+            ).to_json(),
         )
         # read the meta line from the raw socket, byte by byte: a buffered
         # wrapper would read-ahead and swallow the file frames that the
         # sender streams immediately after the meta line
         line = _read_raw_line(sock)
         if line is None:
+            if cancel is not None and cancel.is_set():
+                return False, "下载已取消"
             return False, "发送方无响应"
         try:
             blob = from_b64(line)
@@ -307,8 +405,12 @@ def _download_file_offer(file_info: FileInfo, target_path: str) -> tuple:
         eof_marker = False
         with open(tmp_path, "wb") as f:
             while not eof_marker:
+                if cancel is not None and cancel.is_set():
+                    return False, "下载已取消"
                 header = _recv_exact(sock, 4)
                 if header is None:
+                    if cancel is not None and cancel.is_set():
+                        return False, "下载已取消"
                     return False, "文件传输中断"
                 frame_len = int.from_bytes(header, "big")
                 if frame_len == 0:
@@ -318,6 +420,8 @@ def _download_file_offer(file_info: FileInfo, target_path: str) -> tuple:
                     return False, "文件数据损坏"
                 frame = _recv_exact(sock, frame_len)
                 if frame is None:
+                    if cancel is not None and cancel.is_set():
+                        return False, "下载已取消"
                     return False, "文件传输中断"
                 try:
                     plain = aes_gcm_decrypt(file_key, frame)
@@ -329,6 +433,11 @@ def _download_file_offer(file_info: FileInfo, target_path: str) -> tuple:
                 if received > MAX_DOWNLOAD_BYTES:
                     return False, f"文件超过 {MAX_DOWNLOAD_BYTES // 1024 // 1024} MB 限制"
                 f.write(plain)
+                if progress is not None:
+                    try:
+                        progress(received, expected)
+                    except Exception:
+                        pass
         if received != expected:
             return False, f"文件不完整（{received}/{expected} 字节）"
         os.replace(tmp_path, target_path)
@@ -388,6 +497,10 @@ class HostGroupServer:
         self.error: Optional[str] = None
         self._active_handlers = 0
         self._handshake_attempts: Dict[str, list] = {}
+        # Bind-retry generation: bumped by every stop()/restart so a retry
+        # loop from a superseded listener can never commit a second binding
+        # (Android parity: P2PManager's generation counter).
+        self._listener_generation = 0
         # The direct-chat manager that auto-accepts secured direct sessions
         # (set by the ViewModel; every device runs it so members can pull up
         # 1:1 chats with no confirmation).
@@ -416,11 +529,22 @@ class HostGroupServer:
         with self._lock:
             old = self._groups.get(p2p.group_name)
             self._groups[p2p.group_name] = p2p
+            # A group registered while the listener sits in bind-retry must
+            # see the CURRENT error (the retry loop only reports the first
+            # failure, which may predate this registration — Android parity:
+            # the error lives in each group's published state).
+            error = self.error
         # A same-name re-host replaces the previous registration: stop the old
         # instance so its heartbeats and sockets do not leak. stop() unregisters
         # conditionally, so it cannot remove the fresh registration.
         if old is not None and old is not p2p:
             old.stop()
+        if error is not None:
+            p2p.server_error = error
+            try:
+                p2p.listener.server_error(p2p, error)
+            except Exception:
+                pass
         self._ensure_running()
 
     def unregister(self, p2p: "P2PManager") -> None:
@@ -451,6 +575,8 @@ class HostGroupServer:
     def stop(self) -> None:
         self._stop_event.set()
         with self._lock:
+            # invalidate any in-flight bind retry of the current generation
+            self._listener_generation += 1
             sock = self._server_socket
             self._server_socket = None
         if sock is not None:
@@ -499,21 +625,62 @@ class HostGroupServer:
             with self._lock:
                 self._active_handlers = max(0, self._active_handlers - 1)
 
+    # Bind-retry cadence (Android parity: P2PManager retries every 3s).
+    BIND_RETRY_INTERVAL = 3.0
+
     def _server_loop(self) -> None:
-        try:
-            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            _configure_server_socket(srv)
-            srv.bind(("0.0.0.0", self.port))
-            srv.listen(16)
-            srv.settimeout(1.0)
+        """Bind the shared port, retrying every BIND_RETRY_INTERVAL until it
+        succeeds or the server is stopped/port-changed: a transient conflict
+        (another instance, a port not yet released) previously killed the
+        listener until the user manually retried. Only the FIRST failure is
+        reported to the UI/log; a recovery is logged once."""
+        with self._lock:
+            gen = self._listener_generation
+        srv = None
+        error_reported = False
+        while srv is None:
+            if self._stop_event.is_set():
+                return
+            with self._lock:
+                if gen != self._listener_generation:
+                    return
+            candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                _configure_server_socket(candidate)
+                candidate.bind(("0.0.0.0", self.port))
+                candidate.listen(16)
+                candidate.settimeout(1.0)
+                srv = candidate
+            except OSError:
+                try:
+                    candidate.close()
+                except OSError:
+                    pass
+                if not error_reported:
+                    error_reported = True
+                    logger.warning(
+                        "failed to bind shared port %s, retrying every %ss",
+                        self.port,
+                        self.BIND_RETRY_INTERVAL,
+                        exc_info=True,
+                    )
+                    self._set_error(
+                        f"无法监听端口 {self.port}，请检查端口是否被占用或防火墙设置"
+                        f"（Windows 防火墙需允许入站 TCP {self.port}）"
+                    )
+                self._stop_event.wait(self.BIND_RETRY_INTERVAL)
+        with self._lock:
+            if gen != self._listener_generation or self._server_socket is not None:
+                # superseded by a stop()/restart() while we were retrying
+                try:
+                    srv.close()
+                except OSError:
+                    pass
+                return
             self._server_socket = srv
-            self._set_error(None)
-        except OSError:
-            self._set_error(
-                f"无法监听端口 {self.port}，请检查端口是否被占用或防火墙设置"
-                f"（Windows 防火墙需允许入站 TCP {self.port}）"
-            )
-            return
+        if error_reported:
+            logger.info("shared port %s recovered after bind failures", self.port)
+        self._set_error(None)
         while not self._stop_event.is_set():
             try:
                 client, client_addr = srv.accept()
@@ -671,14 +838,13 @@ class HostGroupServer:
             return self._resolve_group(id_or_name)
 
     def _resolve_group(self, id_or_name: Optional[str]) -> Optional["P2PManager"]:
-        """Resolve a group by its numeric join id (primary) or its name
-        (legacy fallback for groups saved before the numeric id existed).
-        Callers must hold self._lock or use resolve_group()."""
+        """Resolve a group by its 8-digit numeric join id ONLY (Android
+        parity, P2PManager.resolveGroup): the group name is a display label,
+        never an addressable join identifier, so a name sent in a handshake
+        must not resolve. Callers must hold self._lock or use
+        resolve_group()."""
         if not id_or_name:
             return None
-        p2p = self._groups.get(id_or_name)
-        if p2p is not None:
-            return p2p
         for candidate in self._groups.values():
             if candidate.numeric_group_id == id_or_name:
                 return candidate
@@ -731,6 +897,11 @@ class P2PListener:
         pass
 
     def join_state_changed(self, p2p: "P2PManager") -> None:
+        pass
+
+    def deleted_ids_received(self, p2p: "P2PManager", deleted_ids) -> None:
+        """join_ack carried tombstone convergence data: [deleted_ids] are
+        message ids deleted in the group while this member was away."""
         pass
 
 
@@ -818,6 +989,10 @@ class P2PManager:
         # Optional call-signaling listener: callable(p2p, packet) invoked on
         # the network thread for call_* packets addressed to this node.
         self.call_listener = None
+        # Tombstone source for join_ack: callable(group_id) -> [msgId, ...]
+        # naming messages deleted while members were away (the ViewModel
+        # backs it with the deleted_messages table). None omits the field.
+        self.deleted_ids_provider = None
 
     @property
     def current_group_id(self) -> str:
@@ -1039,6 +1214,16 @@ class P2PManager:
                             if peer.id != self.my_id:
                                 self.peers[peer.id] = peer
                     self.listener.peers_changed(self)
+                    if response.deleted_ids:
+                        # tombstone convergence: drop copies we still hold and
+                        # record the tombstones — never rebroadcast (Android
+                        # parity); runs before the join result so the replay
+                        # after it cannot resurrect the deleted messages. The
+                        # sanitized list is what reaches the database.
+                        ids = sanitize_deleted_ids(response.deleted_ids)
+                        if ids:
+                            self.apply_deleted_ids(ids)
+                            self.listener.deleted_ids_received(self, ids)
                     host = response.host
                     if host is not None and (
                         host.ip_address != target_ip or host.port != target_port
@@ -1130,6 +1315,13 @@ class P2PManager:
                     self._host_socket = sock
                     self._host_wire = wire
                 sock = None
+                if response.deleted_ids:
+                    # tombstone convergence from the host (no rebroadcast);
+                    # only the sanitized/capped list reaches the database
+                    ids = sanitize_deleted_ids(response.deleted_ids)
+                    if ids:
+                        self.apply_deleted_ids(ids)
+                        self.listener.deleted_ids_received(self, ids)
                 self._start_heartbeat()
                 self._read_loop_from_host(self._host_socket, wire)
             except Exception:
@@ -1189,9 +1381,18 @@ class P2PManager:
         if previous is not None and previous is not conn:
             self._safe_close(previous["sock"])
         try:
-            wire.send_packet(
-                NetworkPacket(type="join_ack", group_id=self.group_id, members=members)
-            )
+            ack = NetworkPacket(type="join_ack", group_id=self.group_id, members=members)
+            deleted_ids = None
+            if self.deleted_ids_provider is not None:
+                try:
+                    deleted_ids = self.deleted_ids_provider(self.group_id) or None
+                except Exception:
+                    deleted_ids = None
+            if deleted_ids:
+                # tombstone convergence: ids deleted while this member was
+                # away, so it drops/resists them instead of resurrecting
+                ack.deleted_ids = deleted_ids
+            wire.send_packet(ack)
         except Exception:
             # the member is gone before the ack: undo the registration above,
             # otherwise a dead socket lingers as a ghost member (its read loop
@@ -1302,6 +1503,26 @@ class P2PManager:
                 self.peers.pop(packet.peer.id, None)
             self.listener.peers_changed(self)
         elif packet.type == "delete_message" and packet.message_id is not None:
+            target = None
+            with self._lock:
+                target = next(
+                    (m for m in self.messages if m.id == packet.message_id), None
+                )
+            if (
+                target is not None
+                and packet.sender_id is not None
+                and packet.sender_id != target.sender_id
+            ):
+                # the relayed delete must come from the message's original
+                # author (same authorization as the host applies before
+                # forwarding); anything else is a forged request
+                logger.warning(
+                    "reject relay delete_message %s: packet senderId=%r, message senderId=%r",
+                    packet.message_id,
+                    packet.sender_id,
+                    target.sender_id,
+                )
+                return
             with self._lock:
                 self.messages = [m for m in self.messages if m.id != packet.message_id]
             self.listener.messages_changed(self)
@@ -1530,15 +1751,35 @@ class P2PManager:
         self.listener.messages_changed(self)
         return True
 
-    def _enqueue_send(self, packet: NetworkPacket) -> None:
-        """Queue an outbound packet for the single sender worker thread."""
+    def apply_deleted_ids(self, deleted_ids) -> list:
+        """Locally drop messages that a peer's tombstone data (join_ack /
+        history_reply deletedIds) reports as deleted; returns the ids that
+        existed here. Never rebroadcasts: convergence is not a new delete
+        event (Android parity). The list is sanitized/capped first so one
+        packet cannot force unbounded work."""
+        wanted = sanitize_deleted_ids(deleted_ids)
+        if not wanted:
+            return []
+        id_set = set(wanted)
+        with self._lock:
+            gone = [m.id for m in self.messages if m.id in id_set]
+            if gone:
+                self.messages = [m for m in self.messages if m.id not in id_set]
+        if gone:
+            self.listener.messages_changed(self)
+        return gone
+
+    def _enqueue_send(self, packet: NetworkPacket, on_failed=None) -> None:
+        """Queue an outbound packet for the single sender worker thread.
+        [on_failed] fires on the worker thread when the packet could not be
+        handed to the wire at all (e.g. no host connection)."""
         with self._lock:
             if self._send_worker is None:
                 self._send_worker = threading.Thread(
                     target=self._send_worker_loop, name="LocalChat-sender", daemon=True
                 )
                 self._send_worker.start()
-            self._send_queue.put(packet)
+            self._send_queue.put((packet, on_failed))
 
     def send_targeted(self, peer_id: str, packet: NetworkPacket) -> None:
         """Send a packet addressed to a specific member (call signaling).
@@ -1553,7 +1794,7 @@ class P2PManager:
     def _send_worker_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                packet = self._send_queue.get(timeout=0.5)
+                packet, on_failed = self._send_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             try:
@@ -1573,10 +1814,15 @@ class P2PManager:
                     self._broadcast_to_clients(packet)
                 else:
                     wire = self._host_wire
-                    if wire is not None:
-                        wire.send_packet(packet)
+                    if wire is None:
+                        raise OSError("no host connection")
+                    wire.send_packet(packet)
             except Exception:
-                pass
+                if on_failed is not None:
+                    try:
+                        on_failed()
+                    except Exception:
+                        pass
 
     def replay_saved_messages(self, messages: list) -> None:
         with self._lock:
@@ -1645,9 +1891,27 @@ class P2PManager:
         with self._lock:
             self.messages.append(message)
         self.listener.messages_changed(self)
-        self._enqueue_send(NetworkPacket(type="file_message", message=message))
+        self._enqueue_send(
+            NetworkPacket(type="file_message", message=message),
+            on_failed=lambda: self._fail_file_send(message.id),
+        )
         self._spawn(self._file_server_loop, file_id, path, file_size, file_key)
         return message
+
+    def _fail_file_send(self, file_id: str) -> None:
+        """The file_message never reached the group relay: close its download
+        server and retract the local bubble so the UI cannot claim it was
+        delivered (mirrors the direct-chat path)."""
+        with self._lock:
+            srv = self._file_servers.pop(file_id, None)
+        if srv is not None:
+            try:
+                srv.close()
+            except OSError:
+                pass
+        with self._lock:
+            self.messages = [m for m in self.messages if m.id != file_id]
+        self.listener.messages_changed(self)
 
     def _file_server_loop(self, file_id: str, path: str, file_size: int, file_key: bytes) -> None:
         deadline = time.time() + FILE_SERVER_TTL
@@ -1680,10 +1944,20 @@ class P2PManager:
                 except OSError:
                     pass
 
-    def download_file(self, file_info: FileInfo, target_path: str) -> tuple:
+    def download_file(
+        self,
+        file_info: FileInfo,
+        target_path: str,
+        progress=None,
+        cancel: Optional[threading.Event] = None,
+        sock_holder: Optional[list] = None,
+    ) -> tuple:
         """Download a file offered via [file_info] to [target_path]. Blocks the
-        calling thread. Returns (ok: bool, message: str)."""
-        return _download_file_offer(file_info, target_path)
+        calling thread. Returns (ok: bool, message: str); see
+        _download_file_offer for [progress]/[cancel]/[sock_holder]."""
+        return _download_file_offer(
+            file_info, target_path, progress=progress, cancel=cancel, sock_holder=sock_holder
+        )
 
     # -------------------------------------------------------------- server
 
@@ -1795,8 +2069,10 @@ class DirectChatListener:
 class DirectChatManager:
     """Direct member-to-member chat: the management unit is the member, not
     the group. Picking a member immediately pulls up a 1:1 chat over a direct
-    TCP connection; the other side auto-accepts (no confirmation) as long as
-    the app is running and listening on the program-wide port.
+    TCP connection. A first contact from an UNKNOWN peer is not opened
+    automatically: it parks in the contact-request message box and the
+    session opens only after the user accepts it; known members reconnect
+    directly without confirmation.
 
     Handshake (see securewire.py): the connection starts with an identity
     handshake — ephemeral ECDH signed by both devices' long-term identity
@@ -2170,8 +2446,12 @@ class DirectChatManager:
 
     def accept_contact_request(self, request_id: str) -> None:
         """The user accepted a request: add the member (clearing any removal
-        marks — acceptance is the explicit un-block) and announce right away;
-        the presence sweep dials the fresh contact immediately (quiet)."""
+        marks — acceptance is the explicit un-block), dial the peer RIGHT AWAY
+        (quiet; start_chat reuses the per-peer dial lock, so a concurrent
+        sweep dial cannot double-connect), and announce. Without the immediate
+        dial, convergence waited for the peer's announce or the local 60s
+        sweep — and the deterministic dialer rule can pick the OTHER side,
+        stretching it to a full sweep period."""
         with self._lock:
             req = next(
                 (r for r in self._contact_requests if r.id == request_id), None
@@ -2181,8 +2461,17 @@ class DirectChatManager:
             self._contact_requests = [
                 r for r in self._contact_requests if r.id != request_id
             ]
-        self.add_contact(Peer(req.id, req.name, req.ip, req.port))
+        peer = Peer(req.id, req.name, req.ip, req.port)
+        self.add_contact(peer)
         self._emit_event(f"已添加 {req.name}")
+
+        def run(p=peer) -> None:
+            try:
+                self.start_chat(p, quiet=True)
+            except Exception:
+                pass
+
+        _spawn(run)
         self.announce_online()
         self._fire_contact_requests_changed()
 
@@ -2484,9 +2773,10 @@ class DirectChatManager:
             return None
 
     def handle_direct_hello(self, sock, wire: Wire, packet: NetworkPacket, peer_ident) -> None:
-        """Listener side: a secured direct_hello arrived on the shared port —
-        auto-accept, no confirmation needed (the handshake already
-        authenticated the dialer's identity key)."""
+        """Listener side: a secured direct_hello arrived on the shared port.
+        A KNOWN member is accepted right away (the handshake already
+        authenticated its identity key); a first contact parks in the
+        request box and the session opens only after the user confirms."""
         peer = packet.peer
         if peer is None or peer.id == self._my_id:
             self._safe_close(sock)
@@ -2915,10 +3205,20 @@ class DirectChatManager:
         self._remove_message(peer_id, file_id)
         self._emit_event("文件发送失败，请重试")
 
-    def download_file(self, file_info: FileInfo, target_path: str) -> tuple:
+    def download_file(
+        self,
+        file_info: FileInfo,
+        target_path: str,
+        progress=None,
+        cancel: Optional[threading.Event] = None,
+        sock_holder: Optional[list] = None,
+    ) -> tuple:
         """Download a file offered via [file_info] to [target_path]. Blocks the
-        calling thread. Returns (ok: bool, message: str)."""
-        return _download_file_offer(file_info, target_path)
+        calling thread. Returns (ok: bool, message: str); see
+        _download_file_offer for [progress]/[cancel]/[sock_holder]."""
+        return _download_file_offer(
+            file_info, target_path, progress=progress, cancel=cancel, sock_holder=sock_holder
+        )
 
     def _direct_file_server_loop(
         self, file_id: str, srv, path: str, file_size: int, file_key: bytes
@@ -3250,6 +3550,11 @@ class GroupMeshListener:
     def group_mesh_delete(self, group_id: str, message_id: str, sender_id: str) -> None:
         pass
 
+    def group_mesh_deleted_ids(self, group_id: str, deleted_ids) -> None:
+        """history_reply carried tombstone convergence data: [deleted_ids]
+        were deleted in the group while this member was away."""
+        pass
+
 
 class GroupMeshManager:
     """Group mesh: direct member-to-member links inside a group, so members
@@ -3285,6 +3590,9 @@ class GroupMeshManager:
         self._listener: Optional[GroupMeshListener] = None
         self._groups: Dict[str, dict] = {}
         self._has_links: Dict[str, bool] = {}
+        # Tombstone source for history pushes: callable(group_id) ->
+        # [msgId, ...] (backed by the ViewModel's deleted_messages table).
+        self.deleted_ids_provider = None
 
     def attach(self, listener: GroupMeshListener) -> None:
         self._listener = listener
@@ -3396,7 +3704,11 @@ class GroupMeshManager:
             if state is None:
                 return
             links = list(state["links"].values())
-            state["messages"].append(msg)
+            # dedupe by id: the same message often arrives twice (host relay
+            # + mesh overlap) and must not double-fill the history (Android
+            # noteMessage parity)
+            if not any(m.id == msg.id for m in state["messages"]):
+                state["messages"].append(msg)
             state["messages"].sort(key=lambda m: m.timestamp)
             if len(state["messages"]) > self.HISTORY_CAP:
                 del state["messages"][: len(state["messages"]) - self.HISTORY_CAP]
@@ -3408,13 +3720,25 @@ class GroupMeshManager:
 
     def broadcast_delete(self, group_id: str, message_id: str) -> None:
         """Tell every linked member that a message was deleted (host-offline
-        path) so deletes converge even when the host relay is unreachable."""
+        path) so deletes converge even when the host relay is unreachable.
+        The sender also drops the message from its own mesh history right
+        away, so a later backfill cannot resurrect it."""
+        had = False
         with self._lock:
             state = self._groups.get(group_id)
             if state is None:
                 return
             my_id = state["my_peer"].id if state["my_peer"] else ""
             links = list(state["links"].values())
+            had = any(m.id == message_id for m in state["messages"])
+            state["messages"] = [m for m in state["messages"] if m.id != message_id]
+        if had:
+            listener = self._listener
+            if listener is not None:
+                try:
+                    listener.group_mesh_delete(group_id, message_id, my_id)
+                except Exception:
+                    pass
         if not links:
             return
         packet = NetworkPacket(
@@ -3422,6 +3746,28 @@ class GroupMeshManager:
         )
         for link in links:
             self._spawn(self._link_write, link, packet)
+
+    def apply_deleted_ids(self, group_id: str, deleted_ids) -> None:
+        """Convergence data received with a history push: drop still-present
+        copies from this member's mesh history and let the listener record
+        the tombstones. Never rebroadcasts: convergence is not a new delete
+        event (Android parity). Sanitized/capped first (one packet must not
+        force unbounded work)."""
+        ids = sanitize_deleted_ids(deleted_ids)
+        if not ids:
+            return
+        id_set = set(ids)
+        with self._lock:
+            state = self._groups.get(group_id)
+            if state is None:
+                return
+            state["messages"] = [m for m in state["messages"] if m.id not in id_set]
+        listener = self._listener
+        if listener is not None:
+            try:
+                listener.group_mesh_deleted_ids(group_id, ids)
+            except Exception:
+                pass
 
     def note_message(self, group_id: str, msg) -> None:
         with self._lock:
@@ -3461,20 +3807,33 @@ class GroupMeshManager:
         """Push history in size-capped batches (see HISTORY_CHUNK_BYTES): the
         receiver reads with a bounded line reader, so each packet must stay
         under the cap or the link would be dropped. Receivers merge each batch
-        independently and dedup by message id (Android parity)."""
+        independently and dedup by message id (Android parity). The FIRST
+        batch also carries the group's delete tombstones (deletedIds) so a
+        member that was offline during a delete converges instead of
+        resurrecting the message; with no tombstones the field stays absent
+        (older peers ignore unknown keys)."""
         batch = []
         estimated = 0
+        first = True
+        deleted_ids = None
+        if self.deleted_ids_provider is not None:
+            try:
+                deleted_ids = self.deleted_ids_provider(group_id) or None
+            except Exception:
+                deleted_ids = None
 
         def flush() -> None:
-            nonlocal batch, estimated
+            nonlocal batch, estimated, first
             if not batch:
                 return
+            packet = NetworkPacket(
+                type="history_reply", group_id=group_id, messages=batch
+            )
+            if first and deleted_ids:
+                packet.deleted_ids = list(deleted_ids)
+            first = False
             try:
-                wire.send_packet(
-                    NetworkPacket(
-                        type="history_reply", group_id=group_id, messages=batch
-                    )
-                )
+                wire.send_packet(packet)
             except Exception:
                 pass
             batch = []
@@ -3685,6 +4044,10 @@ class GroupMeshManager:
                     ]
                     if valid_history:
                         self._handle_incoming(group_id, valid_history)
+                    if packet.deleted_ids:
+                        # tombstone convergence riding the history push (no
+                        # rebroadcast — see apply_deleted_ids)
+                        self.apply_deleted_ids(group_id, packet.deleted_ids)
                 elif packet.type == "mesh_announce" and packet.peer is not None:
                     self.add_peer(group_id, packet.peer)
                 elif packet.type == "ping":

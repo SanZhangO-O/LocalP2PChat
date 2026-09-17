@@ -44,11 +44,13 @@ import logging
 import os
 import sys
 import threading
+from collections import OrderedDict
 from ctypes import wintypes
 from typing import Optional
 
 from .crypto import (
     ECKeyPair,
+    GCM_NONCE_LEN,
     KEY_LEN,
     PBKDF2_ITERATIONS,
     aes_gcm_decrypt,
@@ -92,6 +94,12 @@ class Protocol:
 
 INFO_SESSION = b"localchat-session-v1"
 INFO_DIRECT = b"lc-direct-v1"
+
+# Replay window: how many per-connection packet nonces are remembered for
+# duplicate detection (LRU, oldest evicted). Keys are per-session ECDH
+# derived, so a CROSS-session replay already fails decryption — this only
+# defends against replaying a line WITHIN the same connection.
+NONCE_CACHE_SIZE = 4096
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +163,10 @@ class Wire:
         self._write_line = write_line
         self._key: Optional[bytes] = None
         self._lock = threading.Lock()
+        # Seen packet nonces of THIS connection (LRU): a repeated nonce is a
+        # replayed line and aborts the connection like a decrypt failure.
+        self._seen_nonces: "OrderedDict[bytes, bool]" = OrderedDict()
+        self._nonce_lock = threading.Lock()
 
     def activate(self, session_key: bytes) -> None:
         self._key = session_key
@@ -203,6 +215,20 @@ class Wire:
             blob = from_b64(line)
         except Exception as e:
             raise WireException("malformed encrypted line") from e
+        if len(blob) > GCM_NONCE_LEN:
+            # replay guard BEFORE decrypting: the nonce is the blob's first
+            # GCM_NONCE_LEN bytes (nonce || ciphertext || tag layout)
+            nonce = blob[:GCM_NONCE_LEN]
+            with self._nonce_lock:
+                if nonce in self._seen_nonces:
+                    logger.warning(
+                        "replayed packet nonce on a secured connection; "
+                        "aborting it (possible replay attack)"
+                    )
+                    raise WireException("replayed packet (nonce reuse)")
+                self._seen_nonces[nonce] = True
+                while len(self._seen_nonces) > NONCE_CACHE_SIZE:
+                    self._seen_nonces.popitem(last=False)
         try:
             plain = aes_gcm_decrypt(key, blob)
         except Exception as e:
@@ -223,9 +249,16 @@ class Wire:
         with self._lock:
             self._write_line(line)
 
-    # ---- handshake-phase plaintext IO (never used once activate() ran) ----
+    # ---- handshake-phase plaintext IO (hard-forbidden once activate() ran) ----
+
+    def _assert_handshake_phase(self) -> None:
+        """Raw plaintext IO is a handshake-phase primitive only: after the
+        wire went secure, using it would bypass the encryption entirely."""
+        if self._key is not None:
+            raise WireException("plaintext IO is forbidden after activate()")
 
     def send_raw(self, packet: NetworkPacket) -> None:
+        self._assert_handshake_phase()
         with self._lock:
             self._write_line(packet.to_json())
 
@@ -233,6 +266,7 @@ class Wire:
         self.send_raw(NetworkPacket(type=Protocol.HS_REJECT, error_message=message))
 
     def recv_raw(self) -> Optional[NetworkPacket]:
+        self._assert_handshake_phase()
         line = self._read_line()
         if line is None:
             return None
@@ -579,6 +613,13 @@ class DeviceIdentity:
             protected = _dpapi_call(True, priv_bytes)
             if protected is not None:
                 scheme, priv_bytes = "dpapi", protected
+            else:
+                # not silent: plaintext-at-rest is a real downgrade the user
+                # should be able to trace from the log
+                logger.warning(
+                    "DPAPI unavailable/failed — storing the device identity "
+                    "private key UNENCRYPTED (scheme=plain)"
+                )
             doc = {
                 "scheme": scheme,
                 "private": to_b64(priv_bytes),

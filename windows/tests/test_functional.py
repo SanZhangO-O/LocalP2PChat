@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import QApplication
 import localchat.network as network_module
 from localchat.models import Peer
 from localchat.network import P2PListener, P2PManager
-from localchat.storage import ChatStore
+from localchat.storage import ChatStore, SavedGroup
 from localchat.view_model import ChatViewModel
 
 HOST_NAME = "\u6d4b\u8bd5\u4e3b\u673a"  # \\u6d4b\\u8bd5\\u4e3b\\u673a
@@ -380,6 +380,41 @@ class SharedPortServerTest(unittest.TestCase):
         )
 
 
+class TombstoneStoreTest(unittest.TestCase):
+    """deleted_messages table: record/get/delete tombstones with a per-group
+    cap (newest 200 by deleted_at), id dedupe and group isolation."""
+
+    def test_record_get_prune_and_isolation(self):
+        store = ChatStore(_fresh_db("lc_test_tombstones.db"))
+        try:
+            self.assertEqual(store.get_deleted_ids("g1"), [])
+            store.record_deleted_messages("g1", ["m1"])
+            store.record_deleted_messages("g1", ["m2", "m3"])
+            self.assertEqual(sorted(store.get_deleted_ids("g1")), ["m1", "m2", "m3"])
+            # re-recording an id keeps a single row
+            store.record_deleted_messages("g1", ["m1"])
+            self.assertEqual(len(store.get_deleted_ids("g1")), 3)
+            # per-group cap: only the newest 200 stay (by deleted_at); the
+            # bulk rows get deliberately old timestamps
+            for i in range(250):
+                store.record_deleted_messages("g1", [f"bulk-{i}"], deleted_at=1000 + i)
+            ids = store.get_deleted_ids("g1")
+            self.assertEqual(len(ids), ChatStore.TOMBSTONE_CAP)
+            self.assertIn("m1", ids)
+            self.assertIn("m2", ids)
+            self.assertIn("bulk-249", ids)
+            self.assertNotIn("bulk-0", ids, "oldest rows must be pruned")
+            # groups are isolated
+            store.record_deleted_messages("g2", ["x"])
+            self.assertEqual(store.get_deleted_ids("g2"), ["x"])
+            self.assertEqual(len(store.get_deleted_ids("g1")), ChatStore.TOMBSTONE_CAP)
+            # deleting the group clears its tombstones too
+            store.delete_group("g2")
+            self.assertEqual(store.get_deleted_ids("g2"), [])
+        finally:
+            store.close()
+
+
 class ViewModelFlowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -553,6 +588,187 @@ class ViewModelFlowTest(unittest.TestCase):
             "deleted message must not resurrect from sqlite after host restart",
         )
         self._vms = [member, host2]
+
+    def test_replay_window_blocks_mirror_delete(self):
+        """While the saved-history replay window is open, a stale in-flight
+        callback must not mirror-delete persisted rows (Android parity:
+        replayDone[groupId] = p2p)."""
+        network_module.TCP_PORT = 10046
+        vm = make_vm(_fresh_db("lc_test_replay_guard.db"))
+        self._vms = [vm]
+        vm.create_group("\u4e3b\u673a", "\u91cd\u653e\u5b88\u536b")
+        gid = vm.active_group_id
+        p2p = vm.group_p2p_map[gid]
+        msg = p2p.send_message("\u5b58\u6d3b\u6d88\u606f")
+        self.assertIsNotNone(msg)
+        self.assertTrue(any(m.id == msg.id for m in vm.store.get_messages_for_group(gid)))
+        # open the replay window, then a stale callback reports the message gone
+        vm.replay_done.pop(gid, None)
+        p2p.messages.clear()
+        vm.messages_changed(p2p)
+        self.assertTrue(
+            any(m.id == msg.id for m in vm.store.get_messages_for_group(gid)),
+            "mirror delete must be blocked while the replay window is open",
+        )
+        self.assertIn(msg.id, vm.persisted_message_ids[gid])
+        # once the replay completes, the same state change mirrors normally
+        vm.replay_done[gid] = p2p
+        vm.messages_changed(p2p)
+        self.assertTrue(all(m.id != msg.id for m in vm.store.get_messages_for_group(gid)))
+        self.assertIn(msg.id, vm.store.get_deleted_ids(gid))
+
+    def test_stale_connection_cannot_mirror_delete(self):
+        """A replaced P2PManager (old connection of the same group) must never
+        mirror-delete from its own message list — not mid-replay of the fresh
+        instance and not after it completed one. Otherwise a late callback from
+        the dying connection wipes rows the fresh instance still holds and
+        mints delete tombstones that make every member drop the message."""
+        network_module.TCP_PORT = 10047
+        vm = make_vm(_fresh_db("lc_test_stale_mirror.db"))
+        self._vms = [vm]
+        vm.create_group("\u4e3b\u673a", "\u65e7\u8fde\u63a5")
+        gid = vm.active_group_id
+        stale = vm.group_p2p_map[gid]
+        msg = stale.send_message("\u5b58\u6d3b\u6d88\u606f")
+        self.assertIsNotNone(msg)
+
+        # a reconnect replaces the manager for the same group id
+        fresh = P2PManager(
+            vm,
+            port=vm.port,
+            device_id=vm._device_id(),
+            hardware_id=vm._hardware_fingerprint(),
+        )
+        fresh.initialize_as_host(vm.nickname, "\u65e7\u8fde\u63a5", "")
+        vm.group_p2p_map[gid] = fresh
+        vm.persisted_message_ids[gid] = {msg.id}
+
+        # the fresh instance has NOT finished its replay yet: a stale callback
+        # must not mirror (and must not mint tombstones)
+        stale.messages.clear()
+        vm.messages_changed(stale)
+        self.assertTrue(
+            any(m.id == msg.id for m in vm.store.get_messages_for_group(gid)),
+            "a stale callback must not mirror-delete mid-replay",
+        )
+        self.assertEqual(vm.store.get_deleted_ids(gid), [])
+
+        # even after the fresh instance completed its replay, the stale one is
+        # still not the live manager: still no mirror delete
+        vm.replay_done[gid] = fresh
+        vm.messages_changed(stale)
+        self.assertTrue(
+            any(m.id == msg.id for m in vm.store.get_messages_for_group(gid)),
+            "a replaced manager must never mirror-delete",
+        )
+        self.assertEqual(vm.store.get_deleted_ids(gid), [])
+        fresh.stop()
+
+    def test_rejoin_without_numeric_id_fails_clearly(self):
+        """A member group saved without its numeric join id cannot be rejoined
+        (a host resolves handshakes by numeric id only, never by name): the
+        attempt must fail fast with an actionable message instead of dialing
+        with the group name that the host would reject."""
+        network_module.TCP_PORT = 10048
+        os.makedirs(DATA_DIR, exist_ok=True)
+        store = ChatStore(_fresh_db("lc_test_rejoin_no_id.db"))
+        # the row must exist BEFORE the VM loads the group list, and it must
+        # carry no remembered join id
+        store.upsert_group(SavedGroup(
+            group_id="legacy-group-id",
+            group_name="\u65e0ID\u7fa4",
+            is_host=False,
+            host_ip="127.0.0.1",
+            host_port=1,
+            my_name="\u6211",
+        ))
+        vm = ChatViewModel(store, data_dir=DATA_DIR)
+        self._vms = [vm]
+        statuses = []
+        vm.status_message.connect(lambda s: statuses.append(s))
+
+        vm.switch_to_group("legacy-group-id")
+
+        self.assertTrue(vm.rejoin_failed, "the rejoin must fail fast")
+        self.assertFalse(vm.rejoin_in_progress)
+        self.assertIsNone(vm.pending_p2p, "no dial may be attempted")
+        self.assertTrue(
+            any("\u6570\u5b57 ID" in s for s in statuses),
+            "the failure must tell the user to re-query the numeric id",
+        )
+
+    def test_tombstone_converges_on_rejoin(self):
+        """A member that was offline during a delete must not resurrect the
+        message after rejoining: join_ack carries deletedIds, the member
+        drops its copy and records the tombstone locally."""
+        port = 10041
+        network_module.TCP_PORT = port
+        dba = _fresh_db("lc_test_ts_host.db")
+        dbc = _fresh_db("lc_test_ts_member.db")
+        host = make_vm(dba)
+        host.create_group("\u4e3b\u673a", "\u5893\u7891")
+        gid = host.active_group_id
+        password = host.active_group_password
+        join_id = host.active_group_numeric_id()
+
+        member = make_vm(dbc)
+        joined = []
+        member.join_successful.connect(lambda: joined.append(True))
+        member.query_group("\u6210\u5458", join_id, "127.0.0.1", port=port, password=password)
+        self.assertTrue(
+            wait_until(lambda: member.queried_group_info() is not None, pump=self.pump)
+        )
+        member.confirm_join()
+        self.assertTrue(wait_until(lambda: joined, pump=self.pump))
+        content = "\u5c06\u88ab\u5220\u9664\u7684\u6d88\u606f"
+        host.send_message(content)
+        member_p2p = member.group_p2p_map[gid]
+        self.assertTrue(
+            wait_until(
+                lambda: any(m.content == content for m in member_p2p.messages),
+                pump=self.pump,
+            )
+        )
+        msg_id = next(m.id for m in member_p2p.messages if m.content == content)
+        # the member goes offline, then the delete happens
+        member.shutdown()
+        host.delete_message(msg_id)
+        self.assertTrue(
+            wait_until(
+                lambda: all(m.content != content for m in host.active_messages()),
+                pump=self.pump,
+            )
+        )
+        self.assertIn(msg_id, host.store.get_deleted_ids(gid), "host must record the tombstone")
+
+        # the member comes back: the join_ack deletedIds must converge it
+        member2 = make_vm(dbc)
+        self._vms = [member2, host]
+        member2.switch_to_group(gid)
+        self.assertTrue(
+            wait_until(
+                lambda: member2.group_p2p_map.get(gid) is not None
+                and not member2.rejoin_in_progress
+                and member2.active_peers(),
+                pump=self.pump,
+            ),
+            "member should rejoin",
+        )
+        time.sleep(0.3)  # let any late tombstone application land
+        p2p2 = member2.group_p2p_map[gid]
+        self.assertTrue(
+            all(m.id != msg_id for m in p2p2.messages),
+            "the deleted message must not resurrect in memory after rejoin",
+        )
+        saved = member2.store.get_messages_for_group(gid)
+        self.assertTrue(
+            all(m.id != msg_id for m in saved),
+            "the deleted message must not resurrect from sqlite after rejoin",
+        )
+        self.assertIn(
+            msg_id, member2.store.get_deleted_ids(gid),
+            "the member must record the tombstone locally",
+        )
 
     def test_create_group_persists_is_host(self):
         network_module.TCP_PORT = 10006
@@ -910,6 +1126,36 @@ class ViewModelFlowTest(unittest.TestCase):
         self.pump()
         self.assertGreaterEqual(page.model.rowCount(), 1)
         win.close()
+
+    def test_tray_aggregation_flushes_on_group_change(self):
+        """A gid change inside the burst window flushes the old bubble first:
+        counts/previews from one group must never bleed into another's."""
+        vm = make_vm(_fresh_db("lc_test_tray_gid_flush.db"))
+        self._vms = [vm]
+        vm.set_window_active(False)
+        vm.TRAY_AGGREGATE_MS = 80
+        received = []
+        vm.tray_notification.connect(lambda gid, title, body: received.append((gid, title, body)))
+        vm._on_raw_tray("g1", "\u5f20\u4e09", "\u7b2c\u4e00\u6761")
+        vm._on_raw_tray("g2", "\u674e\u56db", "\u7b2c\u4e8c\u6761")
+        self.assertTrue(
+            wait_until(lambda: received, timeout=2.0, pump=self.pump),
+            "the old group's bubble must flush when another group arrives",
+        )
+        self.assertEqual(
+            received[0],
+            ("g1", "\u5f20\u4e09", "\u7b2c\u4e00\u6761"),
+            "the flushed bubble must carry the OLD group's data",
+        )
+        self.assertTrue(
+            wait_until(lambda: len(received) >= 2, timeout=2.0, pump=self.pump)
+        )
+        self.assertEqual(received[1][0], "g2")
+        self.assertEqual(
+            received[1][1],
+            "\u674e\u56db",
+            "the new group's bubble must start fresh (count 1)",
+        )
 
     def test_tray_notification_aggregation(self):
         vm = make_vm(_fresh_db("lc_test_tray_agg.db"))

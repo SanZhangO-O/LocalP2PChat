@@ -183,6 +183,11 @@ class FakeHostServer:
                 return
             on_secured(secured.mode, secured.group_id, conn, wire)
         except Exception:
+            # never swallow silently: a dead handler looks exactly like a peer
+            # that never answers, which turns protocol tests into timeouts
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
             try:
                 conn.close()
             except OSError:

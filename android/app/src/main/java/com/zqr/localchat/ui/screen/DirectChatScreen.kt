@@ -135,6 +135,9 @@ fun DirectChatScreen(
                                 message = msg,
                                 state = downloadStates[msg.id],
                                 onDownload = { onDownloadFile(msg.fileInfo!!) },
+                                onCancel = msg.fileInfo?.let { fi ->
+                                    ({ ChatViewModel.cancelDownload(fi.fileId) })
+                                },
                                 onDelete = { onDelete(msg) }
                             )
                         } else {

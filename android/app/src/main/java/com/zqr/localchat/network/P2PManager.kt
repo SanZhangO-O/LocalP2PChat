@@ -239,6 +239,13 @@ class HostGroupServer(port: Int) {
                         closeSocket(socket)
                         return
                     }
+                    if (hello.groupId != start.groupId) {
+                        // same rule as query/join: the password was verified for
+                        // start.groupId, so the hello must not name another group
+                        // (whose mesh state and history it must not reach)
+                        closeSocket(socket)
+                        return
+                    }
                     GroupMeshManager.handleMeshHello(socket, wire, hello)
                 }
                 Protocol.MODE_QUERY, Protocol.MODE_JOIN -> {
@@ -570,6 +577,7 @@ class P2PManager(
                                         _peers.update { it + (peer.id to peer) }
                                     }
                                 }
+                                applyPeerDeletedIds(groupId, response.deletedIds)
                                 val host = response.host
                                 if (host != null && (host.ipAddress != targetIp || host.port != targetPort)) {
                                     // joined through a member sponsor: the ack
@@ -669,6 +677,7 @@ class P2PManager(
                             _peers.update { it + (peer.id to peer) }
                         }
                     }
+                    applyPeerDeletedIds(groupId, response.deletedIds)
                     socket = null
                     hostConnection = s
                     hostWire = wire
@@ -754,7 +763,15 @@ class P2PManager(
         }
         val allMembers = listOf(Peer(myId, myName, myIpAddress, port)) +
                 _peers.value.values.filter { it.id != myId && it.id != newPeer.id }
-        val ack = NetworkPacket(type = "join_ack", groupId = groupId, members = allMembers)
+        // offline-member delete convergence: the ack carries this group's
+        // tombstoned ids so a member that was offline drops what it missed
+        // (null omitted on the wire; empty list must not serialize either)
+        val ack = NetworkPacket(
+            type = "join_ack",
+            groupId = groupId,
+            members = allMembers,
+            deletedIds = deletedIdsProvider?.invoke(groupId).orEmpty().ifEmpty { null }
+        )
         wire.sendPacket(ack)
         val announcement = NetworkPacket(type = "announce", peer = newPeer)
         broadcastToClients(announcement, exclude = newPeer.id)
@@ -1054,13 +1071,31 @@ class P2PManager(
 
     /** Remove a message locally because a delete arrived over the group mesh
      *  (the mesh path validated the sender). Only the original sender may
-     *  delete — mirrors the host relay's authorization. Does NOT rebroadcast:
-     *  the mesh path forwards the delete to every other link itself. */
-    fun removeLocalMessage(messageId: String, senderId: String): Boolean {
+     *  delete — mirrors the host relay's authorization. A null [senderId]
+     *  means a tombstone-synced delete (join_ack/history_reply deletedIds):
+     *  trusted, no author check. Does NOT rebroadcast: the sender already
+     *  told everyone else (loop prevention). */
+    fun removeLocalMessage(messageId: String, senderId: String?): Boolean {
         val target = _messages.value.firstOrNull { it.id == messageId }
-        if (target == null || target.senderId != senderId) return false
+        if (target == null) return false
+        if (senderId != null && target.senderId != senderId) return false
         _messages.update { list -> list.filterNot { it.id == messageId } }
         return true
+    }
+
+    /**
+     * Apply a peer's tombstone sync (join_ack deletedIds): drop the messages
+     * from the live list and hand them to [onPeerDeletedIds] so the ViewModel
+     * persists tombstones — a later history replay must not resurrect them.
+     * Never rebroadcast: the sender already told everyone (loop prevention).
+     */
+    private fun applyPeerDeletedIds(groupId: String, deletedIds: List<String>?) {
+        val ids = sanitizeDeletedIds(deletedIds)
+        if (ids.isEmpty()) return
+        ids.forEach { id ->
+            _messages.update { list -> list.filterNot { it.id == id } }
+        }
+        onPeerDeletedIds?.invoke(groupId, ids)
     }
 
     /**
@@ -1075,7 +1110,11 @@ class P2PManager(
         uri: Uri,
         fileSize: Long
     ): ChatMessage? {
-        if (!isValidContent(fileName)) return null
+        // receivers use the advertised name as their default save name: strip
+        // path separators and ".." so a crafted offer cannot traverse out of
+        // the directory the user picked
+        val safeName = sanitizeFileName(fileName)
+        if (!isValidContent(safeName)) return null
         if (fileSize > FileTransfer.MAX_DOWNLOAD_BYTES) {
             Log.w(TAG, "sendFile rejected: ${fileSize} bytes exceeds the ${FileTransfer.MAX_DOWNLOAD_BYTES} cap")
             return null
@@ -1096,11 +1135,11 @@ class P2PManager(
         // switched Wi-Fi since would otherwise advertise a stale, unreachable
         // download host
         val advertised = P2PManager.getLocalIpAddress().ifBlank { myIpAddress }
-        val fileInfo = FileInfo(fileId, fileName, fileSize, advertised, port, Crypto.toB64(fileKey))
+        val fileInfo = FileInfo(fileId, safeName, fileSize, advertised, port, Crypto.toB64(fileKey))
         fileServers[fileId] = server
         val msg = ChatMessage(
             id = fileId,
-            content = fileName,
+            content = safeName,
             timestamp = System.currentTimeMillis(),
             senderId = myId,
             senderName = myName,
@@ -1125,7 +1164,7 @@ class P2PManager(
             server = server,
             resolver = resolver,
             uri = uri,
-            fileName = fileName,
+            fileName = safeName,
             fileSize = fileSize,
             fileKey = fileKey,
             isActive = { fileServers[fileId] === server },
@@ -1183,6 +1222,48 @@ class P2PManager(
         private const val TAG = "P2PManager"
         const val MAX_CONTENT_LENGTH = 5000
         const val MAX_LINE_LENGTH = 64 * 1024
+
+        /**
+         * Tombstone intake bounds for ONE packet. The deleted_messages table
+         * keeps at most DeletedMessage.CAP ids per group (trimmed), so a peer
+         * gains nothing by sending more — but a hostile or merely large list
+         * must not make us do unbounded work (state updates, DB rows, delete
+         * tombstones for peers). Message ids are UUID-sized; anything much
+         * longer is not one.
+         */
+        const val MAX_DELETED_IDS = 200
+        const val MAX_DELETED_ID_LEN = 128
+
+        /** Dedupe, drop blanks/oversized ids and cap a tombstone list received
+         *  from the wire (single-use guard for join_ack / history_reply). */
+        fun sanitizeDeletedIds(ids: List<String>?): List<String> =
+            ids.orEmpty()
+                .asSequence()
+                .filter { it.isNotBlank() && it.length <= MAX_DELETED_ID_LEN }
+                .distinct()
+                .take(MAX_DELETED_IDS)
+                .toList()
+
+        /**
+         * Global callback: this device learned tombstoned message ids from a
+         * peer's join_ack (offline-member delete convergence). The ViewModel
+         * persists them as DeletedMessage tombstones so a later history
+         * replay cannot resurrect the rows. Global (like the mesh callbacks)
+         * because it only touches the shared database; set once at ViewModel
+         * init — BEFORE any join can complete (join_ack racing callback
+         * registration must never drop tombstones).
+         */
+        @Volatile
+        var onPeerDeletedIds: ((groupId: String, deletedIds: List<String>) -> Unit)? = null
+
+        /**
+         * Global tombstone provider for the host's join_ack (offline-member
+         * delete convergence): returns the group's tombstoned message ids,
+         * empty when there are none (omitted on the wire). Set once at
+         * ViewModel init, which owns the database.
+         */
+        @Volatile
+        var deletedIdsProvider: ((groupId: String) -> List<String>)? = null
 
         /** Peer-presence heartbeat: both sides send a ping every interval; a
          * read loop that sees no traffic for [HEARTBEAT_TIMEOUT_MS] declares
@@ -1258,6 +1339,13 @@ class P2PManager(
 
         fun isValidContent(content: String): Boolean =
             content.isNotBlank() && content.length <= MAX_CONTENT_LENGTH
+
+        /** Strip path separators and ".." from a file name: receivers use
+         *  [com.zqr.localchat.data.FileInfo.fileName] as the default save
+         *  name, so a crafted offer must never escape the directory the user
+         *  picked. */
+        fun sanitizeFileName(name: String): String =
+            name.replace('/', '_').replace('\\', '_').replace("..", "_")
 
         /**
          * Reads a single line with a hard cap: accumulates chars until '\n'

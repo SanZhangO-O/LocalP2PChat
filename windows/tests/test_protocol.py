@@ -743,6 +743,219 @@ class HeartbeatTest(ProtocolTestBase):
             self._restore_heartbeat()
 
 
+class JoinAckDeletedIdsTest(ProtocolTestBase):
+    """join_ack carries the group's delete tombstones (deletedIds) so a
+    member rejoining after a delete converges. The field is OPTIONAL: with
+    no tombstones it must stay absent (byte-level wire format unchanged)."""
+
+    def _join_ack(self, host):
+        s = FakePeerClient.connect("127.0.0.1", self.PORT)
+        s.hs_join(GROUP_NAME, GROUP_PASSWORD)
+        s.send(NetworkPacket(type="join", group_id=GROUP_NAME, peer=MEMBER_PEER))
+        ack = s.recv(skip_heartbeat=True)
+        s.close()
+        return ack
+
+    def test_join_ack_carries_deleted_ids(self):
+        host = self.start_host()
+        try:
+            host.deleted_ids_provider = lambda gid: ["dead-1", "dead-2"]
+            ack = self._join_ack(host)
+            self.assertEqual(ack.type, "join_ack")
+            self.assertEqual(ack.deleted_ids, ["dead-1", "dead-2"])
+            self.assertEqual(ack.to_dict()["deletedIds"], ["dead-1", "dead-2"])
+        finally:
+            host.stop()
+
+    def test_join_ack_omits_deleted_ids_without_tombstones(self):
+        host = self.start_host()
+        try:
+            host.deleted_ids_provider = lambda gid: []
+            ack = self._join_ack(host)
+            self.assertEqual(ack.type, "join_ack")
+            self.assertIsNone(ack.deleted_ids, "empty tombstones must omit the field")
+            self.assertNotIn("deletedIds", ack.to_dict())
+        finally:
+            host.stop()
+
+
+class FakeHostRecorder(Recorder):
+    def __init__(self):
+        super().__init__()
+        self.deleted_ids = []
+
+    def deleted_ids_received(self, p2p, deleted_ids):
+        self.deleted_ids.append(list(deleted_ids))
+
+
+class ClientConvergenceTest(unittest.TestCase):
+    """Client side behind a (possibly compromised) host: a join_ack with
+    deletedIds drops still-present local copies and notifies the listener,
+    and a relayed delete_message whose sender is not the message's original
+    author is dropped instead of applied."""
+
+    def _join_fake_host(self, srv, client):
+        client.query_group("127.0.0.1", srv.port)
+        self.assertTrue(
+            wait_until(lambda: client.queried_group_info is not None, timeout=12)
+        )
+        client.confirm_join("127.0.0.1", srv.port)
+        self.assertTrue(
+            wait_until(
+                lambda: client.connection_result is not None
+                and client.connection_result[0],
+                timeout=12,
+            )
+        )
+
+    def _fake_host_thread(self, srv, join_ack_builder):
+        t = threading.Thread(
+            target=lambda: srv.accept_loop(self._on_secured(join_ack_builder)),
+            daemon=True,
+        )
+        t.start()
+        time.sleep(0.2)
+
+    @staticmethod
+    def _drain(conn, wire, budget=0.3):
+        """Consume whatever the client already sent. On Windows a close with
+        unread data in the receive buffer sends RST, which destroys the
+        response still sitting in the send buffer — the client then sees EOF
+        instead of the packet (flake). The real host reads every packet, so
+        the fake must too."""
+        old_timeout = conn.gettimeout()
+        try:
+            conn.settimeout(budget)
+            while True:
+                try:
+                    if wire.recv_packet() is None:
+                        break
+                except Exception:
+                    break
+        finally:
+            try:
+                conn.settimeout(old_timeout)
+            except OSError:
+                pass
+
+    @classmethod
+    def _close_gracefully(cls, conn, wire):
+        cls._drain(conn, wire)
+        try:
+            conn.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        conn.close()
+
+    @classmethod
+    def _answer_query(cls, conn, wire):
+        # read the query packet first: replying before reading leaves unread
+        # data that would RST the connection and discard the group_info
+        cls._drain(conn, wire, budget=0.5)
+        wire.send_packet(NetworkPacket(
+            type="group_info",
+            group_info=GroupInfo(GROUP_NAME, HOST_NAME, "host-id", 1),
+        ))
+        conn.close()
+
+    def _on_secured(self, join_ack_builder):
+        def handler(mode, gid, conn, wire):
+            if mode == "query":
+                self._answer_query(conn, wire)
+                return
+            join_ack_builder(conn, wire)
+
+        return handler
+
+    def test_join_ack_deleted_ids_applied_locally(self):
+        srv = FakeHostServer(lambda mode, gid: GROUP_PASSWORD)
+
+        def on_join(conn, wire):
+            self._drain(conn, wire, budget=0.5)  # consume the join packet
+            wire.send_packet(NetworkPacket(
+                type="join_ack",
+                group_id="g",
+                members=[Peer("host", "H", "127.0.0.1", 9999)],
+                deleted_ids=["dead-9"],
+            ))
+            self._close_gracefully(conn, wire)
+
+        self._fake_host_thread(srv, on_join)
+        client = P2PManager(FakeHostRecorder(), port=19993)
+        client.initialize_as_client("\u6210\u5458", GROUP_NAME, password=GROUP_PASSWORD)
+        client.messages.append(ChatMessage(
+            "dead-9", "\u5f85\u6536\u655b", 1700000000000, "member-1", "\u5f20\u4e09",
+        ))
+        try:
+            self._join_fake_host(srv, client)
+            self.assertTrue(
+                wait_until(lambda: not any(m.id == "dead-9" for m in client.messages)),
+                "join_ack deletedIds must drop the local copy",
+            )
+            self.assertEqual(
+                client.listener.deleted_ids, [["dead-9"]],
+                "the listener must be told about the tombstones",
+            )
+        finally:
+            client.stop()
+            srv.close()
+
+    def test_client_drops_forged_relay_delete(self):
+        srv = FakeHostServer(lambda mode, gid: GROUP_PASSWORD)
+        chat_seen = threading.Event()
+        forged_done = threading.Event()
+        good_sent = threading.Event()
+
+        def on_join(conn, wire):
+            self._drain(conn, wire, budget=0.5)  # consume the join packet
+            wire.send_packet(NetworkPacket(
+                type="join_ack",
+                group_id="g",
+                members=[Peer("host", "H", "127.0.0.1", 9999)],
+            ))
+            wire.send_packet(NetworkPacket(
+                type="chat",
+                message=ChatMessage(
+                    "m-1", "\u4f2a\u9020\u76ee\u6807", 1700000000000,
+                    "member-1", "\u5f20\u4e09",
+                ),
+            ))
+            chat_seen.wait(6)
+            # forged: claims member-2 deleted member-1's message
+            wire.send_packet(NetworkPacket(
+                type="delete_message", message_id="m-1", sender_id="member-2",
+            ))
+            forged_done.wait(6)
+            # the real author's delete must still apply
+            wire.send_packet(NetworkPacket(
+                type="delete_message", message_id="m-1", sender_id="member-1",
+            ))
+            good_sent.set()
+            self._close_gracefully(conn, wire)
+
+        self._fake_host_thread(srv, on_join)
+        client = P2PManager(Recorder(), port=19992)
+        client.initialize_as_client("\u6210\u5458", GROUP_NAME, password=GROUP_PASSWORD)
+        try:
+            self._join_fake_host(srv, client)
+            self.assertTrue(wait_until(lambda: any(m.id == "m-1" for m in client.messages)))
+            chat_seen.set()
+            time.sleep(0.5)  # let the forged delete arrive and be processed
+            forged_done.set()
+            self.assertTrue(
+                any(m.id == "m-1" for m in client.messages),
+                "a relayed delete from anyone but the author must be dropped",
+            )
+            self.assertTrue(good_sent.wait(6))
+            self.assertTrue(
+                wait_until(lambda: not any(m.id == "m-1" for m in client.messages)),
+                "the author's own delete must still apply",
+            )
+        finally:
+            client.stop()
+            srv.close()
+
+
 class CallInfoSerializationTest(unittest.TestCase):
     """Wire format of the video-call packets must match kotlinx.serialization
     on the Android side (compact, camelCase, defaults omitted)."""

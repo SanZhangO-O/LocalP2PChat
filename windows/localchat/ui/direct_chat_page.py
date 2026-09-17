@@ -169,6 +169,7 @@ class DirectChatPage(QWidget):
         self.vm.direct_contacts_signal.connect(self._on_contacts_changed)
         self.vm.direct_session_closed.connect(self._on_session_closed)
         self.vm.file_download_finished.connect(self._on_file_download_finished)
+        self.vm.file_progress.connect(self._on_file_progress)
         self.vm.direct_chat_migrated.connect(self._on_chat_migrated)
 
     def open_chat(self, contact: Peer) -> None:
@@ -329,15 +330,36 @@ class DirectChatPage(QWidget):
         )
         if not path:
             return
-        self._file_states[msg.id] = ("downloading", path, "")
+        self._file_states[msg.id] = ("downloading", path, "0")
         self.list_view.viewport().update()
         self.vm.download_direct_file(peer_id, msg.id, path)
+
+    def _on_file_progress(self, file_id: str, received: int, total: int):
+        state = self._file_states.get(file_id)
+        if state is None or state[0] != "downloading":
+            return
+        if total > 0:
+            percent = min(99, int(received * 100 / total))
+            self._file_states[file_id] = ("downloading", state[1], str(percent))
+            self.list_view.viewport().update()
+
+    def _cancel_download(self, msg):
+        peer_id = self._peer_id
+        if peer_id is None:
+            return
+        self.vm.cancel_download(peer_id, msg.id)
+        state = self._file_states.get(msg.id)
+        if state is not None and state[0] == "downloading":
+            self._file_states[msg.id] = ("cancelled", "", "")
+            self.list_view.viewport().update()
 
     def _on_file_download_finished(self, file_id: str, ok: bool, message: str):
         if ok:
             path = self._file_states.get(file_id, ("", "", ""))[1]
             self._file_states[file_id] = ("done", path, "")
             Toast(self.window()).show_message("文件已保存")
+        elif "取消" in message:
+            self._file_states[file_id] = ("cancelled", "", "")
         else:
             self._file_states[file_id] = ("failed", "", message)
             Toast(self.window()).show_message(f"下载失败：{message}")
@@ -351,8 +373,12 @@ class DirectChatPage(QWidget):
         menu = QMenu(self.list_view)
         if msg.file_info is not None:
             download_action = None
-            if not file_offer_expired(msg.file_info):
+            cancel_action = None
+            state = self._file_states.get(msg.id, ("idle", "", ""))[0]
+            if not file_offer_expired(msg.file_info) and state != "downloading":
                 download_action = menu.addAction("下载 / 另存为")
+            if state == "downloading":
+                cancel_action = menu.addAction("取消下载")
             copy_name_action = menu.addAction("复制文件名")
             delete_action = None
             if msg.is_from_me:
@@ -361,6 +387,8 @@ class DirectChatPage(QWidget):
             chosen = menu.exec(self.list_view.viewport().mapToGlobal(pos))
             if download_action is not None and chosen is download_action:
                 self._download_file(msg)
+            elif cancel_action is not None and chosen is cancel_action:
+                self._cancel_download(msg)
             elif chosen is copy_name_action:
                 QApplication.clipboard().setText(msg.file_info.file_name)
             elif chosen is delete_action:

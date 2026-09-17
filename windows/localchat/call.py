@@ -13,10 +13,10 @@ Capture:
 - Video: OpenCV (cv2) because PyQt6 pip wheels do not ship the Qt ffmpeg
   multimedia backend on Windows; falls back to ffmpeg/DirectShow capture and
   then to a synthetic test pattern when no camera can be opened.
-- Audio: QtMultimedia QAudioSource/QAudioSink first (work without a backend
-  on other machines); when QtMultimedia has no audio backend at all,
-  sounddevice (PortAudio) provides capture/playback — same PCM16 mono 16 kHz
-  wire format either way.
+- Audio: sounddevice (PortAudio) is probed first (per side, on a worker
+  thread); QtMultimedia QAudioSource/QAudioSink is the per-side fallback
+  (e.g. when sounddevice is not installed) — same PCM16 mono 16 kHz wire
+  format either way.
 
 Threading: the media socket lives on plain worker threads; all state
 transitions and Qt audio/video objects stay on the GUI thread, reached via
@@ -33,6 +33,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import OrderedDict
 
 import cv2
 import numpy as np
@@ -67,6 +68,10 @@ MAX_FRAME_LEN = 512 * 1024
 # Largest ciphertext frame on the wire: a MAX_FRAME_LEN payload plus the GCM
 # nonce and tag aes_gcm_encrypt prepends/appends per frame.
 MAX_FRAME_WIRE_LEN = MAX_FRAME_LEN + GCM_NONCE_LEN + 16
+# Seen GCM nonces kept per media connection (raw 12 bytes, LRU, oldest
+# evicted) so a frame replayed inside the same connection is dropped like
+# tampered data (the wire format itself stays unchanged).
+MEDIA_NONCE_CACHE = 4096
 VIDEO_MAX_EDGE = 640
 VIDEO_JPEG_QUALITY = 70
 VIDEO_INTERVAL = 0.08  # ~12 fps
@@ -136,6 +141,28 @@ class FrameDecoder:
             self.frames.append((channel, payload))
 
 
+class NonceReplayGuard:
+    """LRU set of the raw GCM nonces seen on ONE media connection (capacity
+    MEDIA_NONCE_CACHE, oldest evicted). The media key is derived per
+    handshake, so a cross-connection replay already fails GCM authentication;
+    this guard catches a replay WITHIN the live connection, which must be
+    handled exactly like tampering."""
+
+    def __init__(self, capacity: int = MEDIA_NONCE_CACHE):
+        self._capacity = capacity
+        self._seen = OrderedDict()
+
+    def is_replay(self, nonce: bytes) -> bool:
+        """Record [nonce] and report whether it had already been seen."""
+        if nonce in self._seen:
+            self._seen.move_to_end(nonce)
+            return True
+        self._seen[nonce] = None
+        if len(self._seen) > self._capacity:
+            self._seen.popitem(last=False)
+        return False
+
+
 class CallManager(QObject):
     """One call at a time. Owns signaling, the media socket and the
     capture/playback resources; created on the GUI thread."""
@@ -149,13 +176,18 @@ class CallManager(QObject):
     call_ended = pyqtSignal(str)  # reason
     call_error = pyqtSignal(str)  # message
 
-    # Cross-thread plumbing (network threads -> GUI thread).
+    # Cross-thread plumbing (network threads -> GUI thread). Every call-scoped
+    # signal carries its call_id so a late event from a PREVIOUS call is
+    # dropped instead of hitting the current one.
     _sig_packet = pyqtSignal(object, object)  # (p2p, NetworkPacket)
-    _sig_media_socket = pyqtSignal(object, object)  # (socket, session_key)
-    _sig_media_ended = pyqtSignal(str)  # read loop ended: reason
-    _sig_connect_failed = pyqtSignal(str)
+    _sig_media_socket = pyqtSignal(str, object, object)  # (call_id, socket, session_key)
+    _sig_media_ended = pyqtSignal(str, str)  # (call_id, read loop ended: reason)
+    _sig_connect_failed = pyqtSignal(str, str)  # (call_id, message)
     _sig_ring_timeout = pyqtSignal(str)  # call_id
     _sig_shutdown_engines = pyqtSignal()  # worker -> GUI thread teardown
+    # sounddevice probe finished off the GUI thread (see _start_sd_audio):
+    # (call_id, in_stream, in_rate, in_channels, out_stream, out_rate)
+    _sig_sd_ready = pyqtSignal(str, object, int, int, object, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -165,6 +197,7 @@ class CallManager(QObject):
         self._peer_name = ""
         self._peer_ip = ""
         self._call_id = ""
+        self._media_port = 0
         self._p2p = None
         self._role = ""  # "caller" | "callee"
         # Signaling channel of the current call: callable(peer_id, packet).
@@ -240,6 +273,7 @@ class CallManager(QObject):
         self._sig_connect_failed.connect(self._on_connect_failed)
         self._sig_ring_timeout.connect(self._on_ring_timeout)
         self._sig_shutdown_engines.connect(self._shutdown_engines)
+        self._sig_sd_ready.connect(self._on_sd_audio_ready)
         self.remote_audio.connect(self._on_remote_audio)
 
     # ------------------------------------------------------------- public API
@@ -418,13 +452,13 @@ class CallManager(QObject):
                 )
             except OSError as e:
                 run_catching_close(sock)
-                self._sig_connect_failed.emit(f"{ip}:{port}（{e}）")
+                self._sig_connect_failed.emit(call_id, f"{ip}:{port}（{e}）")
                 return
             except Exception:
                 run_catching_close(sock)
-                self._sig_connect_failed.emit(f"{ip}:{port}（安全握手失败）")
+                self._sig_connect_failed.emit(call_id, f"{ip}:{port}（安全握手失败）")
                 return
-            self._sig_media_socket.emit(sock, key)
+            self._sig_media_socket.emit(call_id, sock, key)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -643,7 +677,7 @@ class CallManager(QObject):
             self.call_ended.emit("对方已挂断")
         self.state_changed.emit(STATE_IDLE, "", "")
 
-    def _on_media_socket(self, sock, key) -> None:
+    def _on_media_socket(self, call_id: str, sock, key) -> None:
         """Media socket arrived (caller accepted / callee connected) with its
         negotiated session key.
 
@@ -652,6 +686,12 @@ class CallManager(QObject):
         call_answer (sent by the callee) becomes redundant confirmation. This
         avoids a stuck "outgoing" state if that answer packet is ever lost."""
         with self._lock:
+            if call_id != self._call_id:
+                # Late arrival from a PREVIOUS call (its accept/connect thread
+                # finished after the call ended or was replaced): never adopt
+                # it into the current call.
+                run_catching_close(sock)
+                return
             role = self._role
             state = self._state
             if state == STATE_IDLE:
@@ -676,11 +716,15 @@ class CallManager(QObject):
             self._start_audio()
         self._start_read_loop(sock)
 
-    def _on_media_ended(self, reason: str) -> None:
+    def _on_media_ended(self, call_id: str, reason: str) -> None:
+        if call_id != self._call_id:
+            return  # late failure from a previous call: not ours
         self._end_call(reason)
 
-    def _on_connect_failed(self, message: str) -> None:
+    def _on_connect_failed(self, call_id: str, message: str) -> None:
         with self._lock:
+            if call_id != self._call_id:
+                return  # late failure from a previous call: not ours
             p2p = self._p2p
             call_id = self._call_id
             if self._state != STATE_INCOMING:
@@ -742,8 +786,22 @@ class CallManager(QObject):
     def _accept_loop(self, server, call_id) -> None:
         sock = None
         try:
-            server.settimeout(RING_TIMEOUT)
-            sock, _ = server.accept()
+            # Short accept timeouts: poll the call scope so a cancel/hangup
+            # ends this thread instead of blocking in accept() (closing the
+            # socket from another thread does not reliably wake a blocked
+            # accept on Windows).
+            server.settimeout(0.25)
+            deadline = time.monotonic() + RING_TIMEOUT
+            while sock is None:
+                if self._call_id != call_id:
+                    return  # call cancelled/replaced: drop this listener
+                if time.monotonic() >= deadline:
+                    self._sig_ring_timeout.emit(call_id)
+                    return
+                try:
+                    sock, _ = server.accept()
+                except socket.timeout:
+                    continue
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.settimeout(10)
             # Identity handshake on the media socket (the caller listens on the
@@ -803,9 +861,9 @@ class CallManager(QObject):
             return
         except OSError:
             run_catching_close(sock)
-            self._sig_media_ended.emit("安全握手失败，通话已结束")
+            self._sig_media_ended.emit(call_id, "安全握手失败，通话已结束")
             return
-        self._sig_media_socket.emit(sock, key)
+        self._sig_media_socket.emit(call_id, sock, key)
 
     def _start_read_loop(self, sock) -> None:
         # A media session starts fresh on every call: _media_stop may still
@@ -815,10 +873,14 @@ class CallManager(QObject):
         # _start_send_thread).
         self._media_stop.clear()
         self._start_send_thread()
-        threading.Thread(target=self._media_read_loop, args=(sock,), daemon=True).start()
+        threading.Thread(
+            target=self._media_read_loop, args=(sock, self._call_id), daemon=True
+        ).start()
 
-    def _media_read_loop(self, sock) -> None:
+    def _media_read_loop(self, sock, call_id: str) -> None:
         reason = "对方已挂断"
+        # One guard per media connection (this loop runs once per socket).
+        replay = NonceReplayGuard()
         try:
             sock.settimeout(MEDIA_READ_TIMEOUT)
             while not self._media_stop.is_set():
@@ -837,6 +899,13 @@ class CallManager(QObject):
                 key = self._media_key
                 if key is None:
                     return
+                if replay.is_replay(blob[:GCM_NONCE_LEN]):
+                    # a nonce already used on this connection means the frame
+                    # is a replay — treat it exactly like tampered data
+                    logger.warning(
+                        "media frame nonce replay detected, dropping the connection"
+                    )
+                    return
                 try:
                     payload = aes_gcm_decrypt(key, blob)
                 except Exception:
@@ -854,7 +923,7 @@ class CallManager(QObject):
         except OSError:
             pass
         finally:
-            self._sig_media_ended.emit(reason)
+            self._sig_media_ended.emit(call_id, reason)
 
     def _send_media(self, channel: int, payload: bytes) -> None:
         """Queue a media frame for the background sender thread.
@@ -891,12 +960,13 @@ class CallManager(QObject):
         if self._send_thread is not None and self._send_thread.is_alive():
             return
         self._send_stop.clear()
+        call_id = self._call_id
         self._send_thread = threading.Thread(
-            target=self._send_loop, daemon=True, name="call-media-sender"
+            target=self._send_loop, args=(call_id,), daemon=True, name="call-media-sender"
         )
         self._send_thread.start()
 
-    def _send_loop(self) -> None:
+    def _send_loop(self, call_id: str) -> None:
         """Single writer for the media socket: audio first, video in gaps.
 
         Audio is produced every ~20 ms for the whole call (silence frames
@@ -911,23 +981,27 @@ class CallManager(QObject):
             except queue.Empty:
                 payload = None
             if payload is not None:
-                self._write_frame(CH_AUDIO, payload)
-                self._send_pending_video()
+                self._write_frame(CH_AUDIO, payload, call_id)
+                self._send_pending_video(call_id)
                 continue
-            self._send_pending_video()
+            self._send_pending_video(call_id)
 
-    def _send_pending_video(self) -> None:
+    def _send_pending_video(self, call_id: str) -> None:
         try:
             payload = self._video_send_q.get_nowait()
         except queue.Empty:
             payload = None
         if payload is not None:
-            self._write_frame(CH_VIDEO, payload)
+            self._write_frame(CH_VIDEO, payload, call_id)
 
-    def _write_frame(self, channel: int, payload: bytes) -> None:
+    def _write_frame(self, channel: int, payload: bytes, call_id: str = "") -> None:
         sock = self._media_socket
         key = self._media_key
         if sock is None or key is None or self._send_stop.is_set():
+            return
+        if call_id and call_id != self._call_id:
+            # stale sender from a previous call: never write into (or kill)
+            # the current call's media socket
             return
         try:
             blob = aes_gcm_encrypt(key, payload)
@@ -935,7 +1009,7 @@ class CallManager(QObject):
                 if sock is not None and not self._send_stop.is_set():
                     sock.sendall(build_frame(channel, blob))
         except OSError:
-            self._sig_media_ended.emit("连接已断开")
+            self._sig_media_ended.emit(call_id, "连接已断开")
 
     # ------------------------------------------------------------ capture
 
@@ -1306,9 +1380,14 @@ class CallManager(QObject):
         # has no working backend at all (QAudioSink "succeeds" but never plays,
         # QAudioSource reports OpenError), while PortAudio reliably provides
         # capture/playback; Qt is the per-side fallback when sounddevice is not
-        # installed.
-        self._start_sd_audio()
-        self._start_qt_audio()
+        # installed. Probed on a worker thread: opening devices (including the
+        # 0.6 s mono probe in _sd_open) must not block the GUI thread while
+        # the call activates — _start_qt_audio() fills in the remaining sides
+        # once the probe reports back.
+        threading.Thread(
+            target=self._start_sd_audio, args=(self._call_id,), daemon=True,
+            name="call-audio-probe",
+        ).start()
 
     def _start_qt_audio(self) -> None:
         """QtMultimedia per-side fallback (only used when sounddevice could not
@@ -1417,30 +1496,76 @@ class CallManager(QObject):
 
     # ------------------------------------------- PortAudio (sounddevice) audio
 
-    def _start_sd_audio(self) -> None:
-        """Start sounddevice (PortAudio) capture/playback for whichever side
-        QtMultimedia could not provide. The wire format is the same PCM16 mono
-        16 kHz used everywhere, so the chunks plug straight into the existing
-        send/receive path (native-rate devices are resampled)."""
+    def _start_sd_audio(self, call_id: str) -> None:
+        """Worker-thread probe: start sounddevice (PortAudio) capture/playback
+        for whichever side QtMultimedia could not provide. The wire format is
+        the same PCM16 mono 16 kHz used everywhere, so the chunks plug straight
+        into the existing send/receive path (native-rate devices are
+        resampled). Reports the opened streams via _sig_sd_ready.
+
+        The report is emitted in a `finally`: _start_qt_audio() runs from that
+        report, so a raising probe (PortAudio errors, no devices, a dead host
+        API) must still hand the call over to Qt instead of leaving it with no
+        audio engine at all. Streams opened before the failure are reported so
+        they are adopted and Qt only fills in the missing side."""
+        in_stream, in_rate, in_ch = None, AUDIO_SAMPLE_RATE, 1
+        out_stream, out_rate = None, AUDIO_SAMPLE_RATE
         try:
-            import sounddevice as sd
+            try:
+                import sounddevice as sd
+            except Exception:
+                return
+            if self._audio_in_dev is None and self._sd_input is None:
+                dev = self._sd_pick_device(sd, want_input=True)
+                if dev is not None:
+                    stream, rate, channels = self._sd_open(sd, dev, want_input=True)
+                    if stream is not None:
+                        in_stream, in_rate, in_ch = stream, rate, channels
+            if self._audio_out_dev is None and self._sd_output is None:
+                dev = self._sd_pick_device(sd, want_input=False)
+                if dev is not None:
+                    stream, rate, channels = self._sd_open(sd, dev, want_input=False)
+                    if stream is not None:
+                        out_stream, out_rate = stream, rate
         except Exception:
+            logger.warning(
+                "sounddevice probe failed; QtMultimedia takes the missing side(s)",
+                exc_info=True,
+            )
+        finally:
+            self._sig_sd_ready.emit(
+                call_id, in_stream, in_rate, in_ch, out_stream, out_rate
+            )
+
+    def _on_sd_audio_ready(self, call_id: str, in_stream, in_rate: int, in_ch: int,
+                           out_stream, out_rate: int) -> None:
+        """GUI-thread completion of the sounddevice probe: adopt the streams
+        for the CURRENT call only, then let Qt fill in any side sounddevice
+        could not provide."""
+        stale = False
+        with self._lock:
+            if call_id != self._call_id or not self._audio_started:
+                # the call is gone (or already replaced): discard the probe
+                stale = True
+            else:
+                self._sd_input = in_stream
+                self._sd_input_rate = in_rate
+                self._sd_input_channels = in_ch
+                self._sd_output = out_stream
+                self._sd_output_rate = out_rate
+        if stale:
+            for stream in (in_stream, out_stream):
+                if stream is not None:
+                    try:
+                        stream.stop()
+                    except Exception:
+                        pass
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
             return
-        if self._audio_in_dev is None and self._sd_input is None:
-            dev = self._sd_pick_device(sd, want_input=True)
-            if dev is not None:
-                stream, rate, channels = self._sd_open(sd, dev, want_input=True)
-                if stream is not None:
-                    self._sd_input = stream
-                    self._sd_input_rate = rate
-                    self._sd_input_channels = channels
-        if self._audio_out_dev is None and self._sd_output is None:
-            dev = self._sd_pick_device(sd, want_input=False)
-            if dev is not None:
-                stream, rate, channels = self._sd_open(sd, dev, want_input=False)
-                if stream is not None:
-                    self._sd_output = stream
-                    self._sd_output_rate = rate
+        self._start_qt_audio()
 
     def _sd_open(self, sd, device: int, want_input: bool):
         """Open a sounddevice stream for [device]: first at the 16 kHz call
@@ -1528,7 +1653,13 @@ class CallManager(QObject):
                     return idx
             except Exception:
                 pass
-        for i, info in enumerate(sd.query_devices()):
+        try:
+            devices = list(sd.query_devices())
+        except Exception:
+            # a dead host API / no devices must degrade to "no sounddevice
+            # candidate" instead of raising out of the audio probe
+            return None
+        for i, info in enumerate(devices):
             channels = (
                 info["max_input_channels"] if want_input else info["max_output_channels"]
             )
@@ -1687,6 +1818,15 @@ class CallManager(QObject):
                     q.get_nowait()
             except queue.Empty:
                 pass
+        sender = self._send_thread
+        if sender is not None:
+            # Android CallManager parity: interrupt/join the sender at
+            # teardown so a stale sender can neither starve the next call
+            # (the isAlive guard in _start_send_thread would keep refusing)
+            # nor write into the next call's socket. The loop polls
+            # _send_stop every ~0.1 s and the media socket is already closed
+            # by the time we get here, so this returns promptly.
+            sender.join(timeout=0.5)
         self._send_thread = None
         # NEVER clear the stop event while the capture loop may still be
         # sleeping inside its `while not stop_event.is_set()` check: clearing

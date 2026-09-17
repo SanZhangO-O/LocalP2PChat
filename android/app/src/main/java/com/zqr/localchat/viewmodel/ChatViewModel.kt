@@ -31,6 +31,7 @@ import com.zqr.localchat.crypto.Crypto
 import com.zqr.localchat.data.ChatDao
 import com.zqr.localchat.data.ChatDatabase
 import com.zqr.localchat.data.ChatMessage
+import com.zqr.localchat.data.DeletedMessage
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.Peer
 import com.zqr.localchat.data.SavedChatMessage
@@ -54,9 +55,12 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.io.OutputStream
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -109,6 +113,106 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val dbLocks = ConcurrentHashMap<String, Mutex>()
     private suspend fun <T> withDbLock(key: String, block: suspend () -> T): T =
         dbLocks.getOrPut(key) { Mutex() }.withLock { block() }
+
+    /**
+     * Tombstones for a group whose row does not exist yet: join_ack
+     * deletedIds arrive DURING the join, while the success path persists the
+     * saved_groups row afterwards. deleted_messages has a CASCADE foreign key
+     * onto saved_groups, so inserting earlier would fail the FK and the
+     * silently swallowed error would let a later history replay resurrect the
+     * message. Buffered here, flushed the moment the group row is written.
+     */
+    private val pendingTombstones = ConcurrentHashMap<String, MutableSet<String>>()
+
+    /**
+     * Record tombstones for locally-applied deletes (own delete, a relayed or
+     * meshed delete_message, a peer's deletedIds cleanup) so members that
+     * were OFFLINE converge later via join_ack / history_reply deletedIds.
+     * Idempotent upserts, bounded per group (trim to the newest CAP); buffered
+     * in memory while the group row is still missing (see [pendingTombstones]).
+     */
+    private fun writeTombstones(groupId: String, messageIds: List<String>) {
+        if (messageIds.isEmpty()) return
+        val now = System.currentTimeMillis()
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                withDbLock(groupId) {
+                    if (!persistTombstones(groupId, messageIds, now)) {
+                        bufferTombstones(groupId, messageIds)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Blocking variant for the join_ack path: the tombstones must be in the
+     * database BEFORE the join result triggers the history replay (a
+     * fire-and-forget write could land after the replay had already read the
+     * table). Runs on the network thread, like [deletedIdsFor]; buffered in
+     * memory when the group row is not written yet.
+     */
+    private fun writeTombstonesBlocking(groupId: String, messageIds: List<String>) {
+        if (messageIds.isEmpty()) return
+        runBlocking {
+            runCatching {
+                withDbLock(groupId) {
+                    if (!persistTombstones(groupId, messageIds, System.currentTimeMillis())) {
+                        bufferTombstones(groupId, messageIds)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun bufferTombstones(groupId: String, messageIds: Collection<String>) {
+        if (messageIds.isEmpty()) return
+        // computeIfAbsent is atomic on ConcurrentHashMap: a concurrent
+        // buffer/flush must never drop the other side's ids
+        pendingTombstones.computeIfAbsent(groupId) { ConcurrentHashMap.newKeySet<String>() }
+            .addAll(messageIds)
+    }
+
+    /** Insert tombstones (idempotent) + trim the table; false when the group
+     *  row is missing so the caller buffers instead of losing them. */
+    private suspend fun persistTombstones(
+        groupId: String,
+        messageIds: Collection<String>,
+        deletedAt: Long
+    ): Boolean {
+        if (chatDao.getGroup(groupId) == null) return false
+        chatDao.upsertDeletedMessages(messageIds.map { DeletedMessage(groupId, it, deletedAt) })
+        chatDao.trimDeletedMessages(groupId, DeletedMessage.CAP)
+        return true
+    }
+
+    /** Flush tombstones buffered before the group row existed; on failure they
+     *  go back to the buffer (the next flush or join retries). */
+    private suspend fun flushPendingTombstones(groupId: String) {
+        val ids = pendingTombstones.remove(groupId) ?: return
+        if (ids.isEmpty()) return
+        val ok = runCatching {
+            withDbLock(groupId) { persistTombstones(groupId, ids, System.currentTimeMillis()) }
+        }.getOrDefault(false)
+        if (!ok) bufferTombstones(groupId, ids)
+    }
+
+    /**
+     * Tombstoned message ids of a group, served to join_ack / history_reply
+     * senders. Called on network worker threads (no coroutine context there),
+     * so the short indexed read blocks the caller briefly. Buffered pending
+     * ids count too: a peer asking while our group row is not written yet must
+     * still learn the delete.
+     */
+    private fun deletedIdsFor(groupId: String): List<String> {
+        val persisted = runBlocking {
+            runCatching { chatDao.getDeletedMessages(groupId).map { it.msgId } }
+                .getOrDefault(emptyList())
+        }
+        val pending = pendingTombstones[groupId]?.toList().orEmpty()
+        if (pending.isEmpty()) return persisted
+        return (persisted + pending).distinct()
+    }
 
     private val _activeGroupPassword = MutableStateFlow<String?>(null)
     val activeGroupPassword: StateFlow<String?> = _activeGroupPassword.asStateFlow()
@@ -194,26 +298,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     /** Download a file offered in a direct chat into [targetUri]; progress is
      *  surfaced via [downloadStates] keyed by the file message id. */
     fun downloadDirectFile(fileInfo: FileInfo, targetUri: Uri) {
-        val fileId = fileInfo.fileId
-        _downloadStates.update { it + (fileId to DownloadState.Downloading) }
-        viewModelScope.launch(Dispatchers.IO) {
-            val resolver = getApplication<Application>().contentResolver
-            val result = runCatching {
-                val out = resolver.openOutputStream(targetUri, "w")
-                    ?: error("无法打开输出流")
-                out.use { DirectChatManager.downloadFile(fileInfo, it) }
-            }.getOrElse { FileTransfer.DownloadResult(false, it.message ?: "未知错误") }
-            if (!result.ok) {
-                // drop the partially written file so a failed download does
-                // not leave a corrupt copy behind
-                runCatching { resolver.delete(targetUri, null, null) }
-            }
-            _downloadStates.update { map ->
-                map + (fileId to if (result.ok)
-                    DownloadState.Done(targetUri.toString())
-                else
-                    DownloadState.Failed(result.message))
-            }
+        runDownload(fileInfo.fileId, targetUri) { out, onProgress, cancelled, socks ->
+            DirectChatManager.downloadFile(fileInfo, out, onProgress, cancelled, socks)
         }
     }
 
@@ -604,8 +690,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     // exclude the host from the mesh member list: it relays to
                     // everyone, linking to it would be redundant
                     val members = p2p.peers.value.values.filter { host == null || it.id != host.id }
+                    // offline-member delete convergence: the sponsor's ack
+                    // carries this group's tombstoned ids as well (null
+                    // omitted; empty list must not serialize either)
                     wire.sendPacket(
-                        NetworkPacket(type = "join_ack", groupId = groupId, members = members, host = host)
+                        NetworkPacket(
+                            type = "join_ack",
+                            groupId = groupId,
+                            members = members,
+                            host = host,
+                            deletedIds = deletedIdsFor(groupId).ifEmpty { null }
+                        )
                     )
                     socket.close()
                     // tell every member about the newcomer so the mesh links up
@@ -676,13 +771,114 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Download state per file message id, surfaced to the chat UI. */
     sealed class DownloadState {
-        data object Downloading : DownloadState()
+        /** [percent] is 0..100; updated throttled (5% or 256KB steps). */
+        data class Downloading(val percent: Int = 0) : DownloadState()
         data class Done(val uri: String) : DownloadState()
         data class Failed(val message: String) : DownloadState()
     }
 
     private val _downloadStates = MutableStateFlow<Map<String, DownloadState>>(emptyMap())
     val downloadStates: StateFlow<Map<String, DownloadState>> = _downloadStates.asStateFlow()
+
+    /** One running download: the cancel flag the transfer loop polls per chunk
+     *  plus every socket the transfer opened, so a cancel can shut a blocked
+     *  read down at once (the flag alone only lands at the next chunk). */
+    private class DownloadHandle {
+        val cancelled = AtomicBoolean(false)
+        val socks: MutableList<java.net.Socket> =
+            java.util.Collections.synchronizedList(mutableListOf())
+    }
+
+    /** Active downloads keyed by file message id. Companion-held so the chat
+     *  UI can cancel via [cancelDownload] without needing the ViewModel
+     *  instance (FileMessageBubble is shared by the group and direct
+     *  screens). */
+    companion object {
+        private const val CHANNEL_MESSAGES = "localchat_messages"
+        private val activeDownloads = ConcurrentHashMap<String, DownloadHandle>()
+
+        /** User tapped 取消下载: the download aborts, the partial file is
+         *  deleted and the state becomes 失败（已取消）. The transfer socket is
+         *  shut down so an in-flight read returns immediately (a stalled peer
+         *  must not hold the cancel for the whole 120s read timeout). */
+        fun cancelDownload(fileId: String) {
+            val handle = activeDownloads[fileId] ?: return
+            handle.cancelled.set(true)
+            for (s in handle.socks.toList()) {
+                runCatching { s.shutdownInput() }
+                runCatching { s.shutdownOutput() }
+            }
+        }
+    }
+
+    /**
+     * Shared runner for group and direct downloads: registers a cancel flag
+     * and the transfer's sockets, streams into [targetUri] with throttled
+     * progress (5% or 256KB, the UI shows 下载中 N%), deletes the partial file
+     * on any failure and marks the final state. [transfer] performs the actual
+     * blocking transfer.
+     */
+    private fun runDownload(
+        fileId: String,
+        targetUri: Uri,
+        transfer: (
+            OutputStream,
+            (Long, Long) -> Unit,
+            () -> Boolean,
+            MutableList<java.net.Socket>
+        ) -> FileTransfer.DownloadResult
+    ) {
+        val handle = DownloadHandle()
+        activeDownloads[fileId] = handle
+        _downloadStates.update { it + (fileId to DownloadState.Downloading(0)) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val resolver = getApplication<Application>().contentResolver
+            val result = runCatching {
+                val out = resolver.openOutputStream(targetUri, "w")
+                    ?: error("无法打开输出流")
+                var lastBytes = 0L
+                var lastPercent = -5
+                out.use { os ->
+                    transfer(
+                        os,
+                        { received, total ->
+                            // throttle: report at 5%-of-total OR 256KB steps,
+                            // whichever comes first (a known total also forces
+                            // the final 100% update)
+                            val percent = if (total > 0) {
+                                ((received * 100) / total).toInt().coerceIn(0, 100)
+                            } else 0
+                            if (received - lastBytes >= 256 * 1024 ||
+                                percent >= lastPercent + 5 ||
+                                (total > 0 && received >= total)
+                            ) {
+                                lastBytes = received
+                                lastPercent = percent
+                                _downloadStates.update {
+                                    it + (fileId to DownloadState.Downloading(percent))
+                                }
+                            }
+                        },
+                        { handle.cancelled.get() },
+                        handle.socks
+                    )
+                }
+            }.getOrElse { FileTransfer.DownloadResult(false, it.message ?: "未知错误") }
+            activeDownloads.remove(fileId)
+            if (!result.ok) {
+                // drop the partially written file so a failed download does
+                // not leave a corrupt copy behind
+                runCatching { resolver.delete(targetUri, null, null) }
+            }
+            _downloadStates.update { map ->
+                map + (fileId to when {
+                    result.ok -> DownloadState.Done(targetUri.toString())
+                    handle.cancelled.get() -> DownloadState.Failed("已取消")
+                    else -> DownloadState.Failed(result.message)
+                })
+            }
+        }
+    }
 
     private fun activeP2pFlow(): Flow<P2PManager?> =
         combine(_activeGroupId, _groupP2pVersion) { gid, _ -> gid }.flatMapLatest { gid ->
@@ -759,11 +955,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         get() = port
 
     /** Change the program-wide port and rebind the shared host server.
-     * Existing member connections keep working; new joins use the new port. */
+     * Existing member connections keep working; new joins use the new port.
+     * Unconditional (Windows view_model.py parity): the shared listener also
+     * serves direct member chats, so it must rebind even when no group is
+     * hosted. */
     fun setPort(newPort: Int) {
         if (newPort !in 1..65535) return
         ChatApp.savePort(getApplication(), newPort)
-        if (hostServer.hasGroups()) hostServer.restart(newPort)
+        hostServer.restart(newPort)
         _groups.update { list ->
             list.map { g -> if (g.isHost) g.copy(hostPort = newPort) else g }
         }
@@ -822,11 +1021,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             groupP2pMap[groupId]?.mergeIncoming(msgs)
         }
         // Mesh-received deletes apply locally (the mesh path validated the
-        // sender itself); the _messages collector then mirrors the removal to
-        // the database exactly like relay-delivered deletes.
+        // sender itself; senderId == null means a tombstone-synced delete —
+        // trusted); the _messages collector then mirrors the removal to the
+        // database exactly like relay-delivered deletes, and the tombstone is
+        // recorded so a later join_ack / history_reply carries it onward.
         GroupMeshManager.onGroupDelete = { groupId, messageId, senderId ->
             groupP2pMap[groupId]?.removeLocalMessage(messageId, senderId)
+            writeTombstones(groupId, listOf(messageId))
         }
+        // history_reply tombstone sync: the provider is read on mesh worker
+        // threads when a link's history is pushed (see GroupMeshManager).
+        GroupMeshManager.deletedIdsProvider = { groupId -> deletedIdsFor(groupId) }
+        // join_ack tombstone sync: tombstones learned from a peer's ack are
+        // persisted so a history replay cannot resurrect the deleted rows.
+        // Global callbacks (one shared database), set before any join runs.
+        // BLOCKING on purpose: the ack is processed before the join result, and
+        // the replay that follows must already see these tombstones (a
+        // fire-and-forget write could land after the replay had read them).
+        P2PManager.onPeerDeletedIds = { groupId, deletedIds ->
+            writeTombstonesBlocking(groupId, deletedIds)
+        }
+        P2PManager.deletedIdsProvider = { groupId -> deletedIdsFor(groupId) }
 
         // Password resolution for incoming handshakes on the shared listener:
         // host groups by numeric join id, member groups (join sponsors) by
@@ -1098,6 +1313,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 lastMessageTime = if (keepOldSummary) old.lastMessageTime else group.lastMessageTime
             )
         }
+        // the group row now exists: tombstones that arrived during the join
+        // (join_ack deletedIds) can finally be written — they were buffered
+        // because the FK onto saved_groups would have rejected them
+        flushPendingTombstones(group.groupId)
     }
 
     /** Rebuild a FileInfo from a persisted row. Every restored offer is shown
@@ -1211,30 +1430,57 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun loadAndReplayMessages(groupId: String, p2p: P2PManager) {
         val job = viewModelScope.launch(Dispatchers.IO) {
-            val saved = chatDao.getMessagesForGroup(groupId).first()
-            // a stale load (this p2p already replaced by a reconnect) must
-            // neither publish history into the new instance's message list
-            // nor mark replay done — otherwise an old connection's replay
-            // finishing late can make the new connection treat persisted
-            // messages as deleted and wipe them from the database
-            if (groupP2pMap[groupId] !== p2p) return@launch
-            persistedMessageIds[groupId] = saved.map { it.id }.toMutableSet()
-            if (saved.isNotEmpty()) {
-                val msgs = saved.map { sm ->
-                    ChatMessage(
-                        id = sm.id,
-                        content = sm.content,
-                        timestamp = sm.timestamp,
-                        senderId = sm.senderId,
-                        senderName = sm.senderName,
-                        isFromMe = sm.isFromMe,
-                        fileInfo = restoredFileInfo(sm)
-                    )
+            try {
+                val saved = chatDao.getMessagesForGroup(groupId).first()
+                // a stale load (this p2p already replaced by a reconnect) must
+                // neither publish history into the new instance's message list
+                // nor mark replay done — otherwise an old connection's replay
+                // finishing late can make the new connection treat persisted
+                // messages as deleted and wipe them from the database
+                if (groupP2pMap[groupId] !== p2p) return@launch
+                // offline-member delete convergence: rows whose delete was
+                // applied before this load (join_ack deletedIds arriving while
+                // the group was offline) must not replay — drop them from the
+                // DB as well so they cannot resurface on a later load either.
+                // Tombstones buffered before the group row existed (join) and
+                // any that failed to flush count too.
+                runCatching { flushPendingTombstones(groupId) }
+                val tombstonedIds = runCatching {
+                    chatDao.getDeletedMessages(groupId).map { it.msgId }
+                }.getOrDefault(emptyList()) + pendingTombstones[groupId].orEmpty()
+                if (tombstonedIds.isNotEmpty()) {
+                    val staleRows = saved.filter { it.id in tombstonedIds }.map { it.id }
+                    if (staleRows.isNotEmpty()) {
+                        runCatching {
+                            withDbLock(groupId) {
+                                staleRows.forEach { chatDao.deleteMessage(groupId, it) }
+                            }
+                        }
+                    }
                 }
-                p2p.replaySavedMessages(msgs)
-            }
-            if (groupP2pMap[groupId] === p2p) {
-                replayDone[groupId] = p2p
+                val fresh = saved.filter { it.id !in tombstonedIds }
+                persistedMessageIds[groupId] = fresh.map { it.id }.toMutableSet()
+                if (fresh.isNotEmpty()) {
+                    val msgs = fresh.map { sm ->
+                        ChatMessage(
+                            id = sm.id,
+                            content = sm.content,
+                            timestamp = sm.timestamp,
+                            senderId = sm.senderId,
+                            senderName = sm.senderName,
+                            isFromMe = sm.isFromMe,
+                            fileInfo = restoredFileInfo(sm)
+                        )
+                    }
+                    p2p.replaySavedMessages(msgs)
+                }
+            } finally {
+                // close the replay window even on failure: a raised replay must
+                // not leave the group permanently unable to mirror deletes
+                // (and record their tombstones)
+                if (groupP2pMap[groupId] === p2p) {
+                    replayDone[groupId] = p2p
+                }
             }
         }
         replayJobs[groupId] = job
@@ -1537,6 +1783,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         removedGroupIds.add(groupId)
         persistedMessageIds.remove(groupId)
         persistedPeerCounts.remove(groupId)
+        // tombstones buffered for a group row that never got written are moot
+        // (the group is gone): drop them so a later same-id group cannot adopt
+        // stale deletes
+        pendingTombstones.remove(groupId)
         _groups.update { list -> list.filter { it.groupId != groupId } }
         if (_activeGroupId.value == groupId) {
             _activeGroupId.value = null
@@ -1595,7 +1845,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             viewModelScope.launch(Dispatchers.IO) {
                 // suppressed: a stale DB write racing a group removal is
                 // already swallowed by the FK-bound collector path below
-                runCatching { withDbLock(gid) { chatDao.deleteMessage(gid, messageId) } }
+                runCatching {
+                    withDbLock(gid) {
+                        chatDao.deleteMessage(gid, messageId)
+                        // offline members learn the delete later via this
+                        // device's join_ack / history_reply deletedIds
+                        chatDao.upsertDeletedMessages(
+                            listOf(DeletedMessage(gid, messageId, System.currentTimeMillis()))
+                        )
+                        chatDao.trimDeletedMessages(gid, DeletedMessage.CAP)
+                    }
+                }
             }
         }
     }
@@ -1620,27 +1880,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * [downloadStates] keyed by the file message id. */
     fun downloadFile(fileInfo: FileInfo, targetUri: Uri) {
         val gid = _activeGroupId.value ?: return
-        val p2p = groupP2pMap[gid] ?: return
-        val fileId = fileInfo.fileId
-        _downloadStates.update { it + (fileId to DownloadState.Downloading) }
-        viewModelScope.launch(Dispatchers.IO) {
-            val resolver = getApplication<Application>().contentResolver
-            val result = runCatching {
-                val out = resolver.openOutputStream(targetUri, "w")
-                    ?: error("无法打开输出流")
-                out.use { p2p.downloadFile(fileInfo, it) }
-            }.getOrElse { FileTransfer.DownloadResult(false, it.message ?: "未知错误") }
-            if (!result.ok) {
-                // drop the partially written file so a failed download does
-                // not leave a corrupt copy behind
-                runCatching { resolver.delete(targetUri, null, null) }
-            }
-            _downloadStates.update { map ->
-                map + (fileId to if (result.ok)
-                    DownloadState.Done(targetUri.toString())
-                else
-                    DownloadState.Failed(result.message))
-            }
+        if (groupP2pMap[gid] == null) return
+        runDownload(fileInfo.fileId, targetUri) { out, onProgress, cancelled, socks ->
+            FileTransfer.download(fileInfo, out, onProgress, cancelled, socks)
         }
     }
 
@@ -1786,6 +2028,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 // emission instead of being forgotten
                                 val deleted = runCatching {
                                     removedIds.forEach { chatDao.deleteMessage(groupId, it) }
+                                    // every applied delete becomes a tombstone
+                                    // so later join_ack / history_reply carry
+                                    // it to members that were offline
+                                    chatDao.upsertDeletedMessages(
+                                        removedIds.map { DeletedMessage(groupId, it, System.currentTimeMillis()) }
+                                    )
+                                    chatDao.trimDeletedMessages(groupId, DeletedMessage.CAP)
                                 }.isSuccess
                                 if (deleted) {
                                     persistedIds.removeAll(removedIds)
@@ -1904,9 +2153,5 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         pendingP2pManager?.stop()
         hostServer.shutdown()
         ChatApp.stopChatService(getApplication())
-    }
-
-    companion object {
-        private const val CHANNEL_MESSAGES = "localchat_messages"
     }
 }

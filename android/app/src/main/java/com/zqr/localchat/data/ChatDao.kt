@@ -83,4 +83,23 @@ interface ChatDao {
 
     @Query("DELETE FROM saved_messages WHERE groupId = :groupId AND id = :messageId")
     suspend fun deleteMessage(groupId: String, messageId: String)
+
+    /**
+     * Tombstones of deleted messages per group (offline-member delete
+     * convergence): REPLACE keeps the newest deletedAt on a re-apply, so
+     * recording the same delete twice is idempotent.
+     */
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertDeletedMessages(messages: List<DeletedMessage>)
+
+    @Query("SELECT * FROM deleted_messages WHERE groupId = :groupId")
+    suspend fun getDeletedMessages(groupId: String): List<DeletedMessage>
+
+    /** Keep only the newest [max] tombstones of a group (bounded growth). */
+    @Query(
+        "DELETE FROM deleted_messages WHERE groupId = :groupId AND msgId NOT IN " +
+            "(SELECT msgId FROM deleted_messages WHERE groupId = :groupId " +
+            "ORDER BY deletedAt DESC LIMIT :max)"
+    )
+    suspend fun trimDeletedMessages(groupId: String, max: Int)
 }
