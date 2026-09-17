@@ -12,7 +12,7 @@ description: Use when debugging or testing the LocalChat Android app (this repo)
 
 - 应用固定端口 `Constants.TCP_PORT = 9999`；`ServerSocket(port)` 绑定 0.0.0.0，所以 adb forward（连 localhost）可达。
 - 现有 AVD：`Medium_Phone_2` 和 `Medium_Phone_API_36.1`（后者 ini 别名指向 `Medium_Phone.avd` 数据目录），均为 android-36.1 x86_64。
-- SDK 在 `C:\Users\zhangqir\AppData\Local\Android\Sdk`，`adb`/`emulator` 不在 PATH，要用全路径。
+- SDK 在 `<user>\AppData\Local\Android\Sdk`（默认 SDK 安装路径），`adb`/`emulator` 不在 PATH，要用全路径。
 - 日志 tag：`P2PManager`、`HostGroupServer`、`DirectChat`、`GroupMesh`。
 
 ## 1. 模拟器网络：两台 NAT 互相连不到（最重要）

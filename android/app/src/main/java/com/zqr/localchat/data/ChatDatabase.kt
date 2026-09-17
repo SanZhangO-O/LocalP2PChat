@@ -9,7 +9,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [SavedGroup::class, SavedChatMessage::class, DeletedMessage::class],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -17,12 +17,27 @@ abstract class ChatDatabase : RoomDatabase() {
 
     companion object {
         /**
-         * v1 -> v2: adds the deleted_messages tombstone table (offline-member
-         * delete convergence). CREATE TABLE + index only — no existing data is
-         * touched, so the destructive fallback was removed: an upgrade must
-         * never silently wipe the user's chat history.
+         * v1 -> v2: add the file-message kind column. History must survive the
+         * upgrade, so this is a real migration — NEVER destructive. (The
+         * destructive fallback was removed for the same reason: a schema the
+         * migrations cannot explain must fail loudly, not wipe chat history.)
          */
         private val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE saved_messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'"
+                )
+            }
+        }
+
+        /**
+         * v2 -> v3: adds the deleted_messages tombstone table (offline-member
+         * delete convergence). CREATE TABLE + index only — no existing data is
+         * touched. The `kind` guard keeps a v2 database from the interim
+         * tombstone-only build upgradeable too (that build shipped the table
+         * but not the column).
+         */
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL(
                     "CREATE TABLE IF NOT EXISTS `deleted_messages` (" +
@@ -35,6 +50,20 @@ abstract class ChatDatabase : RoomDatabase() {
                     "CREATE INDEX IF NOT EXISTS `index_deleted_messages_groupId` " +
                         "ON `deleted_messages` (`groupId`)"
                 )
+                var hasKind = false
+                db.query("PRAGMA table_info(`saved_messages`)").use { c ->
+                    val nameIndex = c.getColumnIndex("name")
+                    while (c.moveToNext()) {
+                        if (nameIndex >= 0 && c.getString(nameIndex) == "kind") {
+                            hasKind = true
+                        }
+                    }
+                }
+                if (!hasKind) {
+                    db.execSQL(
+                        "ALTER TABLE saved_messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'"
+                    )
+                }
             }
         }
 
@@ -48,7 +77,7 @@ abstract class ChatDatabase : RoomDatabase() {
                     ChatDatabase::class.java,
                     "localchat_database"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .build()
                 INSTANCE = instance
                 instance

@@ -23,6 +23,7 @@ import androidx.compose.ui.unit.sp
 import com.zqr.localchat.ChatApp
 import com.zqr.localchat.network.Constants
 import com.zqr.localchat.network.GroupInfo
+import com.zqr.localchat.viewmodel.ChatViewModel
 import kotlinx.coroutines.launch
 
 internal const val DEFAULT_GROUP_PORT = Constants.TCP_PORT
@@ -125,6 +126,8 @@ fun SetupScreen(
     var groupPassword by rememberSaveable { mutableStateOf("") }
     var modeName by rememberSaveable { mutableStateOf<String?>(null) }
     val mode = modeName?.let { name -> runCatching { SetupMode.valueOf(name) }.getOrNull() }
+    var pendingDuplicateCreate by rememberSaveable { mutableStateOf(false) }
+    val savedGroupNames by ChatViewModel.savedGroupNames.collectAsState()
 
     val addressText = if (localIpAddress.isNotEmpty()) {
         "$localIpAddress:$localPort"
@@ -150,13 +153,13 @@ fun SetupScreen(
                     hostIp = hostIp,
                     groupPassword = groupPassword,
                     isLoading = isQuerying,
-                    onUserNameChange = { userName = it },
+                    onUserNameChange = { userName = it.take(20) },
                     onGroupNameChange = { groupName = it },
                     onHostIpChange = { hostIp = it },
                     onPasswordChange = { groupPassword = it },
                     onJoin = {
                         val parsed = parseHostPort(hostIp)
-                        if (parsed.host.isNotBlank()) {
+                        if (isValidHost(parsed.host)) {
                             onQueryGroup(
                                 userName,
                                 groupName,
@@ -181,9 +184,15 @@ fun SetupScreen(
                         groupName = groupName,
                         addressText = addressText,
                         localIpAddress = localIpAddress,
-                        onUserNameChange = { userName = it },
-                        onGroupNameChange = { groupName = it },
-                        onCreate = { onCreateGroup(userName, groupName) },
+                        onUserNameChange = { userName = it.take(20) },
+                        onGroupNameChange = { groupName = it.take(20) },
+                        onCreate = {
+                            if (groupName.trim() in savedGroupNames) {
+                                pendingDuplicateCreate = true
+                            } else {
+                                onCreateGroup(userName, groupName)
+                            }
+                        },
                         onBack = { modeName = null }
                     )
                     SetupMode.JOIN -> JoinGroupForm(
@@ -194,7 +203,7 @@ fun SetupScreen(
                         isLoading = isQuerying,
                         errorMessage = queryError ?: connectionError,
                         onUserNameChange = {
-                            userName = it
+                            userName = it.take(20)
                             onClearError()
                         },
                         onGroupNameChange = {
@@ -211,7 +220,7 @@ fun SetupScreen(
                         },
                         onJoin = {
                             val parsed = parseHostPort(hostIp)
-                            if (parsed.host.isNotBlank()) {
+                            if (isValidHost(parsed.host)) {
                                 onQueryGroup(
                                     userName,
                                     groupName,
@@ -228,6 +237,27 @@ fun SetupScreen(
                 }
             }
         }
+    }
+
+    if (pendingDuplicateCreate) {
+        AlertDialog(
+            onDismissRequest = { pendingDuplicateCreate = false },
+            title = { Text("已存在同名群组") },
+            text = { Text("已存在同名群组，重新创建将替换原群组（聊天记录保留），是否继续？") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingDuplicateCreate = false
+                        onCreateGroup(userName, groupName)
+                    }
+                ) {
+                    Text("继续创建")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDuplicateCreate = false }) { Text("取消") }
+            }
+        )
     }
 }
 
@@ -524,7 +554,7 @@ private fun JoinGroupForm(
     onBack: () -> Unit
 ) {
     val parsedHost = remember(hostIp) { parseHostPort(hostIp) }
-    val hostInputError = if (hostIp.isNotBlank() && parsedHost.host.isBlank()) "请输入有效的IP地址" else null
+    val hostInputError = if (hostIp.isNotBlank() && !isValidHost(parsedHost.host)) "请输入有效的IP地址" else null
     val hostPortError = if (hasInvalidPort(hostIp)) "端口无效（范围 1-65535）" else null
 
     Column(
@@ -616,7 +646,7 @@ private fun JoinGroupForm(
         Button(
             onClick = onJoin,
             enabled = !isLoading && userName.isNotBlank() &&
-                joinIdDigits.length == 8 && parsedHost.host.isNotBlank() && hostPortError == null,
+                joinIdDigits.length == 8 && isValidHost(parsedHost.host) && hostPortError == null,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(50.dp),

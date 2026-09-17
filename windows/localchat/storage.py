@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional
 
-from .models import ChatMessage
+from .models import FILE_KIND_FILE, ChatMessage
 
 
 @dataclass
@@ -33,6 +33,9 @@ class SavedMessage:
     file_size: int = 0
     download_host: str = ""
     download_port: int = 0
+    # file-message kind ("file" | "image" | "video"): media kinds render
+    # inline in the conversation, also after a restart
+    kind: str = FILE_KIND_FILE
     # True while an own direct-chat message still waits for the peer to come
     # online (pending send). Restored into the outbox at startup.
     pending: bool = False
@@ -134,6 +137,10 @@ class ChatStore:
                 c.execute(
                     "ALTER TABLE saved_messages ADD COLUMN downloadPort INTEGER NOT NULL DEFAULT 0"
                 )
+            if "kind" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'"
+                )
             return
         # old schema: rebuild with the composite PK (+ pending) and copy rows
         c.execute("ALTER TABLE saved_messages RENAME TO saved_messages_old")
@@ -150,6 +157,7 @@ class ChatStore:
                 fileSize INTEGER NOT NULL DEFAULT 0,
                 downloadHost TEXT NOT NULL DEFAULT '',
                 downloadPort INTEGER NOT NULL DEFAULT 0,
+                kind TEXT NOT NULL DEFAULT 'file',
                 pending INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (groupId) REFERENCES saved_groups(groupId) ON DELETE CASCADE,
                 PRIMARY KEY (groupId, id)
@@ -164,10 +172,10 @@ class ChatStore:
             f"""
             INSERT INTO saved_messages
                 (id, groupId, content, timestamp, senderId, senderName, isFromMe,
-                 fileSize, downloadHost, downloadPort, pending)
+                 fileSize, downloadHost, downloadPort, kind, pending)
             SELECT id, groupId, content, timestamp, senderId, senderName, isFromMe,
                    {_col('fileSize', '0')}, {_col('downloadHost', "''")},
-                   {_col('downloadPort', '0')}, 0
+                   {_col('downloadPort', '0')}, {_col('kind', "'file'")}, 0
             FROM saved_messages_old
             """
         )
@@ -260,8 +268,8 @@ class ChatStore:
                 """
                 INSERT OR REPLACE INTO saved_messages
                 (id, groupId, content, timestamp, senderId, senderName, isFromMe,
-                 fileSize, downloadHost, downloadPort, pending)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 fileSize, downloadHost, downloadPort, kind, pending)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -275,6 +283,7 @@ class ChatStore:
                         m.file_size,
                         m.download_host,
                         m.download_port,
+                        m.kind,
                         1 if m.pending else 0,
                     )
                     for m in messages
@@ -300,6 +309,7 @@ class ChatStore:
                 file_size=r["fileSize"] if "fileSize" in r.keys() else 0,
                 download_host=r["downloadHost"] if "downloadHost" in r.keys() else "",
                 download_port=r["downloadPort"] if "downloadPort" in r.keys() else 0,
+                kind=r["kind"] if "kind" in r.keys() else FILE_KIND_FILE,
                 pending=bool(r["pending"]) if "pending" in r.keys() else False,
             )
             for r in rows
@@ -328,6 +338,7 @@ class ChatStore:
                 file_size=r["fileSize"] if "fileSize" in r.keys() else 0,
                 download_host=r["downloadHost"] if "downloadHost" in r.keys() else "",
                 download_port=r["downloadPort"] if "downloadPort" in r.keys() else 0,
+                kind=r["kind"] if "kind" in r.keys() else FILE_KIND_FILE,
                 pending=True,
             )
             for r in rows
@@ -353,9 +364,9 @@ class ChatStore:
                 """
                 INSERT OR REPLACE INTO saved_messages
                     (id, groupId, content, timestamp, senderId, senderName, isFromMe,
-                     fileSize, downloadHost, downloadPort, pending)
+                     fileSize, downloadHost, downloadPort, kind, pending)
                 SELECT id, ?, content, timestamp, senderId, senderName, isFromMe,
-                       fileSize, downloadHost, downloadPort, pending
+                       fileSize, downloadHost, downloadPort, kind, pending
                 FROM saved_messages WHERE groupId = ?
                 """,
                 (to_group_id, from_group_id),
@@ -449,5 +460,6 @@ def to_saved_message(group_id: str, msg: ChatMessage) -> SavedMessage:
         file_size=fi.file_size if fi is not None else 0,
         download_host=fi.download_host if fi is not None else "",
         download_port=fi.download_port if fi is not None else 0,
+        kind=fi.kind if fi is not None else FILE_KIND_FILE,
         pending=msg.pending,
     )

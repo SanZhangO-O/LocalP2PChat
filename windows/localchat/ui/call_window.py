@@ -40,7 +40,7 @@ class IncomingCallDialog(QDialog):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
 
-        detail = QLabel(f"<b>{caller_name}</b> 邀请你进行视频通话")
+        detail = QLabel(f"<b>{caller_name.toHtmlEscaped()}</b> 邀请你进行视频通话")
         detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         detail.setWordWrap(True)
         layout.addWidget(detail)

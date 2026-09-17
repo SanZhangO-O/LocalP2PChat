@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Media downloaded by downloadMedia lives under filesDir/media; the
+     FileProvider exposes it read-only to the viewer/player apps the user
+     opens it with (openDownloadedFile). -->
+<paths>
+    <files-path name="media" path="media/" />
+</paths>

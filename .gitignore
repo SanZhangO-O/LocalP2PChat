@@ -2,6 +2,7 @@
 windows/build/
 windows/dist/
 windows/data/
+windows/data.bak_user/
 windows/*.db
 windows/*.lock
 

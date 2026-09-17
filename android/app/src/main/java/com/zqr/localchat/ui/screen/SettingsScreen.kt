@@ -86,8 +86,11 @@ fun SettingsScreen(
                     )
                     Button(
                         onClick = {
-                            if (nickText.isNotBlank()) {
-                                onSaveNickname(nickText.trim())
+                            val trimmed = nickText.trim()
+                            if (trimmed.isEmpty()) {
+                                Toast.makeText(context, "昵称不能为空", Toast.LENGTH_SHORT).show()
+                            } else {
+                                onSaveNickname(trimmed)
                                 Toast.makeText(context, "昵称已保存", Toast.LENGTH_SHORT).show()
                             }
                         },

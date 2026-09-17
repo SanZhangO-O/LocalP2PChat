@@ -12,6 +12,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -33,7 +35,8 @@ fun GroupListScreen(
     onGroupClick: (String) -> Unit,
     onAddGroup: () -> Unit,
     onOpenSettings: () -> Unit,
-    onRemoveGroup: (String) -> Unit
+    onRemoveGroup: (String) -> Unit,
+    onToggleMute: (String, Boolean) -> Unit
 ) {
     var pendingDelete by remember { mutableStateOf<String?>(null) }
 
@@ -101,7 +104,8 @@ fun GroupListScreen(
                     GroupItem(
                         group = group,
                         onClick = { onGroupClick(group.groupId) },
-                        onRemove = { pendingDelete = group.groupId }
+                        onRemove = { pendingDelete = group.groupId },
+                        onToggleMute = { onToggleMute(group.groupId, !group.muted) }
                     )
                 }
             }
@@ -137,7 +141,8 @@ fun GroupListScreen(
 private fun GroupItem(
     group: ChatViewModel.GroupMeta,
     onClick: () -> Unit,
-    onRemove: () -> Unit
+    onRemove: () -> Unit,
+    onToggleMute: () -> Unit
 ) {
     Card(
         modifier = Modifier
@@ -252,6 +257,16 @@ private fun GroupItem(
                         )
                     }
                 }
+            }
+            // per-group notification mute: muted groups badge unread in-app
+            // but never post a system notification
+            IconButton(onClick = onToggleMute) {
+                Icon(
+                    imageVector = if (group.muted) Icons.Filled.NotificationsOff else Icons.Filled.Notifications,
+                    contentDescription = if (group.muted) "取消免打扰" else "群消息免打扰",
+                    tint = if (group.muted) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
             // explicit delete entry: long-press alone is undiscoverable both
             // for users and for accessibility services

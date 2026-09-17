@@ -199,7 +199,7 @@ fun MemberListScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedTextField(
                         value = nameText,
-                        onValueChange = { nameText = it },
+                        onValueChange = { nameText = it.take(20) },
                         singleLine = true,
                         label = { Text("备注名（可选）") },
                         modifier = Modifier.fillMaxWidth()

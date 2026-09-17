@@ -34,6 +34,9 @@ data class SavedChatMessage(
     val fileSize: Long = 0L,
     val downloadHost: String = "",
     val downloadPort: Int = 0,
+    /** File-message kind ("file" | "image" | "video"): media kinds render
+     *  inline in the conversation, also after a restart. */
+    val kind: String = "file",
     /** True while an own direct-chat message is still waiting for the peer
      *  to come online (pending send). Restored into the outbox at startup. */
     val pending: Boolean = false

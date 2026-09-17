@@ -63,7 +63,11 @@ class ChatApp : Application() {
             ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE).getString(KEY_NICKNAME, "") ?: ""
 
         fun saveNickname(ctx: Context, name: String) {
-            ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE).edit().putString(KEY_NICKNAME, name).apply()
+            // defense in depth: every nickname entry point truncates to 20,
+            // but a stray caller must not persist an unbounded name either
+            ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE).edit()
+                .putString(KEY_NICKNAME, name.take(20))
+                .apply()
         }
 
         /** The single program-wide port used by every host group (default 9999). */
@@ -87,6 +91,23 @@ class ChatApp : Application() {
             ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE)
                 .edit()
                 .putBoolean(KEY_BACKGROUND_RUNNING, enabled)
+                .apply()
+        }
+
+        private fun groupMutedKey(groupId: String) = "group_muted_$groupId"
+
+        /**
+         * Whether a group is muted: new messages still badge unread in-app,
+         * but never post a system notification. Persisted, so it survives
+         * restarts; a removed group clears its flag so a future group reusing
+         * the id starts unmuted.
+         */
+        fun isGroupMuted(ctx: Context, groupId: String): Boolean =
+            ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE).getBoolean(groupMutedKey(groupId), false)
+
+        fun setGroupMuted(ctx: Context, groupId: String, muted: Boolean) {
+            ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE).edit()
+                .putBoolean(groupMutedKey(groupId), muted)
                 .apply()
         }
 

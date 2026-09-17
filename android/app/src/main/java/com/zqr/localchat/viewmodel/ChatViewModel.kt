@@ -3,6 +3,7 @@ package com.zqr.localchat.viewmodel
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Context.MODE_PRIVATE
 import android.content.Intent
@@ -17,6 +18,7 @@ import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.Person
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Lifecycle
@@ -26,6 +28,7 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import com.zqr.localchat.ChatApp
 import com.zqr.localchat.MainActivity
+import com.zqr.localchat.NotificationDismissReceiver
 import com.zqr.localchat.call.CallManager
 import com.zqr.localchat.crypto.Crypto
 import com.zqr.localchat.data.ChatDao
@@ -33,6 +36,7 @@ import com.zqr.localchat.data.ChatDatabase
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.DeletedMessage
 import com.zqr.localchat.data.FileInfo
+import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.data.Peer
 import com.zqr.localchat.data.SavedChatMessage
 import com.zqr.localchat.data.SavedGroup
@@ -78,6 +82,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val lastMessage: String = "",
         val lastMessageTime: Long = 0L,
         val unreadCount: Int = 0,
+        val muted: Boolean = false,
         val connected: Boolean = false
     )
 
@@ -287,12 +292,156 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Bumped whenever an own sent image finishes copying into the media dir;
+     *  the chat UI keys its media path lookups on it so the sender's own
+     *  image bubble flips to the inline render as soon as the copy lands. */
+    private val _mediaVersion = MutableStateFlow(0)
+    val mediaVersion: StateFlow<Int> = _mediaVersion.asStateFlow()
+
     /** Offer a file to a direct-chat member. */
-    fun sendDirectFile(peerId: String, uri: Uri, fileName: String, fileSize: Long): Boolean {
+    fun sendDirectFile(
+        peerId: String,
+        uri: Uri,
+        fileName: String,
+        fileSize: Long,
+        kind: String = FileKind.FILE
+    ): Boolean {
         if (fileName.isBlank()) return false
-        return DirectChatManager.sendFile(
-            peerId, fileName, getApplication<Application>().contentResolver, uri, fileSize
-        )
+        val msg = DirectChatManager.sendFile(
+            peerId, fileName, getApplication<Application>().contentResolver, uri, fileSize, kind
+        ) ?: return false
+        mirrorOwnMedia(msg.id, uri, fileName, kind)
+        return true
+    }
+
+    /** After an own IMAGE goes out, copy it into the media dir (worker
+     *  thread) so the sender's own bubble renders inline like a received one
+     *  — and keeps doing so after a restart. Videos are NOT copied: they are
+     *  far larger and the placeholder card already opens fine for the
+     *  sender. Failures are silently ignored: the copy is a rendering
+     *  convenience, the offer itself was already delivered. */
+    private fun mirrorOwnMedia(fileId: String, uri: Uri, fileName: String, kind: String) {
+        if (kind != FileKind.IMAGE) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = runCatching {
+                val target = mediaTargetFile(fileId, fileName)
+                target.parentFile?.mkdirs()
+                // .part + rename so a half-copied image is never visible to
+                // the UI's media path probe (Windows parity)
+                val tmp = java.io.File(target.absolutePath + ".part")
+                tmp.outputStream().use { output ->
+                    getApplication<Application>().contentResolver.openInputStream(uri)?.use { input ->
+                        input.copyTo(output)
+                    } ?: return@runCatching false
+                }
+                if (!tmp.renameTo(target)) {
+                    tmp.delete()
+                    return@runCatching false
+                }
+                true
+            }.getOrDefault(false)
+            if (ok) _mediaVersion.update { it + 1 }
+        }
+    }
+
+    /** Download a media (image/video) message into the app's media dir so it
+     *  renders inline in the conversation; NO system save dialog. Progress is
+     *  surfaced via [downloadStates] keyed by the file message id. */
+    fun downloadMedia(fileInfo: FileInfo, isDirect: Boolean) {
+        val fileId = fileInfo.fileId
+        val target = mediaTargetFile(fileId, fileInfo.fileName)
+        if (fileInfo.fileSize > 0 && target.isFile && target.length() == fileInfo.fileSize) {
+            _downloadStates.update { map ->
+                map + (fileId to DownloadState.Done(target.absolutePath))
+            }
+            return
+        }
+        // register the cancel handle + throttled progress (5% or 256KB) for
+        // this media download: the transfer socket is handed to the canceller
+        // so a stalled read can be shut down, and [downloadStates] shows the
+        // percent while the row is 下载中
+        val handle = DownloadHandle()
+        activeDownloads[fileId] = handle
+        var lastBytes = 0L
+        var lastPercent = -5
+        val progress: (Long, Long) -> Unit = { received, total ->
+            val percent = if (total > 0) {
+                ((received * 100) / total).toInt().coerceIn(0, 100)
+            } else 0
+            if (received - lastBytes >= 256 * 1024 ||
+                percent >= lastPercent + 5 ||
+                (total > 0 && received >= total)
+            ) {
+                lastBytes = received
+                lastPercent = percent
+                _downloadStates.update { it + (fileId to DownloadState.Downloading(percent)) }
+            }
+        }
+        _downloadStates.update { it + (fileId to DownloadState.Downloading(0)) }
+        viewModelScope.launch(Dispatchers.IO) {
+            // download to a .part file and rename on success: the UI probes
+            // the target path to render inline media, so a partially written
+            // target must never be visible there (Windows parity)
+            val tmp = java.io.File(target.absolutePath + ".part")
+            val result = runCatching {
+                tmp.parentFile?.mkdirs()
+                tmp.outputStream().use { out ->
+                    if (isDirect) {
+                        DirectChatManager.downloadFile(
+                            fileInfo, out, progress, { handle.cancelled.get() }, handle.socks
+                        )
+                    } else {
+                        val gid = _activeGroupId.value
+                        val p2p = gid?.let { groupP2pMap[it] }
+                            ?: return@runCatching FileTransfer.DownloadResult(false, "未连接到群组")
+                        p2p.downloadFile(
+                            fileInfo, out, progress, { handle.cancelled.get() }, handle.socks
+                        )
+                    }
+                }
+                FileTransfer.DownloadResult(true)
+            }.getOrElse { FileTransfer.DownloadResult(false, it.message ?: "未知错误") }
+            activeDownloads.remove(fileId)
+            if (result.ok) {
+                if (!tmp.renameTo(target)) {
+                    tmp.delete()
+                    _downloadStates.update { map ->
+                        map + (fileId to DownloadState.Failed("无法保存媒体文件"))
+                    }
+                    return@launch
+                }
+            } else {
+                tmp.delete()
+            }
+            _downloadStates.update { map ->
+                map + (fileId to when {
+                    result.ok -> DownloadState.Done(target.absolutePath)
+                    handle.cancelled.get() -> DownloadState.Failed("已取消")
+                    else -> DownloadState.Failed(result.message)
+                })
+            }
+        }
+    }
+
+    /** Deterministic local target for a downloaded media message, keyed by
+     *  the file id so same-named files from different messages never collide.
+     *  The UI checks [File.exists] on this path to re-render inline media
+     *  after a restart. */
+    fun mediaTargetFile(fileId: String, fileName: String): java.io.File {
+        val dir = java.io.File(getApplication<Application>().filesDir, "media")
+        val safe = fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .trim('.', ' ')
+            .ifBlank { "file" }
+            .take(80)
+        return java.io.File(dir, "${fileId}_$safe")
+    }
+
+    /** Path of an already-downloaded media copy, or null. Lets the chat UI
+     *  render image/video messages inline (also after a restart). */
+    fun localMediaPath(fileInfo: FileInfo): String? {
+        if (fileInfo.kind != FileKind.IMAGE && fileInfo.kind != FileKind.VIDEO) return null
+        val f = mediaTargetFile(fileInfo.fileId, fileInfo.fileName)
+        return if (f.isFile) f.absolutePath else null
     }
 
     /** Download a file offered in a direct chat into [targetUri]; progress is
@@ -336,7 +485,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // no effect". Reject it here; the UI surfaces 地址无效 (Windows
         // parity).
         if (!isValidHost(parsed.host) || parsed.port !in 1..65535) return false
-        val nick = name.trim().ifBlank { parsed.host }
+        val nick = name.trim().ifBlank { parsed.host }.take(20)
         val contact = DirectChatManager.Contact(
             "ip:${parsed.host}:${parsed.port}", nick, parsed.host, parsed.port
         )
@@ -496,6 +645,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                         fileSize = msg.fileInfo?.fileSize ?: 0L,
                                         downloadHost = msg.fileInfo?.downloadHost ?: "",
                                         downloadPort = msg.fileInfo?.downloadPort ?: 0,
+                                        kind = msg.fileInfo?.kind ?: FileKind.FILE,
                                         pending = msg.pending
                                     )
                                 })
@@ -617,7 +767,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         ChatApp.savedNickname(getApplication()).ifBlank { "用户" }
 
     fun setNickname(name: String) {
-        val nick = name.trim()
+        val nick = name.trim().take(20)
         if (nick.isBlank()) return
         ChatApp.saveNickname(getApplication(), nick)
     }
@@ -808,6 +958,104 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 runCatching { s.shutdownInput() }
                 runCatching { s.shutdownOutput() }
             }
+        }
+
+        private const val GROUP_KEY_MESSAGES = "localchat_message_group"
+        private const val SUMMARY_NOTIFICATION_ID = 20001
+        private const val MAX_NOTIFICATION_MESSAGES = 8
+        const val ACTION_NOTIF_DISMISSED = "com.zqr.localchat.NOTIF_DISMISSED"
+        const val EXTRA_DISMISSED_GROUP_ID = "com.zqr.localchat.DISMISSED_GROUP_ID"
+
+        /** Process-wide mirror of the current group names (kept in sync with
+         *  [groups] in init): the setup screen reads it to confirm before a
+         *  same-name creation silently replaces the old group instance. */
+        val savedGroupNames = MutableStateFlow<List<String>>(emptyList())
+
+        private data class NotifEntry(val sender: String, val text: String, val time: Long)
+
+        /**
+         * Recent incoming messages per group: a follow-up notification
+         * re-renders the whole recent conversation (MessagingStyle) instead
+         * of a single orphan bubble. Lives on the companion — NOT the
+         * instance — because it must stay in sync with what is actually in
+         * the shade across activity/ViewModel recreation, and because
+         * [NotificationDismissReceiver] clears entries from outside any
+         * instance. Cleared when a notification is cancelled or swiped away,
+         * so it only ever holds messages the user has NOT seen as
+         * notifications yet.
+         */
+        private val notificationLog = ConcurrentHashMap<String, MutableList<NotifEntry>>()
+
+        private fun notificationsPermissionGranted(context: Context): Boolean =
+            Build.VERSION.SDK_INT < 33 ||
+                ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+
+        private fun ensureMessageChannel(context: Context) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    CHANNEL_MESSAGES,
+                    "新消息",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "收到新群聊消息时通知"
+                }
+                context.getSystemService(NotificationManager::class.java)
+                    .createNotificationChannel(channel)
+            }
+        }
+
+        /**
+         * Swipe-away hook for [NotificationDismissReceiver]: a dismissed
+         * bubble must drop its log entry, or the group's next message
+         * re-renders already-dismissed messages and the summary keeps stale
+         * counts. A null group id means the whole summary / group stack was
+         * dismissed — clear everything.
+         */
+        fun onNotificationsDismissed(context: Context, groupId: String?) {
+            if (groupId == null) notificationLog.clear()
+            else notificationLog.remove(groupId)
+            refreshMessageSummary(context)
+        }
+
+        /** Reconcile the grouped summary with the log: posted only while two
+         *  or more groups still have unread notifications (a single child
+         *  stands alone), cancelled otherwise. */
+        private fun refreshMessageSummary(context: Context) {
+            if (!notificationsPermissionGranted(context)) return
+            ensureMessageChannel(context)
+            val nm = NotificationManagerCompat.from(context)
+            if (notificationLog.size < 2) {
+                nm.cancel(SUMMARY_NOTIFICATION_ID)
+                return
+            }
+            val total = notificationLog.values.sumOf { it.size }
+            val openIntent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            }
+            val contentPendingIntent = PendingIntent.getActivity(
+                context, SUMMARY_NOTIFICATION_ID, openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            // no group id extra = swipe of the whole stack clears the log
+            val deleteIntent = Intent(context, NotificationDismissReceiver::class.java)
+                .setAction(ACTION_NOTIF_DISMISSED)
+            val deletePendingIntent = PendingIntent.getBroadcast(
+                context, SUMMARY_NOTIFICATION_ID, deleteIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val summary = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+                .setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setGroup(GROUP_KEY_MESSAGES)
+                .setGroupSummary(true)
+                .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
+                .setContentTitle("LocalChat")
+                .setContentText("${notificationLog.size} 个群聊共 $total 条新消息")
+                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                .setAutoCancel(true)
+                .setContentIntent(contentPendingIntent)
+                .setDeleteIntent(deletePendingIntent)
+                .build()
+            nm.notify(SUMMARY_NOTIFICATION_ID, summary)
         }
     }
 
@@ -1015,6 +1263,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // once; the private key never leaves app storage).
         DeviceIdentity.ensureLoaded(application)
 
+        // Mirror the group list's names into the companion flow so the setup
+        // screen can detect a same-name re-creation without extra wiring.
+        viewModelScope.launch {
+            _groups.collect { list -> savedGroupNames.value = list.map { it.groupName } }
+        }
+
         // Group mesh: messages arriving over member-to-member links (host
         // offline, or history backfill) flow into the owning group's list.
         GroupMeshManager.onGroupMessage = { groupId, msgs ->
@@ -1215,6 +1469,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                     false,
                                     hostIp = hostIp,
                                     hostPort = hostPort,
+                                    muted = ChatApp.isGroupMuted(getApplication(), groupId),
                                     connected = true
                                 )
                             ) + groups
@@ -1325,11 +1580,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      *  side restarted, a stale address only produces a failed download. The
      *  bubble renders it as "已过期" instead of offering a download that can
      *  no longer succeed; the sender can re-share the file for a fresh
-     *  address. */
+     *  address. The kind is preserved so image/video messages keep rendering
+     *  inline (from their local media copy) across restarts. */
     private fun restoredFileInfo(sm: SavedChatMessage): FileInfo? {
         if (sm.fileSize <= 0 && sm.downloadHost.isEmpty()) return null
         // blank the address for every restored offer, own or received
-        return FileInfo(sm.id, sm.content, sm.fileSize, "", 0)
+        return FileInfo(sm.id, sm.content, sm.fileSize, "", 0, kind = sm.kind)
     }
 
     private fun loadPersistedGroups() {
@@ -1354,7 +1610,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 hostPort = if (sg.isHost) currentPort else sg.hostPort,
                                 memberCount = sg.memberCount,
                                 lastMessage = sg.lastMessage,
-                                lastMessageTime = sg.lastMessageTime
+                                lastMessageTime = sg.lastMessageTime,
+                                muted = ChatApp.isGroupMuted(getApplication(), sg.groupId)
                             )
                         }
                         .filter { it.groupId !in currentIds && it.groupId !in removedGroupIds }
@@ -1488,9 +1745,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun createGroup(userName: String, groupName: String) {
         if (userName.isBlank() || groupName.isBlank()) return
-        val name = groupName.trim()
+        val name = groupName.trim().take(20)
         if (name.isBlank()) return
-        val nick = userName.trim()
+        val nick = userName.trim().take(20)
         ChatApp.saveNickname(getApplication(), nick)
 
         // Crypto-random group password (8 chars ≈ 47.6 bits): high enough
@@ -1542,11 +1799,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun queryGroup(userName: String, groupId: String, hostIp: String, password: String? = null) {
         val id = groupId.trim().filter { it.isDigit() }
         val ip = hostIp.trim()
-        if (id.isBlank() || ip.isBlank()) return
+        // VM-side double check with the UI gating (UI can be bypassed): the
+        // numeric join id must be 8 digits and the endpoint a usable
+        // host:port — anything else can never connect.
+        if (id.length != 8 || ip.isBlank()) return
         val parsed = parseHostPort(ip)
-        if (parsed.host.isBlank()) return
-        val nick = userName.trim()
-        ChatApp.saveNickname(getApplication(), nick)
+        if (!isValidHost(parsed.host) || parsed.port !in 1..65535) return
+        // A blank nickname (spaces) must not overwrite the saved nickname;
+        // keep the current one and continue the join rather than stalling.
+        val rawNick = userName.trim().take(20)
+        val nick = rawNick.ifBlank { currentNickname() }
+        if (rawNick.isNotBlank()) {
+            ChatApp.saveNickname(getApplication(), rawNick)
+        }
         stopPendingP2p()
         _rejoinInProgress.value = false
         _rejoinFailed.value = false
@@ -1787,6 +2052,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // (the group is gone): drop them so a later same-id group cannot adopt
         // stale deletes
         pendingTombstones.remove(groupId)
+        // drop the group's notification AND its mute flag: group ids can be
+        // reused (they derive from fingerprint + port), so a stale flag would
+        // silently mute a future group with the same id
+        cancelGroupNotification(groupId)
+        ChatApp.setGroupMuted(getApplication(), groupId, false)
         _groups.update { list -> list.filter { it.groupId != groupId } }
         if (_activeGroupId.value == groupId) {
             _activeGroupId.value = null
@@ -1833,6 +2103,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (g.groupId == groupId && g.unreadCount > 0) g.copy(unreadCount = 0) else g
             }
         }
+        // also drops a notification still showing from an earlier background
+        // session once the user opens the group
+        cancelGroupNotification(groupId)
     }
 
     fun deleteMessage(messageId: String) {
@@ -1861,18 +2134,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Offer a file (from a content Uri) to the active group. */
-    fun sendFile(uri: Uri, fileName: String, fileSize: Long): Boolean {
+    fun sendFile(
+        uri: Uri,
+        fileName: String,
+        fileSize: Long,
+        kind: String = FileKind.FILE
+    ): Boolean {
         if (fileName.isBlank()) return false
         val gid = _activeGroupId.value ?: return false
         val p2p = groupP2pMap[gid] ?: return false
         // Sending depends only on the SENDER being online: the host relay OR a
         // live mesh link is enough, so the host going offline never blocks it.
         if (!p2p.isConnected && !GroupMeshManager.hasLinks(gid)) return false
-        val msg = p2p.sendFile(fileName, getApplication<Application>().contentResolver, uri, fileSize) ?: return false
+        val msg = p2p.sendFile(fileName, getApplication<Application>().contentResolver, uri, fileSize, kind)
+            ?: return false
         // p2p.sendFile relays the offer to the group when the host is up; the
         // mesh delivers it to every linked member either way (receivers dedup
         // by message id)
         GroupMeshManager.broadcast(gid, msg)
+        mirrorOwnMedia(msg.id, uri, fileName, kind)
         return true
     }
 
@@ -2010,7 +2290,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                     if (!isAppForeground.value && incoming.isNotEmpty()) {
-                        notifyNewMessages(groupId, newMessages.first().senderName, incoming.last().content, incoming.size)
+                        notifyNewMessages(
+                            groupId,
+                            _groups.value.find { it.groupId == groupId }?.groupName ?: "群聊",
+                            incoming.map { NotifEntry(it.senderName, it.content, it.timestamp) }
+                        )
                     }
                 }
 
@@ -2054,7 +2338,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                         isFromMe = msg.isFromMe,
                                         fileSize = msg.fileInfo?.fileSize ?: 0L,
                                         downloadHost = msg.fileInfo?.downloadHost ?: "",
-                                        downloadPort = msg.fileInfo?.downloadPort ?: 0
+                                        downloadPort = msg.fileInfo?.downloadPort ?: 0,
+                                        kind = msg.fileInfo?.kind ?: FileKind.FILE
                                     )
                                 }
                                 val inserted = runCatching { chatDao.insertMessages(saved) }.isSuccess
@@ -2089,44 +2374,82 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         monitoringJobs[groupId] = listOf(jobPeers, jobConnection, jobMessages)
     }
 
-    private fun notifyNewMessages(groupId: String, senderName: String, content: String, count: Int) {
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(getApplication(), android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            return
-        }
+    // ------------------------------------------------ message notifications
+
+    private fun notifyNewMessages(groupId: String, groupName: String, incoming: List<NotifEntry>) {
+        if (incoming.isEmpty()) return
         val context = getApplication<Application>()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_MESSAGES,
-                "新消息",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "收到新群聊消息时通知"
-            }
-            val nm = context.getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
+        if (!notificationsPermissionGranted(context)) return
+        if (ChatApp.isGroupMuted(getApplication(), groupId)) return
+        ensureMessageChannel(context)
+        val log = notificationLog.getOrPut(groupId) { mutableListOf() }
+        log.addAll(incoming)
+        while (log.size > MAX_NOTIFICATION_MESSAGES) log.removeAt(0)
+
+        val myName = persistedMyNames[groupId]?.ifBlank { null } ?: "我"
+        val style = NotificationCompat.MessagingStyle(Person.Builder().setName(myName).build())
+            .setConversationTitle(groupName)
+        for (m in log) {
+            style.addMessage(m.text, m.time, Person.Builder().setName(m.sender).build())
         }
-        val tapIntent = Intent(context, MainActivity::class.java).apply {
+        // distinct requestCodes per group: a shared one would let the last
+        // posted intent overwrite every other group's deep-link extra
+        val openIntent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra(MainActivity.EXTRA_OPEN_GROUP_ID, groupId)
         }
-        val pendingIntent = android.app.PendingIntent.getActivity(
-            context, 0, tapIntent,
-            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        val contentPendingIntent = PendingIntent.getActivity(
+            context, groupId.hashCode(), openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val deleteIntent = Intent(context, NotificationDismissReceiver::class.java).apply {
+            action = ACTION_NOTIF_DISMISSED
+            putExtra(EXTRA_DISMISSED_GROUP_ID, groupId)
+        }
+        val deletePendingIntent = PendingIntent.getBroadcast(
+            context, groupId.hashCode(), deleteIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val notification = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
-            .setContentTitle(if (count > 1) "$senderName 等 $count 条新消息" else "$senderName")
-            .setContentText(content)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(content))
+            // MessagingStyle renders the conversation; the title/text are the
+            // fallback for launchers that do not style it
+            .setContentTitle(groupName)
+            .setContentText(log.last().text)
+            .setStyle(style)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setWhen(log.last().time)
             .setAutoCancel(true)
-            .setContentIntent(pendingIntent)
+            .setContentIntent(contentPendingIntent)
+            // swiping the bubble away must drop its log entry too, or the
+            // group's next message resurrects dismissed bubbles and the
+            // summary keeps stale counts
+            .setDeleteIntent(deletePendingIntent)
+            .setGroup(GROUP_KEY_MESSAGES)
+            // children alert, the summary stays silent
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
             .build()
         NotificationManagerCompat.from(context).notify(groupId.hashCode(), notification)
+        refreshMessageSummary(context)
     }
 
     private fun cancelGroupNotification(groupId: String) {
-        NotificationManagerCompat.from(getApplication()).cancel(groupId.hashCode())
+        val context = getApplication<Application>()
+        notificationLog.remove(groupId)
+        NotificationManagerCompat.from(context).cancel(groupId.hashCode())
+        refreshMessageSummary(context)
+    }
+
+    /** Per-group mute: persisted across restarts. Muting also drops any
+     *  notification the group currently shows. */
+    fun setGroupMuted(groupId: String, muted: Boolean) {
+        ChatApp.setGroupMuted(getApplication(), groupId, muted)
+        _groups.update { list ->
+            list.map { g ->
+                if (g.groupId == groupId) g.copy(muted = muted) else g
+            }
+        }
+        if (muted) cancelGroupNotification(groupId)
     }
 
     override fun onCleared() {
@@ -2154,4 +2477,5 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         hostServer.shutdown()
         ChatApp.stopChatService(getApplication())
     }
+
 }

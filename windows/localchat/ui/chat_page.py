@@ -1,15 +1,17 @@
 import os
 import sys
 
-from PyQt6.QtCore import QEvent, QPointF, QRect, QRectF, QSize, Qt
+from PyQt6.QtCore import QEvent, QPointF, QRect, QRectF, QSize, Qt, QUrl
 from PyQt6.QtGui import (
     QColor,
+    QDesktopServices,
     QFont,
     QFontMetrics,
     QIcon,
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
     QStandardItem,
     QStandardItemModel,
 )
@@ -31,7 +33,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..models import MAX_CONTENT_LENGTH, ChatMessage
+from ..models import (
+    MAX_CONTENT_LENGTH,
+    ChatMessage,
+    FILE_KIND_IMAGE,
+    FILE_KIND_VIDEO,
+    MEDIA_KINDS,
+    sanitize_file_name,
+)
 from ..view_model import ChatViewModel
 from .theme import (
     BUBBLE_MINE,
@@ -52,6 +61,14 @@ TIME_H = 14
 NAME_H = 17
 SIDE_MARGIN = 12
 FILE_CARD_H = 66
+# Inline media image: longest edge cap (logical px) inside the conversation.
+MEDIA_IMAGE_MAX = 240
+
+
+def _safe_save_name(name: str) -> str:
+    # 远端文件名只作建议名：复用 models.sanitize_file_name（FileInfo 入口
+    # 已经消毒过，这里是针对旧存量数据的二次防线）
+    return sanitize_file_name(name or "")
 
 
 def format_file_size(size: int) -> str:
@@ -71,15 +88,83 @@ def file_offer_expired(fi) -> bool:
 
 
 class MessageDelegate(QStyledItemDelegate):
-    def __init__(self, view, on_file_click=None, file_states=None, parent=None):
+    def __init__(
+        self,
+        view,
+        on_file_click=None,
+        file_states=None,
+        media_resolver=None,
+        on_media_open=None,
+        parent=None,
+    ):
         super().__init__(parent)
         self._view = view
         self.on_file_click = on_file_click
         self.file_states = file_states if file_states is not None else {}
+        # msg -> local path of an already-downloaded image/video copy (None
+        # when not downloaded yet); lets the delegate render media inline.
+        self.media_resolver = media_resolver
+        # path -> open a downloaded media file with the system viewer/player.
+        self.on_media_open = on_media_open
+        self._pixmaps: dict = {}
+
+    # ------------------------------------------------------------- media
+
+    def _is_media(self, msg: ChatMessage) -> bool:
+        return msg.file_info is not None and msg.file_info.kind in MEDIA_KINDS
+
+    def _media_path(self, msg: ChatMessage):
+        if self.media_resolver is None:
+            return None
+        try:
+            return self.media_resolver(msg)
+        except Exception:
+            return None
+
+    def _load_pixmap(self, path: str):
+        pm = self._pixmaps.get(path)
+        if pm is None:
+            pm = QPixmap(path)
+            if pm.isNull():
+                return None
+            if len(self._pixmaps) > 64:
+                self._pixmaps.clear()
+            self._pixmaps[path] = pm
+        return pm
+
+    def _fit_size(self, width: int, height: int) -> tuple:
+        if width <= 0 or height <= 0:
+            return 0, 0
+        scale = min(1.0, MEDIA_IMAGE_MAX / width, MEDIA_IMAGE_MAX / height)
+        return max(1, int(width * scale)), max(1, int(height * scale))
+
+    def _media_image_size(self, msg: ChatMessage, max_bubble_w: int):
+        """Displayed (w, h) for a downloaded image message, or None. Shared by
+        _layout and _paint_media_image so both honor the same caps (media cap
+        AND the bubble width cap) with the aspect ratio preserved."""
+        path = self._media_path(msg)
+        if not path:
+            return None
+        pm = self._load_pixmap(path)
+        if pm is None:
+            return None
+        w, h = self._fit_size(pm.width(), pm.height())
+        cap = max_bubble_w - 2 * V_PAD
+        if w > cap > 0:
+            h = max(1, int(h * cap / w))
+            w = cap
+        return w, h
 
     def _layout(self, msg: ChatMessage, max_bubble_w: int) -> tuple:
         if msg.file_info is not None:
-            # fixed-size file card; width capped so the card never dominates
+            if self._is_media(msg):
+                size = self._media_image_size(msg, max_bubble_w)
+                if size is not None:
+                    w, h = size
+                    return w + 2 * V_PAD, h + 2 * V_PAD, None
+                # image not downloaded yet (or unreadable): placeholder card
+            # fixed-size file / media card; width capped so the card never
+            # dominates
             return min(max_bubble_w, 320), FILE_CARD_H, None
         font = self._view.font()
         font.setPointSize(10)
@@ -120,12 +205,33 @@ class MessageDelegate(QStyledItemDelegate):
             and event.button() == Qt.MouseButton.LeftButton
         ):
             msg = index.data(MSG_ROLE)
-            if msg is not None and msg.file_info is not None and self.on_file_click:
-                if file_offer_expired(msg.file_info):
-                    return True  # expired offers are not clickable
-                state = self.file_states.get(msg.id, ("idle", "", ""))[0]
-                if state != "downloading":
-                    self.on_file_click(msg)
+            if msg is not None and msg.file_info is not None:
+                if self._is_media(msg):
+                    # downloaded media: click opens the system viewer/player;
+                    # otherwise click downloads into the app media dir and
+                    # the bubble flips to the inline image / playable card
+                    # (own offers are never re-downloaded: the sender already
+                    # has the original — and videos are simply not mirrored)
+                    path = self._media_path(msg)
+                    if path:
+                        if self.on_media_open:
+                            self.on_media_open(path)
+                        return True
+                    if (
+                        not msg.is_from_me
+                        and not file_offer_expired(msg.file_info)
+                        and self.on_file_click
+                    ):
+                        state = self.file_states.get(msg.id, ("idle", "", ""))[0]
+                        if state != "downloading":
+                            self.on_file_click(msg)
+                    return True
+                if self.on_file_click:
+                    if file_offer_expired(msg.file_info):
+                        return True  # expired offers are not clickable
+                    state = self.file_states.get(msg.id, ("idle", "", ""))[0]
+                    if state != "downloading":
+                        self.on_file_click(msg)
                 return True
         return super().editorEvent(event, model, option, index)
 
@@ -138,6 +244,11 @@ class MessageDelegate(QStyledItemDelegate):
         if msg is None:
             return
         if msg.file_info is not None:
+            if self._is_media(msg) and self._media_path(msg):
+                pm = self._load_pixmap(self._media_path(msg))
+                if pm is not None:
+                    self._paint_media_image(painter, option, msg, pm)
+                    return
             self._paint_file_message(painter, option, msg)
         else:
             self._paint_message(painter, option, msg)
@@ -237,18 +348,31 @@ class MessageDelegate(QStyledItemDelegate):
         fi = msg.file_info
         state = self.file_states.get(msg.id, ("idle", "", ""))
         expired = file_offer_expired(fi)
-        if expired:
+        is_media = self._is_media(msg)
+        downloaded = self._media_path(msg) is not None
+        # throttle-friendly progress text: the ViewModel reports integer
+        # percent for a known size (state[2]) or nothing at all
+        progress_text = (
+            f"下载中 {state[2]}%" if state[0] == "downloading" and state[2] else "下载中..."
+        )
+        if expired and not downloaded:
             status_text = "已过期"
         else:
-            status_text = {
-                "idle": "点击下载",
-                "downloading": (
-                    f"下载中 {state[2]}%" if state[0] == "downloading" and state[2] else "下载中..."
-                ),
-                "done": "已保存",
-                "cancelled": "已取消",
-                "failed": state[2] or "下载失败",
-            }.get(state[0], "点击下载")
+            if is_media:
+                idle_text = "点击播放" if fi.kind == FILE_KIND_VIDEO else "点击查看"
+                status_text = {
+                    "idle": "点击播放" if downloaded else idle_text,
+                    "downloading": progress_text,
+                    "done": "点击播放" if fi.kind == FILE_KIND_VIDEO else "已下载",
+                    "failed": state[2] or "下载失败",
+                }.get(state[0], idle_text if not downloaded else "点击播放")
+            else:
+                status_text = {
+                    "idle": "点击下载",
+                    "downloading": progress_text,
+                    "done": "已保存",
+                    "failed": state[2] or "下载失败",
+                }.get(state[0], "点击下载")
         text_color = QColor("#FFFFFF" if msg.is_from_me else BUBBLE_TEXT_OTHER)
         subtle = QColor("#FFFFFF" if msg.is_from_me else "#6B6875")
         subtle.setAlpha(200 if msg.is_from_me else 255)
@@ -261,7 +385,12 @@ class MessageDelegate(QStyledItemDelegate):
         # icon (drawn with QPainter so it never depends on emoji font support)
         painter.setPen(text_color)
         icon_rect = QRectF(bubble_rect.x() + 12, bubble_rect.y() + 12, 34, 34)
-        self._paint_file_icon(painter, icon_rect, text_color)
+        if is_media and fi.kind == FILE_KIND_VIDEO:
+            self._paint_play_icon(painter, icon_rect, text_color)
+        elif is_media:
+            self._paint_picture_icon(painter, icon_rect, text_color)
+        else:
+            self._paint_file_icon(painter, icon_rect, text_color)
 
         # status on the right, vertically centered (fixed band so it never
         # overlaps the size line)
@@ -316,6 +445,86 @@ class MessageDelegate(QStyledItemDelegate):
             )
         painter.restore()
 
+    def _paint_picture_icon(self, painter: QPainter, rect: QRectF, color: QColor) -> None:
+        """Draw a simple picture glyph (frame + sun + mountains)."""
+        painter.save()
+        pen = QPen(color, 2)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        frame = QRectF(rect.x() + 4, rect.y() + 6, 27, 23)
+        painter.drawRoundedRect(frame, 3, 3)
+        sun = QRectF(frame.x() + 4.5, frame.y() + 4, 5, 5)
+        painter.drawEllipse(sun)
+        mountain = QPainterPath()
+        mountain.moveTo(frame.x() + 2.5, frame.bottom() - 2.5)
+        mountain.lineTo(frame.x() + 11, frame.top() + 9)
+        mountain.lineTo(frame.x() + 16, frame.bottom() - 2.5)
+        painter.drawPath(mountain)
+        mountain2 = QPainterPath()
+        mountain2.moveTo(frame.x() + 13, frame.bottom() - 2.5)
+        mountain2.lineTo(frame.x() + 20, frame.top() + 12)
+        mountain2.lineTo(frame.right() - 2.5, frame.bottom() - 2.5)
+        painter.drawPath(mountain2)
+        painter.restore()
+
+    def _paint_play_icon(self, painter: QPainter, rect: QRectF, color: QColor) -> None:
+        """Draw a simple video glyph (rounded frame + play triangle)."""
+        painter.save()
+        pen = QPen(color, 2)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        frame = QRectF(rect.x() + 3, rect.y() + 7, 29, 21)
+        painter.drawRoundedRect(frame, 4, 4)
+        painter.setBrush(color)
+        triangle = QPainterPath()
+        triangle.moveTo(frame.x() + 12, frame.y() + 5)
+        triangle.lineTo(frame.x() + 12, frame.bottom() - 5)
+        triangle.lineTo(frame.x() + 20, frame.center().y())
+        triangle.closeSubpath()
+        painter.drawPath(triangle)
+        painter.restore()
+
+    def _paint_media_image(self, painter: QPainter, option, msg: ChatMessage, pm: QPixmap) -> None:
+        """Inline image message: the downloaded image rendered directly in the
+        conversation bubble (rounded corners, aspect ratio preserved)."""
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = option.rect
+        view_w = rect.width()
+        max_bubble_w = max(int(view_w * 0.72), 200)
+        bubble_w, bubble_h, _ = self._layout(msg, max_bubble_w)
+        if msg.is_from_me:
+            bubble_x = rect.left() + rect.width() - bubble_w - SIDE_MARGIN
+        else:
+            bubble_x = rect.left() + SIDE_MARGIN
+        bubble_rect = QRectF(bubble_x, rect.top() + V_PAD, bubble_w, bubble_h)
+        image_rect = QRectF(
+            bubble_rect.x() + V_PAD,
+            bubble_rect.y() + V_PAD,
+            bubble_rect.width() - 2 * V_PAD,
+            bubble_rect.height() - 2 * V_PAD,
+        )
+        scaled = pm.scaled(
+            int(image_rect.width()),
+            int(image_rect.height()),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        clip = QPainterPath()
+        clip.addRoundedRect(image_rect, 12, 12)
+        painter.setClipPath(clip)
+        painter.drawPixmap(
+            QPointF(
+                image_rect.x() + (image_rect.width() - scaled.width()) / 2,
+                image_rect.y() + (image_rect.height() - scaled.height()) / 2,
+            ),
+            scaled,
+        )
+        painter.restore()
+
 
 class ChatInput(QTextEdit):
     def __init__(self, on_send, parent=None):
@@ -365,7 +574,14 @@ class ChatPage(QWidget):
         self.list_view = QListView()
         self.list_view.setModel(self.model)
         self.list_view.setItemDelegate(
-            MessageDelegate(self.list_view, on_file_click=self._download_file, file_states=self._file_states, parent=self)
+            MessageDelegate(
+                self.list_view,
+                on_file_click=self._download_file,
+                file_states=self._file_states,
+                media_resolver=self._media_path,
+                on_media_open=self._open_media,
+                parent=self,
+            )
         )
         self.list_view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.list_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -417,6 +633,7 @@ class ChatPage(QWidget):
         self.vm.active_messages_changed.connect(self._on_messages_changed)
         self.vm.active_connection_lost_changed.connect(self._on_connection_state_changed)
         self.vm.file_download_finished.connect(self._on_file_download_finished)
+        self.vm.media_ready.connect(self._on_media_ready)
         self.vm.file_progress.connect(self._on_file_progress)
 
     def _on_group_changed(self):
@@ -517,14 +734,42 @@ class ChatPage(QWidget):
         if not self.vm.send_file(path):
             Toast(self.window()).show_message("无法发送文件：未连接或文件不可用")
 
+    def _media_path(self, msg):
+        fi = msg.file_info
+        if fi is None:
+            return None
+        return self.vm.downloaded_media_path(fi.file_id, fi.file_name)
+
+    def _open_media(self, path: str):
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            Toast(self.window()).show_message("无法打开文件")
+
     def _download_file(self, msg):
+        fi = msg.file_info
+        if fi is None:
+            return
+        if fi.kind in MEDIA_KINDS:
+            # media: NO save dialog — download into the app media dir so the
+            # message renders inline; "另存为" in the context menu saves a copy
+            target = self.vm.media_target_path(fi.file_id, fi.file_name)
+            if os.path.isfile(target):
+                self._file_states[msg.id] = ("done", target, "")
+                self._open_media(target)
+                return
+            self._file_states[msg.id] = ("downloading", target, "")
+            self.list_view.viewport().update()
+            self.vm.download_file(msg.id, target)
+            return
+        self._save_file_as(msg)
+
+    def _save_file_as(self, msg):
         fi = msg.file_info
         if fi is None:
             return
         downloads = os.path.join(os.path.expanduser("~"), "Downloads")
         os.makedirs(downloads, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
-            self.window(), "保存文件", os.path.join(downloads, fi.file_name)
+            self.window(), "保存文件", os.path.join(downloads, _safe_save_name(fi.file_name))
         )
         if not path:
             return
@@ -562,6 +807,15 @@ class ChatPage(QWidget):
             self._file_states[file_id] = ("failed", "", message)
             Toast(self.window()).show_message(f"下载失败：{message}")
         self.list_view.viewport().update()
+        # a downloaded image swaps its placeholder card for a much taller
+        # inline bubble: repaint alone keeps the stale row height
+        self.list_view.doItemsLayout()
+
+    def _on_media_ready(self):
+        """An own sent image landed in the media dir: re-render so the
+        sender's own bubble flips to the inline image."""
+        self.list_view.viewport().update()
+        self.list_view.doItemsLayout()
 
     def _show_message_menu(self, pos):
         index = self.list_view.indexAt(pos)
@@ -570,21 +824,32 @@ class ChatPage(QWidget):
             return
         menu = QMenu(self.list_view)
         if msg.file_info is not None:
+            is_media = msg.file_info.kind in MEDIA_KINDS
+            open_action = None
+            if is_media:
+                local = self._media_path(msg)
+                if local:
+                    open_action = menu.addAction("打开")
             download_action = None
             cancel_action = None
-            state = self._file_states.get(msg.id, ("idle", "", ""))[0]
-            if not file_offer_expired(msg.file_info) and state != "downloading":
-                download_action = menu.addAction("下载 / 另存为")
-            if state == "downloading":
-                cancel_action = menu.addAction("取消下载")
+            dl_state = self._file_states.get(msg.id, ("idle", "", ""))[0]
+            if not file_offer_expired(msg.file_info):
+                if dl_state == "downloading":
+                    # an in-flight download offers 取消下载 instead of starting
+                    # a second one
+                    cancel_action = menu.addAction("取消下载")
+                else:
+                    download_action = menu.addAction("另存为..." if is_media else "下载 / 另存为")
             copy_name_action = menu.addAction("复制文件名")
             delete_action = None
             if msg.is_from_me:
                 menu.addSeparator()
                 delete_action = menu.addAction("删除")
             chosen = menu.exec(self.list_view.viewport().mapToGlobal(pos))
-            if download_action is not None and chosen is download_action:
-                self._download_file(msg)
+            if open_action is not None and chosen is open_action:
+                self._open_media(self._media_path(msg))
+            elif download_action is not None and chosen is download_action:
+                self._save_file_as(msg)
             elif cancel_action is not None and chosen is cancel_action:
                 self._cancel_download(msg)
             elif chosen is copy_name_action:

@@ -264,11 +264,16 @@ object Handshake {
         val ok = wire.recvRaw() ?: throw WireException("对方无响应")
         if (ok.type == Protocol.HS_REJECT) throw WireException(ok.errorMessage ?: "连接被拒绝")
         if (ok.type != Protocol.HS_OK || ok.mac.isNullOrBlank()) throw WireException("握手确认无效")
-        val expected = Crypto.hmacSha256(pwKey, "lc-server|$transcript".toByteArray(Charsets.UTF_8))
-        val provided = Crypto.fromB64(ok.mac!!)
-        if (provided == null || !Crypto.constantTimeEquals(provided, expected)) {
-            throw WireException("对方密码验证失败")
-        }
+        val expected = Crypto.toB64(
+            Crypto.hmacSha256(pwKey, "lc-server|$transcript".toByteArray(Charsets.UTF_8))
+        )
+        // 常数时间比较（复用 Crypto.constantTimeEquals）：非常数比较会
+        // 泄露 MAC 前缀的匹配长度，辅助针对握手 MAC 的定时侧信道
+        val macMatches = Crypto.constantTimeEquals(
+            ok.mac!!.toByteArray(Charsets.UTF_8),
+            expected.toByteArray(Charsets.UTF_8)
+        )
+        if (!macMatches) throw WireException("对方密码验证失败")
         wire.activate(
             Crypto.hkdfSha256(shared + pwKey, salt, INFO_SESSION.toByteArray(), Crypto.KEY_LEN)
         )
