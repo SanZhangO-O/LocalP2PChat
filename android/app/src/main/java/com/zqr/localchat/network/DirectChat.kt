@@ -276,6 +276,16 @@ object DirectChatManager {
     @Volatile
     var onChatMigrated: ((fromId: String, toId: String) -> Unit)? = null
 
+    /** A peer's typing indicator changed (direct chat). Advisory: the
+     *  ViewModel also expires an indicator that received no refresh, and a
+     *  session that drops clears it. Invoked on the session read thread. */
+    @Volatile
+    var onTypingChanged: ((peerId: String, active: Boolean) -> Unit)? = null
+
+    /** Peers whose typing indicator is currently on (last event forwarded):
+     *  dedupes notifications and lets a dropped session clear the indicator. */
+    private val typingPeers = ConcurrentHashMap.newKeySet<String>()
+
     private val _contacts = MutableStateFlow<Map<String, Contact>>(emptyMap())
     val contacts: StateFlow<Map<String, Contact>> = _contacts.asStateFlow()
 
@@ -864,7 +874,13 @@ object DirectChatManager {
      * redial or the peer dialing us. Returns false only when there is no
      * known contact AND no session to deliver to.
      */
-    fun sendMessage(peerId: String, content: String): Boolean {
+    fun sendMessage(
+        peerId: String,
+        content: String,
+        replyTo: String? = null,
+        replyPreview: String? = null,
+        replySender: String? = null
+    ): Boolean {
         // validate with the SAME rule the receiver enforces: the receiver
         // drops content longer than MAX_CONTENT_LENGTH, so without this check
         // a too-long message would "send" locally but silently never arrive
@@ -879,7 +895,10 @@ object DirectChatManager {
             senderId = myId,
             senderName = myName,
             isFromMe = true,
-            pending = s == null
+            pending = s == null,
+            replyTo = replyTo,
+            replyPreview = replyPreview,
+            replySender = replySender
         )
         // show the message locally right away (pending until delivered)
         appendMessage(peerId, msg)
@@ -896,6 +915,72 @@ object DirectChatManager {
             enqueuePending(peerId, contact, msg)
         }
         return true
+    }
+
+    /** Send a typing indicator to a direct-chat peer. Advisory and never
+     *  queued offline: with no live session it is dropped (nobody to show it
+     *  to). The scope names THIS device's conversation key for the chat, so
+     *  the receiver's "direct:<peer>" key matches it exactly (Windows
+     *  parity). */
+    fun sendTyping(peerId: String, active: Boolean) {
+        val s = sessions[peerId]?.takeIf { it.alive } ?: return
+        runCatching {
+            putSend(
+                s,
+                NetworkPacket(
+                    type = "typing",
+                    groupId = "direct:$myId",
+                    senderId = myId,
+                    active = active
+                )
+            )
+        }
+    }
+
+    /** Tell [peerId] that everything up to [upToId] has been read. Sent
+     *  automatically when a plain chat arrives (the protocol defines the
+     *  automatic receipt on delivery); only a live session carries it. */
+    private fun sendReadReceipt(peerId: String, upToId: String) {
+        val s = sessions[peerId]?.takeIf { it.alive } ?: return
+        runCatching {
+            putSend(
+                s,
+                NetworkPacket(
+                    type = "read_receipt",
+                    groupId = "direct:$myId",
+                    upToId = upToId,
+                    readerId = myId
+                )
+            )
+        }
+    }
+
+    /** Record/forward a peer typing change, deduped to real transitions. */
+    private fun setPeerTyping(peerId: String, active: Boolean) {
+        val changed = if (active) typingPeers.add(peerId) else typingPeers.remove(peerId)
+        if (changed) onTypingChanged?.invoke(peerId, active)
+    }
+
+    private fun clearPeerTyping(peerId: String) = setPeerTyping(peerId, false)
+
+    /** Mark every OWN message up to the receipt's message id as read. The
+     *  receipt names a peer message id, so the cut-off is that message's
+     *  timestamp; an id we no longer hold (history pruned) is ignored. The
+     *  observer persists the read flips like pending flags. */
+    private fun applyReadReceipt(peerId: String, upToId: String) {
+        val state = messageStates[peerId] ?: return
+        val current = state.value
+        val target = current.firstOrNull { it.id == upToId } ?: return
+        var changed = false
+        val updated = current.map { m ->
+            if (m.isFromMe && !m.read && m.timestamp <= target.timestamp) {
+                changed = true
+                m.copy(read = true)
+            } else {
+                m
+            }
+        }
+        if (changed) state.value = updated
     }
 
     /** Park a message for a currently-offline peer and start the redial loop. */
@@ -1302,6 +1387,7 @@ object DirectChatManager {
             s.alive = false
             closeSocket(s.socket)
         }
+        clearPeerTyping(peerId)
     }
 
     fun isChatAlive(peerId: String): Boolean = sessions[peerId]?.alive == true
@@ -1353,6 +1439,30 @@ object DirectChatManager {
                             Log.i(TAG, "drop duplicate message ${msg.id} on session ${s.peerId}")
                         } else {
                             appendMessage(s.peerId, P2PManager.markFromMe(msg.withSanitizedFileInfo(), myId))
+                            if (packet.type == "chat") {
+                                // receiving a plain chat IS reading it (the
+                                // protocol defines the automatic receipt on
+                                // delivery): ack so the sender flips 已读
+                                sendReadReceipt(s.peerId, msg.id)
+                            }
+                        }
+                    }
+                    "typing" -> {
+                        val active = packet.active ?: continue
+                        // only the session peer may speak for itself, and the
+                        // scope must name this chat (Windows parity)
+                        if (packet.senderId == s.peerId &&
+                            packet.groupId == "direct:${s.peerId}"
+                        ) {
+                            setPeerTyping(s.peerId, active)
+                        }
+                    }
+                    "read_receipt" -> {
+                        val upToId = packet.upToId ?: continue
+                        if (packet.readerId == s.peerId &&
+                            packet.groupId == "direct:${s.peerId}"
+                        ) {
+                            applyReadReceipt(s.peerId, upToId)
                         }
                     }
                     "delete_message" -> {
@@ -1394,6 +1504,8 @@ object DirectChatManager {
             if (sessions.remove(s.peerId, s)) {
                 _aliveSessions.update { it - s.peerId }
                 closeSocket(s.socket)
+                // a session that died can no longer be typing
+                clearPeerTyping(s.peerId)
                 _events.tryEmit("与 ${s.peerName} 的直聊连接已断开")
                 onSessionClosed?.invoke(s.peerId)
             } else {

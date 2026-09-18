@@ -92,11 +92,16 @@ object GroupMeshManager {
 
     /** A mesh-received delete: (groupId, messageId, senderId), or senderId
      *  = null for a tombstone-synced delete (a peer's history_reply
-     *  deletedIds — trusted, no author to validate). The ViewModel removes
-     *  the message from the owning group's list so mesh deletes stay in sync
+     *  deletedIds): trusted cleanup with no author validation. The ViewModel
+     *  removes the message from the owning group's list so mesh deletes stay in sync
      *  with the relay/history path. Called on mesh worker threads. */
     @Volatile
     var onGroupDelete: ((String, String, String?) -> Unit)? = null
+
+    /** A linked member's typing indicator changed (host-offline path):
+     *  (groupId, senderId, active). Advisory; called on mesh worker threads. */
+    @Volatile
+    var onGroupTyping: ((String, String, Boolean) -> Unit)? = null
 
     /** Tombstoned message ids per group (offline-member delete convergence),
      *  carried by history_reply so a member that was offline drops what it
@@ -205,6 +210,26 @@ object GroupMeshManager {
         val packet = NetworkPacket(type = "delete_message", messageId = messageId, senderId = myId)
         val links = state.links.values.toList()
         thread(name = "mesh-delete") {
+            links.forEach { link ->
+                runCatching { link.wire.sendPacket(packet) }
+            }
+        }
+    }
+
+    /** Tell every linked member that [senderId] started/stopped typing
+     *  (host-offline path). Advisory: no history/state is touched, and a
+     *  member with no link simply misses the indicator. */
+    fun broadcastTyping(groupId: String, senderId: String, active: Boolean) {
+        val state = groups[groupId] ?: return
+        val packet = NetworkPacket(
+            type = "typing",
+            groupId = groupId,
+            senderId = senderId,
+            active = active
+        )
+        val links = state.links.values.toList()
+        if (links.isEmpty()) return
+        thread(name = "mesh-typing") {
             links.forEach { link ->
                 runCatching { link.wire.sendPacket(packet) }
             }
@@ -510,6 +535,14 @@ object GroupMeshManager {
                     }
                     "mesh_announce" -> packet.peer?.let { peer ->
                         addPeer(state.groupId, peer)
+                    }
+                    "typing" -> {
+                        // only the linked member may claim ITS OWN typing state
+                        val sender = packet.senderId
+                        val active = packet.active
+                        if (sender == link.peerId && active != null) {
+                            onGroupTyping?.invoke(state.groupId, sender, active)
+                        }
                     }
                     "ping" -> runCatching { link.wire.sendPacket(NetworkPacket(type = "pong")) }
                     "pong" -> {}

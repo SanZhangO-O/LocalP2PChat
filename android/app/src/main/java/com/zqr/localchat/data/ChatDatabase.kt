@@ -9,7 +9,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [SavedGroup::class, SavedChatMessage::class, DeletedMessage::class],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -89,6 +89,28 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v4 -> v5: add the reply/quote columns and the own-message read flag.
+         * History must survive the upgrade (NEVER destructive): every column
+         * gets its empty/0 default, so pre-reply rows behave as before.
+         */
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE saved_messages ADD COLUMN replyTo TEXT NOT NULL DEFAULT ''"
+                )
+                db.execSQL(
+                    "ALTER TABLE saved_messages ADD COLUMN replyPreview TEXT NOT NULL DEFAULT ''"
+                )
+                db.execSQL(
+                    "ALTER TABLE saved_messages ADD COLUMN replySender TEXT NOT NULL DEFAULT ''"
+                )
+                db.execSQL(
+                    "ALTER TABLE saved_messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
+
         @Volatile
         private var INSTANCE: ChatDatabase? = null
 
@@ -99,7 +121,7 @@ abstract class ChatDatabase : RoomDatabase() {
                     ChatDatabase::class.java,
                     "localchat_database"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                     .build()
                 INSTANCE = instance
                 instance

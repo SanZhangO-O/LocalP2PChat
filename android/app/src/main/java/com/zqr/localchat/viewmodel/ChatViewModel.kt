@@ -61,6 +61,7 @@ import com.zqr.localchat.ui.screen.parseHostPort
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -237,6 +238,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      *  (outbox flush) is written back to the database. */
     private val persistedDirectPending = mutableMapOf<String, MutableMap<String, Boolean>>()
 
+    /** Own direct messages' persisted read state (peer read_receipts):
+     *  message id -> read. Mirrors [persistedDirectPending]. */
+    private val persistedDirectRead = mutableMapOf<String, MutableMap<String, Boolean>>()
+
     /** Fires when a direct chat's key moves from a manually added "ip:..."
      *  placeholder id to the member's real device id (revealed by a
      *  handshake); the UI re-keys the open chat screen. */
@@ -264,6 +269,165 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Transient direct-chat events surfaced as toasts. */
     val directEvents: SharedFlow<String> = DirectChatManager.events
+
+    // ------------------------------------------------------ typing indicators
+
+    /** Direct-chat peers whose typing indicator is currently live. */
+    private val _directTypingPeers = MutableStateFlow<Set<String>>(emptySet())
+    val directTypingPeers: StateFlow<Set<String>> = _directTypingPeers.asStateFlow()
+
+    /** Group id -> (sender id -> display name) for live typing indicators. */
+    private val _groupTyping = MutableStateFlow<Map<String, Map<String, String>>>(emptyMap())
+    val groupTyping: StateFlow<Map<String, Map<String, String>>> = _groupTyping.asStateFlow()
+
+    /** Received-indicator deadlines (peer/member id -> expiry), mirroring the
+     *  Windows ViewModel: an indicator that saw no refresh for
+     *  [TYPING_TIMEOUT_MS] is dropped by the ticker. */
+    private val directTypingDeadlines = ConcurrentHashMap<String, Long>()
+    private val groupTypingDeadlines = ConcurrentHashMap<String, ConcurrentHashMap<String, Long>>()
+    private val groupTypingNames = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>()
+    private val typingTickerStarted = AtomicBoolean(false)
+
+    /** Outbound typing throttle state per conversation scope. */
+    private class TypingOut(var lastSentAt: Long = 0L, var job: Job? = null)
+    private val outboundTyping = ConcurrentHashMap<String, TypingOut>()
+
+    /** Refresh our typing indicator for a direct chat (throttled; the stop is
+     *  scheduled automatically). Call on every input change. */
+    fun notifyDirectTyping(peerId: String) {
+        if (peerId.isBlank()) return
+        typingActivity("direct:$peerId") { active ->
+            DirectChatManager.sendTyping(peerId, active)
+        }
+    }
+
+    /** Our message went out or the chat closed: stop the indicator now. */
+    fun endDirectTyping(peerId: String) = stopTyping("direct:$peerId")
+
+    /** Refresh our typing indicator for the active group (throttled). */
+    fun notifyGroupTyping() {
+        val gid = _activeGroupId.value ?: return
+        typingActivity(gid) { active -> sendGroupTyping(gid, active) }
+    }
+
+    private fun sendGroupTyping(groupId: String, active: Boolean) {
+        val p2p = groupP2pMap[groupId]
+        p2p?.sendTyping(active)
+        // host-offline path: the mesh carries the indicator too
+        GroupMeshManager.broadcastTyping(groupId, p2p?.myIdValue ?: "", active)
+    }
+
+    private fun typingActivity(scopeKey: String, send: (Boolean) -> Unit) {
+        val state = outboundTyping.getOrPut(scopeKey) { TypingOut() }
+        val now = System.currentTimeMillis()
+        if (now - state.lastSentAt >= TYPING_ACTIVE_INTERVAL_MS) {
+            state.lastSentAt = now
+            send(true)
+        }
+        state.job?.cancel()
+        state.job = viewModelScope.launch {
+            delay(TYPING_STOP_DELAY_MS)
+            outboundTyping.remove(scopeKey)
+            send(false)
+        }
+    }
+
+    private fun stopTyping(scopeKey: String) {
+        val state = outboundTyping.remove(scopeKey) ?: return
+        state.job?.cancel()
+        when {
+            scopeKey.startsWith("direct:") ->
+                DirectChatManager.sendTyping(scopeKey.removePrefix("direct:"), false)
+            else -> sendGroupTyping(scopeKey, false)
+        }
+    }
+
+    /** A peer's typing indicator changed (direct session read thread). */
+    private fun onDirectTyping(peerId: String, active: Boolean) {
+        if (active) {
+            directTypingDeadlines[peerId] = System.currentTimeMillis() + TYPING_TIMEOUT_MS
+        } else {
+            directTypingDeadlines.remove(peerId)
+        }
+        publishTyping()
+        ensureTypingTicker()
+    }
+
+    /** A group member's typing indicator changed (host relay / mesh thread). */
+    private fun onGroupTyping(groupId: String, senderId: String, active: Boolean) {
+        if (groupId.isBlank() || senderId.isBlank() || senderId == currentMyId()) return
+        val deadlines = groupTypingDeadlines.getOrPut(groupId) { ConcurrentHashMap() }
+        val names = groupTypingNames.getOrPut(groupId) { ConcurrentHashMap() }
+        if (active) {
+            deadlines[senderId] = System.currentTimeMillis() + TYPING_TIMEOUT_MS
+            names[senderId] = groupP2pMap[groupId]?.peers?.value?.get(senderId)?.name
+                ?.ifBlank { senderId } ?: senderId
+        } else {
+            deadlines.remove(senderId)
+            names.remove(senderId)
+            if (deadlines.isEmpty()) {
+                groupTypingDeadlines.remove(groupId)
+                groupTypingNames.remove(groupId)
+            }
+        }
+        publishTyping()
+        ensureTypingTicker()
+    }
+
+    private fun currentMyId(): String =
+        groupP2pMap.values.firstOrNull()?.myIdValue ?: DirectChatManager.myIdValue
+
+    private fun publishTyping() {
+        _directTypingPeers.value = directTypingDeadlines.keys.toSet()
+        val snapshot = HashMap<String, Map<String, String>>()
+        for ((gid, names) in groupTypingNames) {
+            if (names.isNotEmpty()) snapshot[gid] = HashMap(names)
+        }
+        _groupTyping.value = snapshot
+    }
+
+    private fun hasAnyTyping(): Boolean =
+        directTypingDeadlines.isNotEmpty() || groupTypingDeadlines.isNotEmpty()
+
+    /** Expiry ticker: runs only while some indicator is live (Windows parity:
+     *  the ViewModel's 1s timer). */
+    private fun ensureTypingTicker() {
+        if (!hasAnyTyping()) return
+        if (!typingTickerStarted.compareAndSet(false, true)) return
+        viewModelScope.launch {
+            try {
+                while (hasAnyTyping()) {
+                    delay(TYPING_TICK_MS)
+                    val now = System.currentTimeMillis()
+                    var changed = false
+                    for ((peerId, deadline) in directTypingDeadlines) {
+                        if (deadline <= now) {
+                            directTypingDeadlines.remove(peerId)
+                            changed = true
+                        }
+                    }
+                    for ((gid, deadlines) in groupTypingDeadlines) {
+                        for ((senderId, deadline) in deadlines) {
+                            if (deadline <= now) {
+                                deadlines.remove(senderId)
+                                groupTypingNames[gid]?.remove(senderId)
+                                changed = true
+                            }
+                        }
+                        if (deadlines.isEmpty()) {
+                            groupTypingDeadlines.remove(gid)
+                            groupTypingNames.remove(gid)
+                        }
+                    }
+                    if (changed) publishTyping()
+                }
+            } finally {
+                typingTickerStarted.set(false)
+                // a new indicator may have arrived as the loop exited
+                if (hasAnyTyping()) ensureTypingTicker()
+            }
+        }
+    }
 
     /**
      * Start a video call with a direct-chat member. Signaling rides the 1:1
@@ -643,8 +807,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun sendDirectMessage(peerId: String, content: String): Boolean =
-        DirectChatManager.sendMessage(peerId, content)
+    fun sendDirectMessage(
+        peerId: String,
+        content: String,
+        replyTo: String? = null,
+        replyPreview: String? = null,
+        replySender: String? = null
+    ): Boolean {
+        val sent = DirectChatManager.sendMessage(
+            peerId, content, replyTo, replyPreview, replySender
+        )
+        if (sent) {
+            // the message supersedes any "typing" we were showing
+            endDirectTyping(peerId)
+        }
+        return sent
+    }
 
     fun deleteDirectMessage(peerId: String, messageId: String, senderId: String) =
         DirectChatManager.deleteMessage(peerId, messageId, senderId)
@@ -691,6 +869,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         directJobs.remove(id)?.cancel()
         persistedDirectIds.remove(id)
         persistedDirectPending.remove(id)
+        persistedDirectRead.remove(id)
         DirectChatManager.closeChat(id)
         DirectChatManager.removeContact(id)
     }
@@ -710,6 +889,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         directJobs.remove(fromId)?.cancel()
         persistedDirectIds.remove(fromId)
         persistedDirectPending.remove(fromId)
+        persistedDirectRead.remove(fromId)
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
                 val toKey = "direct:$toId"
@@ -762,6 +942,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val saved = chatDao.getMessagesForGroup("direct:$peerId").first()
             persistedDirectIds[peerId] = saved.map { it.id }.toMutableSet()
             persistedDirectPending[peerId] = saved.associate { it.id to it.pending }.toMutableMap()
+            // read flips from the peer's read_receipts: persisted like pending
+            persistedDirectRead[peerId] = saved.associate { it.id to it.read }.toMutableMap()
             DirectChatManager.seedMessages(
                 peerId,
                 saved.map { sm ->
@@ -774,13 +956,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         senderName = plain.senderName,
                         isFromMe = plain.isFromMe,
                         fileInfo = restoredFileInfo(plain),
-                        pending = plain.pending
+                        pending = plain.pending,
+                        replyTo = plain.replyTo.ifEmpty { null },
+                        replyPreview = plain.replyPreview.ifEmpty { null },
+                        replySender = plain.replySender.ifEmpty { null },
+                        read = plain.read
                     )
                 }
             )
             DirectChatManager.messagesFor(peerId).collect { msgs ->
                 val persisted = persistedDirectIds.getOrPut(peerId) { mutableSetOf() }
                 val pendingMap = persistedDirectPending.getOrPut(peerId) { mutableMapOf() }
+                val readMap = persistedDirectRead.getOrPut(peerId) { mutableMapOf() }
                 val currentIds = msgs.map { it.id }.toSet()
                 val removed = persisted.filter { it !in currentIds }
                 val newOnes = msgs.filter { it.id !in persisted }
@@ -788,7 +975,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val flagChanges = msgs.filter { m ->
                     m.isFromMe && pendingMap.containsKey(m.id) && pendingMap[m.id] != m.pending
                 }
-                if (removed.isNotEmpty() || newOnes.isNotEmpty() || flagChanges.isNotEmpty()) {
+                // peer read_receipts flip own messages to 已读
+                val readChanges = msgs.filter { m ->
+                    m.isFromMe && readMap.containsKey(m.id) && readMap[m.id] != m.read
+                }
+                if (removed.isNotEmpty() || newOnes.isNotEmpty() ||
+                    flagChanges.isNotEmpty() || readChanges.isNotEmpty()
+                ) {
                     withDbLock("direct:$peerId") {
                         if (removed.isNotEmpty()) {
                             // drop ids from the persisted set only after a
@@ -800,6 +993,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             if (deleted) {
                                 persisted.removeAll(removed)
                                 removed.forEach { pendingMap.remove(it) }
+                                removed.forEach { readMap.remove(it) }
                             } else {
                                 Log.w("ChatViewModel", "failed to delete ${removed.size} direct messages for $peerId")
                             }
@@ -823,7 +1017,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                         folderName = msg.fileInfo?.folderName ?: "",
                                         relativePath = msg.fileInfo?.relativePath ?: "",
                                         folderTotal = msg.fileInfo?.folderTotal ?: 0,
-                                        pending = msg.pending
+                                        pending = msg.pending,
+                                        replyTo = msg.replyTo ?: "",
+                                        replyPreview = msg.replyPreview ?: "",
+                                        replySender = msg.replySender ?: "",
+                                        read = msg.read
                                     )
                                 })
                             }.isSuccess
@@ -832,6 +1030,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 // a failed insert is retried on the next emission
                                 persisted.addAll(newOnes.map { it.id })
                                 newOnes.forEach { pendingMap[it.id] = it.pending }
+                                newOnes.forEach { readMap[it.id] = it.read }
                             } else {
                                 Log.w("ChatViewModel", "failed to persist direct messages for $peerId")
                             }
@@ -846,6 +1045,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 flagChanges.forEach { pendingMap[it.id] = it.pending }
                             } else {
                                 Log.w("ChatViewModel", "failed to update pending flags for $peerId")
+                            }
+                        }
+                        if (readChanges.isNotEmpty()) {
+                            val updated = runCatching {
+                                readChanges.forEach { m ->
+                                    chatDao.updateMessageRead("direct:$peerId", m.id, m.read)
+                                }
+                            }.isSuccess
+                            if (updated) {
+                                readChanges.forEach { readMap[it.id] = it.read }
+                            } else {
+                                Log.w("ChatViewModel", "failed to update read flags for $peerId")
                             }
                         }
                     }
@@ -1138,6 +1349,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      *  screens). */
     companion object {
         private const val CHANNEL_MESSAGES = "localchat_messages"
+
+        /** Typing indicator cadence (Windows parity): while the user keeps
+         *  typing, refresh at most once per interval; stop after the delay
+         *  with no input; expire a received indicator after the timeout. */
+        const val TYPING_ACTIVE_INTERVAL_MS = 2_000L
+        const val TYPING_STOP_DELAY_MS = 4_000L
+        const val TYPING_TIMEOUT_MS = 6_000L
+        private const val TYPING_TICK_MS = 1_000L
         private val activeDownloads = ConcurrentHashMap<String, DownloadHandle>()
 
         /** Active folder downloads keyed by folderId, so the UI can cancel a
@@ -1696,6 +1915,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // history_reply tombstone sync: the provider is read on mesh worker
         // threads when a link's history is pushed (see GroupMeshManager).
         GroupMeshManager.deletedIdsProvider = { groupId -> deletedIdsFor(groupId) }
+        // Typing indicators: mesh links (host offline) and direct sessions
+        // report transitions on their worker threads; the ViewModel state
+        // updates are Main-safe (StateFlow) and the ticker expires stale ones.
+        GroupMeshManager.onGroupTyping = { groupId, senderId, active ->
+            onGroupTyping(groupId, senderId, active)
+        }
+        DirectChatManager.onTypingChanged = { peerId, active ->
+            onDirectTyping(peerId, active)
+        }
         // join_ack tombstone sync: tombstones learned from a peer's ack are
         // persisted so a history replay cannot resurrect the deleted rows.
         // Global callbacks (one shared database), set before any join runs.
@@ -1940,6 +2168,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun registerGroupP2p(groupId: String, p2p: P2PManager) {
         groupP2pMap[groupId] = p2p
         p2p.callSignalListener = { packet -> CallManager.handleSignal(p2p, packet) }
+        // typing indicators relayed by the host (or seen by the host itself)
+        p2p.typingListener = { senderId, active ->
+            onGroupTyping(groupId, senderId, active)
+        }
         p2p.serverErrorNotify = { message ->
             _groups.update { list ->
                 list.map { g ->
@@ -2157,7 +2389,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             senderId = plain.senderId,
                             senderName = plain.senderName,
                             isFromMe = plain.isFromMe,
-                            fileInfo = restoredFileInfo(plain)
+                            fileInfo = restoredFileInfo(plain),
+                            replyTo = plain.replyTo.ifEmpty { null },
+                            replyPreview = plain.replyPreview.ifEmpty { null },
+                            replySender = plain.replySender.ifEmpty { null }
                         )
                     }
                     p2p.replaySavedMessages(msgs)
@@ -2507,15 +2742,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (_groups.value.isEmpty()) ChatApp.stopChatService(getApplication())
     }
 
-    fun sendMessage(content: String): Boolean {
+    fun sendMessage(
+        content: String,
+        replyTo: String? = null,
+        replyPreview: String? = null,
+        replySender: String? = null
+    ): Boolean {
         if (content.isBlank()) return false
         val gid = _activeGroupId.value ?: return false
         val p2p = groupP2pMap[gid] ?: return false
         // messages can go out over the host relay OR the group mesh (host
         // offline) — either path suffices
         if (!p2p.isConnected && !GroupMeshManager.hasLinks(gid)) return false
-        val msg = p2p.sendMessage(content) ?: return false
+        val msg = p2p.sendMessage(content, replyTo, replyPreview, replySender) ?: return false
         GroupMeshManager.broadcast(gid, msg)
+        // the message supersedes any "typing" we were showing
+        stopTyping(gid)
         return true
     }
 
@@ -2525,6 +2767,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (!p2p.isConnected && !GroupMeshManager.hasLinks(groupId)) return false
         val msg = p2p.sendMessage(content) ?: return false
         GroupMeshManager.broadcast(groupId, msg)
+        stopTyping(groupId)
         return true
     }
 

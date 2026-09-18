@@ -137,12 +137,35 @@ data class ChatMessage(
     val senderId: String,
     val senderName: String,
     val fileInfo: FileInfo? = null,
+    /** Reply/quote (optional, omitted from the wire when unset so a plain
+     *  message stays byte-identical, Windows parity): [replyTo] is the quoted
+     *  message's id, [replyPreview] a short snippet of its content and
+     *  [replySender] the original sender's display name. All three are
+     *  self-contained so the receiver can render the quote even when the
+     *  referenced message is not in its local history. */
+    val replyTo: String? = null,
+    val replyPreview: String? = null,
+    val replySender: String? = null,
     @Transient val isFromMe: Boolean = false,
     /** Local-only delivery state (like [isFromMe], never sent over the
      *  wire): true while an offline-sent message still waits in the direct
      *  chat outbox for the peer to come online. */
-    @Transient val pending: Boolean = false
+    @Transient val pending: Boolean = false,
+    /** Local-only read state for OWN direct-chat messages: flipped when the
+     *  peer's read_receipt covers this message. Never sent over the wire;
+     *  group chats do not track per-reader receipts (Windows parity). */
+    @Transient val read: Boolean = false
 )
+
+/** Reply/quote preview cap: the snippet copied into [ChatMessage.replyPreview]
+ *  (and persisted) so one huge quoted message cannot bloat every reply
+ *  packet. Mirrors Windows models.MAX_REPLY_PREVIEW. */
+const val MAX_REPLY_PREVIEW = 120
+
+/** The quote snippet for replying to this message: newlines flattened and
+ *  capped at [MAX_REPLY_PREVIEW] (Windows parity). */
+fun ChatMessage.replyPreviewText(): String =
+    content.replace('\n', ' ').trim().take(MAX_REPLY_PREVIEW)
 
 /** Inbound advisory metadata must never be trusted: a forged folderTotal (a
  *  display-only entry count) decodes to 0 = unknown once it exceeds the cap —

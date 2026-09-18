@@ -58,5 +58,15 @@ data class NetworkPacket(
      *  direction, strictly 1,2,3,...) INSIDE the GCM-protected JSON, so the
      *  receiver can reject replayed/reordered/injected lines. Never set by
      *  application code; null is omitted on the wire. */
-    val seq: Long? = null
+    val seq: Long? = null,
+    /** read_receipt: the newest message id the sender has read in the
+     *  [groupId] scope; [readerId] is the reader's device id (must match the
+     *  packet's authenticated sender). Direct chats only — group chats do not
+     *  track per-reader receipts (see README). Null is omitted. */
+    val upToId: String? = null,
+    val readerId: String? = null,
+    /** typing: true while the sender is composing in the [groupId] scope,
+     *  false once it stopped. Advisory only: receivers also expire an
+     *  indicator that received no refresh (see README). Null is omitted. */
+    val active: Boolean? = null
 )

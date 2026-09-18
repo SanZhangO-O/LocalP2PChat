@@ -13,9 +13,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.Reply
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -28,6 +31,7 @@ import androidx.compose.ui.unit.sp
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
+import com.zqr.localchat.data.replyPreviewText
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.viewmodel.ChatViewModel
 import java.text.SimpleDateFormat
@@ -47,8 +51,11 @@ fun DirectChatScreen(
     connected: Boolean,
     messages: List<ChatMessage>,
     downloadStates: Map<String, ChatViewModel.DownloadState> = emptyMap(),
+    /** True while the peer is typing ("对方正在输入…" in the header). */
+    peerTyping: Boolean = false,
     onBack: () -> Unit,
-    onSend: (String) -> Boolean,
+    /** Send the draft, optionally quoting [replyTo] (null = plain message). */
+    onSend: (String, ChatMessage?) -> Boolean,
     onDelete: (ChatMessage) -> Unit,
     onCopy: (String) -> Unit,
     onCall: () -> Unit = {},
@@ -68,12 +75,17 @@ fun DirectChatScreen(
      *  dir: re-keys the local-path lookups so the sender's own bubble flips
      *  to the inline render without any other recomposition trigger. */
     mediaVersion: Int = 0,
-    onOpenFile: (String) -> Unit = {}
+    onOpenFile: (String) -> Unit = {},
+    /** The local user typed in the draft: refresh our typing indicator
+     *  (the ViewModel throttles and auto-stops it). */
+    onTyping: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var input by remember { mutableStateOf("") }
     var pendingDelete by remember { mutableStateOf<ChatMessage?>(null) }
     var pendingFolderDelete by remember { mutableStateOf<FolderGroup?>(null) }
+    // Message being quoted by the next send (null = plain message).
+    var replyTarget by remember { mutableStateOf<ChatMessage?>(null) }
     val tooLong = input.length > P2PManager.MAX_CONTENT_LENGTH
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -85,6 +97,9 @@ fun DirectChatScreen(
         if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
     }
 
+    // a different member never inherits the previous chat's quote target
+    LaunchedEffect(contactName, contactIp) { replyTarget = null }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -92,9 +107,13 @@ fun DirectChatScreen(
                     Column {
                         Text(contactName, fontSize = 17.sp, fontWeight = FontWeight.Medium)
                         Text(
-                            text = if (connected) "在线" else "未连接",
+                            text = when {
+                                peerTyping -> "对方正在输入…"
+                                connected -> "在线"
+                                else -> "未连接"
+                            },
                             fontSize = 11.sp,
-                            color = if (connected) MaterialTheme.colorScheme.primary
+                            color = if (connected || peerTyping) MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
@@ -199,6 +218,7 @@ fun DirectChatScreen(
                                 } else {
                                     DirectMessageBubble(
                                         msg = msg,
+                                        onReply = { replyTarget = it },
                                         onCopy = {
                                             onCopy(msg.content)
                                             Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
@@ -213,6 +233,9 @@ fun DirectChatScreen(
             }
 
             HorizontalDivider()
+            replyTarget?.let { target ->
+                ReplyComposeBar(target = target, onCancel = { replyTarget = null })
+            }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -255,7 +278,10 @@ fun DirectChatScreen(
                 Spacer(modifier = Modifier.width(4.dp))
                 OutlinedTextField(
                     value = input,
-                    onValueChange = { input = it },
+                    onValueChange = {
+                        input = it
+                        if (it.isNotBlank()) onTyping()
+                    },
                     placeholder = { Text("输入消息...") },
                     modifier = Modifier.weight(1f),
                     maxLines = 4,
@@ -270,8 +296,9 @@ fun DirectChatScreen(
                 FilledIconButton(
                     onClick = {
                         if (input.isNotBlank() && !tooLong) {
-                            if (onSend(input)) {
+                            if (onSend(input, replyTarget)) {
                                 input = ""
+                                replyTarget = null
                             } else {
                                 Toast.makeText(context, "发送失败", Toast.LENGTH_SHORT).show()
                             }
@@ -336,14 +363,16 @@ fun DirectChatScreen(
 @Composable
 private fun DirectMessageBubble(
     msg: ChatMessage,
+    onReply: (ChatMessage) -> Unit,
     onCopy: () -> Unit,
     onDelete: () -> Unit
 ) {
     val mine = msg.isFromMe
+    var showMenu by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .combinedClickable(onClick = onCopy, onLongClick = { if (mine) onDelete() }),
+            .combinedClickable(onClick = onCopy, onLongClick = { showMenu = true }),
         horizontalAlignment = if (mine) Alignment.End else Alignment.Start
     ) {
         if (!mine) {
@@ -369,6 +398,7 @@ private fun DirectMessageBubble(
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
             Column {
+                ReplyHeader(message = msg, mine = mine)
                 Text(
                     text = msg.content,
                     fontSize = 15.sp,
@@ -383,8 +413,16 @@ private fun DirectMessageBubble(
                         Text(
                             text = "待送达",
                             fontSize = 10.sp,
-                            color = if (mine) MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.7f)
-                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.7f),
+                            modifier = Modifier.padding(end = 6.dp)
+                        )
+                    } else if (mine) {
+                        // direct chats only: the peer's read_receipt flips this
+                        // (group chats do not track per-reader receipts)
+                        Text(
+                            text = if (msg.read) "已读" else "未读",
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.7f),
                             modifier = Modifier.padding(end = 6.dp)
                         )
                     }
@@ -393,6 +431,39 @@ private fun DirectMessageBubble(
                         fontSize = 10.sp,
                         color = if (mine) MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.7f)
                         else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            DropdownMenu(
+                expanded = showMenu,
+                onDismissRequest = { showMenu = false }
+            ) {
+                DropdownMenuItem(
+                    text = { Text("回复") },
+                    onClick = {
+                        onReply(msg)
+                        showMenu = false
+                    },
+                    leadingIcon = { Icon(Icons.Filled.Reply, contentDescription = null) }
+                )
+                DropdownMenuItem(
+                    text = { Text("复制") },
+                    onClick = {
+                        onCopy()
+                        showMenu = false
+                    },
+                    leadingIcon = {
+                        Icon(Icons.Filled.ContentCopy, contentDescription = null)
+                    }
+                )
+                if (mine) {
+                    DropdownMenuItem(
+                        text = { Text("删除") },
+                        onClick = {
+                            onDelete()
+                            showMenu = false
+                        },
+                        leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null) }
                     )
                 }
             }
