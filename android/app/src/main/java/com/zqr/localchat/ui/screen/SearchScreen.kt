@@ -318,6 +318,7 @@ internal fun HighlightWrapper(highlighted: Boolean, content: @Composable () -> U
 internal fun MessageItem.matchesMessageId(messageId: String): Boolean = when (this) {
     is MessageItem.Folder -> group.entries.any { it.id == messageId }
     is MessageItem.Msg -> message.id == messageId
+    is MessageItem.Call -> false
 }
 
 /** One-line preview of a search hit (mirrors MessageSearch.preview for the

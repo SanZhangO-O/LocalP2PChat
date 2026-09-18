@@ -465,7 +465,7 @@ fun ChatScreen(
                         value = inputText,
                         onValueChange = {
                             inputText = it
-                            if (it.isNotBlank()) onTyping()
+                            if (it.text.isNotBlank()) onTyping()
                         },
                         placeholder = { Text("输入消息...") },
                         modifier = Modifier.weight(1f),

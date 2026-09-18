@@ -380,7 +380,7 @@ fun DirectChatScreen(
                     value = input,
                     onValueChange = {
                         input = it
-                        if (it.isNotBlank()) onTyping()
+                        if (it.text.isNotBlank()) onTyping()
                     },
                     placeholder = { Text("输入消息...") },
                     modifier = Modifier.weight(1f),

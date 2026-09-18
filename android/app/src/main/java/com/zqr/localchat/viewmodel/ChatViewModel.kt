@@ -2382,7 +2382,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // Owner management: refresh/persist after a host-side update or an
         // applied member-side group_update; tear the group down when kicked.
         p2p.adminNotify = { refreshGroupAdmin(groupId, p2p) }
-        p2p.kickedNotify = { onKickedFromGroup(groupId, p2p) }        p2p.serverErrorNotify = { message ->
+        p2p.kickedNotify = { onKickedFromGroup(groupId, p2p) }
+        p2p.serverErrorNotify = { message ->
             _groups.update { list ->
                 list.map { g ->
                     if (g.groupId == groupId && g.isHost) g.copy(connected = message == null) else g
