@@ -32,6 +32,8 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.EmojiEmotions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -45,8 +47,10 @@ import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -56,6 +60,7 @@ import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.viewmodel.ChatViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Calendar
@@ -165,12 +170,25 @@ fun ChatScreen(
      *  to the inline render without any other recomposition trigger. */
     mediaVersion: Int = 0,
     onOpenFile: (String) -> Unit = {},
+    /** A search-result jump: scroll to this message and flash-highlight it,
+     *  then call [onRevealHandled] (once). */
+    revealMessageId: String? = null,
+    onRevealHandled: () -> Unit = {},
     onBack: () -> Unit
 ) {
-    var inputText by rememberSaveable { mutableStateOf("") }
+    val context = LocalContext.current
+    var inputText by rememberSaveable(stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(""))
+    }
     var pendingForward by remember { mutableStateOf<String?>(null) }
     var pendingDelete by remember { mutableStateOf<String?>(null) }
     var pendingFolderDelete by remember { mutableStateOf<FolderGroup?>(null) }
+    var searchActive by rememberSaveable { mutableStateOf(false) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var highlightId by remember { mutableStateOf<String?>(null) }
+    var revealConsumed by remember(revealMessageId) { mutableStateOf(false) }
+    var emojiPickerOpen by remember { mutableStateOf(false) }
+    var recentEmoji by remember { mutableStateOf(RecentEmoji.load(context)) }
     val listState = rememberLazyListState()
     var shouldAutoScroll by remember(groupName) { mutableStateOf(true) }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -179,16 +197,53 @@ fun ChatScreen(
     // change instead of on every recomposition (and inside every scroll event)
     val messageItems = remember(messages) { buildMessageItems(messages) }
 
-    val contentTooLong = inputText.length > P2PManager.MAX_CONTENT_LENGTH
+    val contentTooLong = inputText.text.length > P2PManager.MAX_CONTENT_LENGTH
+
+    // in-conversation search over the loaded list (newest first)
+    val searchResults = remember(searchQuery, messageItems) {
+        val kw = searchQuery.trim()
+        if (kw.isEmpty()) emptyList()
+        else messages
+            .filter { it.content.contains(kw, ignoreCase = true) || it.senderName.contains(kw, ignoreCase = true) }
+            .sortedByDescending { it.timestamp }
+            .take(50)
+    }
+
+    /** Scroll to a message and flash-highlight it; false when it is not in
+     *  the list (yet). */
+    fun revealInList(messageId: String): Boolean {
+        val index = messageItems.indexOfFirst { it.matchesMessageId(messageId) }
+        if (index < 0) return false
+        shouldAutoScroll = false
+        scope.launch { listState.animateScrollToItem(index) }
+        highlightId = messageId
+        return true
+    }
+
+    // external search-result jump (retried while the history is still loading)
+    LaunchedEffect(revealMessageId, messageItems.size) {
+        val target = revealMessageId ?: return@LaunchedEffect
+        if (revealConsumed) return@LaunchedEffect
+        if (revealInList(target)) {
+            revealConsumed = true
+            onRevealHandled()
+        }
+    }
+    LaunchedEffect(highlightId) {
+        if (highlightId != null) {
+            delay(1800)
+            highlightId = null
+        }
+    }
 
     fun sendInput() {
         // The IME send action still fires while the send button is disabled:
         // never truncate silently — the error is shown, the user shortens it.
         if (contentTooLong) return
-        val text = inputText
+        val text = inputText.text
         if (text.isNotBlank()) {
             if (onSendMessage(text)) {
-                inputText = ""
+                inputText = TextFieldValue("")
             } else {
                 scope.launch {
                     snackbarHostState.showSnackbar("消息未发送：已断开连接")
@@ -229,6 +284,16 @@ fun ChatScreen(
                             contentDescription = "返回",
                             tint = MaterialTheme.colorScheme.onSurface
                         )
+                    }
+                },
+                actions = {
+                    IconButton(
+                        onClick = {
+                            searchActive = !searchActive
+                            if (!searchActive) searchQuery = ""
+                        }
+                    ) {
+                        Icon(Icons.Filled.Search, contentDescription = "搜索消息")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -312,6 +377,13 @@ fun ChatScreen(
                         )
                     }
                     Spacer(modifier = Modifier.width(4.dp))
+                    IconButton(onClick = { emojiPickerOpen = true }) {
+                        Icon(
+                            Icons.Filled.EmojiEmotions,
+                            contentDescription = "表情",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
                     OutlinedTextField(
                         value = inputText,
                         onValueChange = { inputText = it },
@@ -323,8 +395,8 @@ fun ChatScreen(
                         isError = contentTooLong,
                         supportingText = if (contentTooLong) {
                             { Text("消息过长（最多 ${P2PManager.MAX_CONTENT_LENGTH} 字）") }
-                        } else if (inputText.length > P2PManager.MAX_CONTENT_LENGTH - 200) {
-                            { Text("${inputText.length}/${P2PManager.MAX_CONTENT_LENGTH}") }
+                        } else if (inputText.text.length > P2PManager.MAX_CONTENT_LENGTH - 200) {
+                            { Text("${inputText.text.length}/${P2PManager.MAX_CONTENT_LENGTH}") }
                         } else {
                             null
                         },
@@ -334,12 +406,12 @@ fun ChatScreen(
                     Spacer(modifier = Modifier.width(8.dp))
                     IconButton(
                         onClick = { sendInput() },
-                        enabled = inputText.isNotBlank() && !contentTooLong && !connectionLost
+                        enabled = inputText.text.isNotBlank() && !contentTooLong && !connectionLost
                     ) {
                         Icon(
                             Icons.AutoMirrored.Filled.Send,
                             contentDescription = "发送",
-                            tint = if (inputText.isNotBlank() && !contentTooLong && !connectionLost)
+                            tint = if (inputText.text.isNotBlank() && !contentTooLong && !connectionLost)
                                 MaterialTheme.colorScheme.primary
                             else
                                 MaterialTheme.colorScheme.onSurfaceVariant
@@ -350,6 +422,7 @@ fun ChatScreen(
         }
     }
     ) { padding ->
+      Box(modifier = Modifier.fillMaxSize()) {
         if (messages.isEmpty()) {
             Box(
                 modifier = Modifier
@@ -392,6 +465,8 @@ fun ChatScreen(
                     if (prev == null || !isSameDay(prev.timestamp, item.timestamp)) {
                         DateHeader(timestamp = item.timestamp)
                     }
+                    val highlighted = highlightId != null && item.matchesMessageId(highlightId!!)
+                    HighlightWrapper(highlighted) {
                     when (item) {
                         is MessageItem.Folder -> {
                             val group = item.group
@@ -440,9 +515,47 @@ fun ChatScreen(
                             }
                         }
                     }
+                    }
                 }
             }
         }
+        if (searchActive) {
+            ChatSearchOverlay(
+                query = searchQuery,
+                onQueryChange = { searchQuery = it },
+                results = searchResults,
+                onPick = { message ->
+                    searchActive = false
+                    searchQuery = ""
+                    revealInList(message.id)
+                },
+                onClose = {
+                    searchActive = false
+                    searchQuery = ""
+                },
+                // the Box spans the whole scaffold body: keep the overlay
+                // below the app bar
+                modifier = Modifier.padding(top = padding.calculateTopPadding())
+            )
+        }
+      }
+    }
+
+    if (emojiPickerOpen) {
+        EmojiPickerDialog(
+            recent = recentEmoji,
+            onPick = { emoji ->
+                val (text, caret) = EmojiText.insert(
+                    inputText.text,
+                    inputText.selection.start,
+                    inputText.selection.end,
+                    emoji
+                )
+                inputText = TextFieldValue(text, TextRange(caret))
+                recentEmoji = RecentEmoji.record(context, emoji)
+            },
+            onDismiss = { emojiPickerOpen = false }
+        )
     }
 
     pendingForward?.let { content ->

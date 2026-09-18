@@ -14,6 +14,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -51,7 +52,8 @@ fun MemberListScreen(
     onAddContact: (ipPort: String, name: String) -> Boolean,
     onRemoveContact: (id: String) -> Unit,
     onAcceptRequest: (id: String) -> Unit,
-    onIgnoreRequest: (id: String) -> Unit
+    onIgnoreRequest: (id: String) -> Unit,
+    onOpenSearch: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var showAdd by remember { mutableStateOf(false) }
@@ -62,6 +64,9 @@ fun MemberListScreen(
             TopAppBar(
                 title = { Text("成员") },
                 actions = {
+                    IconButton(onClick = onOpenSearch) {
+                        Icon(Icons.Filled.Search, contentDescription = "搜索消息")
+                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "设置")
                     }
