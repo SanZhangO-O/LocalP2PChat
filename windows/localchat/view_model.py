@@ -54,6 +54,9 @@ class GroupMeta:
     last_message_time: int = 0
     unread_count: int = 0
     connected: bool = False
+    # The group owner's published announcement (group_update), shown as a
+    # banner in the group lobby and persisted so it survives restarts.
+    announcement: str = ""
 
 
 class ChatViewModel(QObject, P2PListener, DirectChatListener):
@@ -231,6 +234,11 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # history pushes carry the group's delete tombstones so members that
         # were offline during a delete converge instead of resurrecting it
         self.mesh.deleted_ids_provider = self.store.get_deleted_ids
+        # owner management packets (group_update / kick_member) are only
+        # accepted over a mesh link when senderId is the group's creator
+        self.mesh.creator_id_provider = lambda gid: self.store.get_setting(
+            f"group_creator_id_{gid}", ""
+        )
         self.host_server.mesh_manager = self.mesh
         # Resolve the group password for an incoming handshake on the shared
         # listener: host groups by numeric join id, member groups (join
@@ -1203,6 +1211,126 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         with self._lock:
             self.store.record_deleted_messages(gid, deleted_ids)
 
+    # Group management (owner-only group_update / kick_member; callbacks may
+    # arrive on relay or mesh worker threads).
+
+    def group_info_changed(self, p2p: P2PManager) -> None:
+        """The owner published a new name/announcement (group_update) or this
+        host applied its own: refresh the list entry and persist the change."""
+        gid = p2p.current_group_id
+        if not gid:
+            return
+        with self._lock:
+            meta = self._find_group(gid)
+            name = p2p.current_group_name
+            if meta is not None:
+                meta.group_name = name
+                meta.announcement = p2p.group_announcement
+            self.store.upsert_group(
+                SavedGroup(
+                    group_id=gid,
+                    group_name=name,
+                    is_host=p2p.is_host,
+                    host_ip=meta.host_ip if meta is not None else "",
+                    host_port=meta.host_port if meta is not None else 0,
+                    my_name=p2p.my_name,
+                    member_count=meta.member_count if meta is not None else 1,
+                    last_message=meta.last_message if meta is not None else "",
+                    last_message_time=meta.last_message_time if meta is not None else 0,
+                    announcement=p2p.group_announcement,
+                )
+            )
+            if gid == self.active_group_id:
+                self.active_group_name = name
+        self.groups_changed.emit()
+        if gid == self.active_group_id:
+            self.active_group_changed.emit()
+
+    def kicked_from_group(self, p2p: P2PManager) -> None:
+        """The owner removed this device: tear down every connection of the
+        group, keep the local history, hide the group and tell the user."""
+        gid = p2p.current_group_id
+        if not gid:
+            return
+        with self._lock:
+            if self.group_p2p_map.get(gid) is not p2p:
+                return
+            meta = self._find_group(gid)
+            name = meta.group_name if meta is not None else p2p.current_group_name
+            self.call_manager.end_if_on(p2p, "已离开群组")
+            self.group_p2p_map.pop(gid, None)
+            self.persisted_peer_counts.pop(gid, None)
+            self.replay_done.pop(gid, None)
+            if meta is not None:
+                meta.connected = False
+            self.groups = [g for g in self.groups if g.group_id != gid]
+            if self.active_group_id == gid:
+                self.active_group_id = None
+                self.active_group_name = ""
+                self.active_my_name = ""
+                self.active_is_host = False
+            # the row (and its message history) stays; kicked hides it
+            self.store.set_group_kicked(gid, True)
+        p2p.stop()
+        self._teardown_group_mesh(gid)
+        self.status_message.emit(f"你已被移出群组「{name}」")
+        self.groups_changed.emit()
+        self.active_group_changed.emit()
+        self.active_peers_changed.emit()
+        self.active_messages_changed.emit()
+        self.active_connection_lost_changed.emit()
+        self.active_server_error_changed.emit()
+
+    def group_mesh_admin(self, group_id: str, packet) -> None:
+        """An owner management packet arrived over a mesh link (already
+        validated against the group's creator id by the mesh layer)."""
+        if packet.type == "group_update":
+            p2p = self.group_p2p_map.get(group_id)
+            if p2p is not None:
+                new_name = (packet.group_name or "").strip()
+                if new_name and new_name != p2p.group_name:
+                    p2p.group_name = new_name
+                if packet.announcement is not None:
+                    p2p.group_announcement = packet.announcement
+                self.group_info_changed(p2p)
+            else:
+                with self._lock:
+                    meta = self._find_group(group_id)
+                    if meta is not None:
+                        if packet.group_name:
+                            meta.group_name = packet.group_name
+                        if packet.announcement is not None:
+                            meta.announcement = packet.announcement
+                        self.store.upsert_group(
+                            SavedGroup(
+                                group_id=group_id,
+                                group_name=meta.group_name,
+                                is_host=False,
+                                host_ip=meta.host_ip,
+                                host_port=meta.host_port,
+                                member_count=meta.member_count,
+                                last_message=meta.last_message,
+                                last_message_time=meta.last_message_time,
+                                announcement=meta.announcement,
+                            )
+                        )
+                self.groups_changed.emit()
+                if group_id == self.active_group_id:
+                    self.active_group_changed.emit()
+        elif packet.type == "kick_member":
+            target = packet.target_id
+            if not target:
+                return
+            p2p = self.group_p2p_map.get(group_id)
+            if p2p is not None and target == p2p.my_id:
+                self.kicked_from_group(p2p)
+                return
+            if p2p is not None:
+                with self._lock:
+                    p2p.peers.pop(target, None)
+                self._save_group_peers(group_id, list(p2p.peers.values()))
+                self.peers_changed(p2p)
+
     # ------------------------------------------------------------ group mesh
 
     def _load_group_peers(self, group_id: str) -> list:
@@ -1244,6 +1372,65 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
 
     def _teardown_group_mesh(self, group_id: str) -> None:
         self.mesh.leave_group(group_id)
+
+    def _attach_admin_hooks(self, p2p: P2PManager) -> None:
+        """Wire one manager's group-management hooks: the creator (owner) id
+        used to validate incoming group_update / kick_member, and the mesh
+        rebroadcast used to forward relayed owner packets to members whose host
+        connection is down. The creator id is resolved lazily because a client
+        only learns its group id once the join completes."""
+        def creator() -> str:
+            gid = p2p.current_group_id
+            if not gid:
+                return ""
+            if p2p.is_host:
+                return p2p.my_id
+            return self.store.get_setting(f"group_creator_id_{gid}", "")
+
+        p2p.creator_id_provider = creator
+
+        def forward(packet) -> None:
+            gid = packet.group_id or p2p.current_group_id or ""
+            if gid:
+                self.mesh.broadcast_admin(gid, packet)
+
+        p2p.admin_rebroadcast = forward
+
+    def active_group_announcement(self) -> str:
+        gid = self.active_group_id
+        if gid is None:
+            return ""
+        meta = self._find_group(gid)
+        return meta.announcement if meta is not None else ""
+
+    def update_group_info(
+        self, group_name: str = "", announcement: Optional[str] = None
+    ) -> bool:
+        """Owner action: publish a new group name and/or announcement. No-op
+        (returns False) for a non-owner or a disconnected group."""
+        p2p = self._active_p2p()
+        if p2p is None or not p2p.is_host:
+            return False
+        name = (group_name or "").strip()[:MAX_NAME_LENGTH]
+        ann = None if announcement is None else announcement.strip()
+        if not name and ann is None:
+            return False
+        if not p2p.send_group_update(name, ann):
+            return False
+        self.status_message.emit("群信息已更新")
+        return True
+
+    def kick_active_member(self, peer_id: str) -> bool:
+        """Owner action: remove a member from the active group."""
+        p2p = self._active_p2p()
+        if p2p is None or not p2p.is_host:
+            return False
+        if not p2p.kick_member(peer_id):
+            return False
+        peer = p2p.peers.get(peer_id)
+        name = peer.name if peer is not None else peer_id
+        self.status_message.emit(f"已将 {name} 移出群组")
+        return True
 
     # ------------------------------------------- member-sponsored join entry
 
@@ -1315,6 +1502,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                         group_id=gid,
                         members=members,
                         host=host,
+                        # the owner's current announcement (the sponsor mirrors
+                        # it, like the host itself would)
+                        announcement=p2p.group_announcement or None,
                         # tombstone convergence: omitted when empty
                         deleted_ids=self.store.get_deleted_ids(gid) or None,
                     )
@@ -1575,6 +1765,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             # table; never surface them as groups
             if sg.group_id.startswith("direct:"):
                 continue
+            # a group this member was kicked out of keeps its history row but
+            # must never appear in the group list again
+            if sg.kicked:
+                continue
             self.persisted_my_names[sg.group_id] = sg.my_name
             self.groups.append(
                 GroupMeta(
@@ -1587,6 +1781,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                     member_count=sg.member_count,
                     last_message=sg.last_message,
                     last_message_time=sg.last_message_time,
+                    announcement=sg.announcement or "",
                 )
             )
         # Host groups now always use the single program-wide port; normalize
@@ -1674,6 +1869,11 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         p2p.deleted_ids_provider = self.store.get_deleted_ids
         p2p.initialize_as_host(nick, name, password)
         group_id = p2p.current_group_id
+        # Freeze the numeric join id at creation: a later owner rename
+        # (group_update) must not change the id members saved to rejoin.
+        p2p.set_join_id(p2p.numeric_group_id)
+        self.store.set_setting(f"group_join_id_{group_id}", p2p.join_id)
+        self._attach_admin_hooks(p2p)
         # The same group name on this device derives the SAME group id: stop
         # the previous instance instead of leaking its sockets/heartbeats, and
         # drop its row (a duplicate id would also break the list's keys).
@@ -1682,6 +1882,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             self.call_manager.end_if_on(old, "通话已结束")
             old.stop()
         self.store.set_group_password(group_id, password)
+        # a re-created same-id group is a fresh one: no announcement, and a
+        # previous kick flag (if any) must not hide it
+        self.store.set_group_announcement(group_id, "")
+        self.store.set_group_kicked(group_id, False)
         self.group_p2p_map[group_id] = p2p
         # a fresh group has no saved history to replay, so this instance may
         # mirror deletes right away (replay_done holds "the instance whose
@@ -1773,6 +1977,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.call_manager.attach(p2p)
         p2p.initialize_as_client(nick, "", password)
         p2p.set_join_id(join_id)
+        self._attach_admin_hooks(p2p)
         self.pending_p2p = p2p
         self.setup_p2p = p2p
         self.pending_host_ip = ip
@@ -1871,6 +2076,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.call_manager.attach(p2p)
         p2p.initialize_as_client(nick, "", password)
         p2p.set_join_id(join_id)
+        self._attach_admin_hooks(p2p)
         self.pending_p2p = p2p
         self.setup_p2p = p2p
         # no host address is known on this path: the group row is saved
@@ -1925,7 +2131,17 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             )
             # join_acks carry the group's delete tombstones (convergence)
             new_p2p.deleted_ids_provider = self.store.get_deleted_ids
-            new_p2p.initialize_as_host(nick, meta.group_name, password)
+            # re-host under the ORIGINAL group id and numeric join id: a
+            # rename (group_update) changed only the display name
+            new_p2p.initialize_as_host(
+                nick, meta.group_name, password, group_id=group_id
+            )
+            stored_join_id = self.store.get_setting(f"group_join_id_{group_id}", "")
+            new_p2p.set_join_id(stored_join_id or new_p2p.numeric_group_id)
+            if not stored_join_id:
+                self.store.set_setting(f"group_join_id_{group_id}", new_p2p.join_id)
+            new_p2p.group_announcement = meta.announcement or ""
+            self._attach_admin_hooks(new_p2p)
             self.call_manager.attach(new_p2p)
             self.group_p2p_map[group_id] = new_p2p
             meta.host_port = self.port
@@ -1969,6 +2185,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             self.store.get_group_password(group_id) or None,
         )
         p2p.set_join_id(join_id)
+        self._attach_admin_hooks(p2p)
         self.pending_p2p = p2p
         self.setup_p2p = p2p
         self.pending_host_ip = sg.host_ip
@@ -2602,6 +2819,29 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 else:
                     host_ip = self.pending_host_ip
                     host_port = self.pending_host_port or 0
+                # Remember the creator (group owner) device id so incoming
+                # group_update / kick_member packets can be validated against
+                # it. A member-sponsored join reveals the host in the ack; a
+                # direct join has the host at the address we dialed; the query
+                # response carries creatorId when it was answered by the host.
+                creator_id = ""
+                if host_peer is not None and host_peer.id:
+                    creator_id = host_peer.id
+                else:
+                    info = p2p.queried_group_info
+                    if info is not None and info.creator_id:
+                        creator_id = info.creator_id
+                    else:
+                        dial_port = self.pending_host_port or network_module.TCP_PORT
+                        for peer in p2p.peers.values():
+                            if (
+                                peer.ip_address == self.pending_host_ip
+                                and peer.port == dial_port
+                            ):
+                                creator_id = peer.id
+                                break
+                if creator_id:
+                    self.store.set_setting(f"group_creator_id_{gid}", creator_id)
                 self.pending_p2p = None
                 self.pending_group_id = None
                 self.group_p2p_map[gid] = p2p
@@ -2615,6 +2855,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                         host_port=host_port,
                         my_name=p2p.my_name,
                         connected=True,
+                        announcement=p2p.group_announcement,
                     )
                     self.groups.insert(0, meta)
                 else:
@@ -2623,6 +2864,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                     meta.host_ip = host_ip
                     meta.host_port = host_port
                     meta.my_name = p2p.my_name
+                    meta.announcement = p2p.group_announcement
                 self.store.upsert_group(
                     SavedGroup(
                         group_id=gid,
@@ -2632,6 +2874,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                         host_port=host_port,
                         my_name=p2p.my_name,
                         member_count=len(p2p.peers) + 1,
+                        announcement=p2p.group_announcement,
                     )
                 )
                 if p2p.group_password:

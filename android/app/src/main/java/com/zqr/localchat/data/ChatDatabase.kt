@@ -90,9 +90,10 @@ abstract class ChatDatabase : RoomDatabase() {
         }
 
         /**
-         * v4 -> v5: add the reply/quote columns and the own-message read flag.
+         * v4 -> v5: add the reply/quote + own-message read columns (chat UX)
+         * and the group-management columns (announcement, kick marker).
          * History must survive the upgrade (NEVER destructive): every column
-         * gets its empty/0 default, so pre-reply rows behave as before.
+         * gets its empty/0 default, so pre-existing rows behave as before.
          */
         private val MIGRATION_4_5 = object : Migration(4, 5) {
             override fun migrate(db: SupportSQLiteDatabase) {
@@ -107,6 +108,12 @@ abstract class ChatDatabase : RoomDatabase() {
                 )
                 db.execSQL(
                     "ALTER TABLE saved_messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0"
+                )
+                db.execSQL(
+                    "ALTER TABLE saved_groups ADD COLUMN announcement TEXT NOT NULL DEFAULT ''"
+                )
+                db.execSQL(
+                    "ALTER TABLE saved_groups ADD COLUMN kickedAt INTEGER NOT NULL DEFAULT 0"
                 )
             }
         }

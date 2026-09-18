@@ -296,6 +296,13 @@ fun LocalChatApp(
     }
 
     LaunchedEffect(Unit) {
+        // group management notices: kicked out, member removed
+        viewModel.groupEvents.collect { message ->
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    LaunchedEffect(Unit) {
         // a handshake revealed a placeholder contact's real device id: re-key
         // the open chat screen so it keeps showing the live message list
         viewModel.directChatMigrations.collect { (fromId, toId) ->
@@ -673,7 +680,10 @@ fun LocalChatApp(
                     requireCallPermission {
                         viewModel.startCall(peerId)
                     }
-                }
+                },
+                announcement = groups.find { it.groupId == activeGroupId }?.announcement ?: "",
+                onUpdateGroupInfo = viewModel::updateGroupInfo,
+                onKickMember = viewModel::kickMember
             )
         }
         Screen.Chat -> {

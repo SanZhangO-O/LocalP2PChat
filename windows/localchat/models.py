@@ -484,6 +484,12 @@ class NetworkPacket:
     # false once it stopped. Advisory only: receivers also expire an indicator
     # that received no refresh (see README).
     active: Optional[bool] = None
+    # group_update packet (group owner only): a new display name and/or a new
+    # announcement. Both optional; None means "unchanged" and is omitted from
+    # the wire so the bytes match kotlinx.serialization (defaults are not
+    # encoded).
+    group_name: Optional[str] = None
+    announcement: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
@@ -537,6 +543,10 @@ class NetworkPacket:
             d["readerId"] = self.reader_id
         if self.active is not None:
             d["active"] = self.active
+        if self.group_name is not None:
+            d["groupName"] = self.group_name
+        if self.announcement is not None:
+            d["announcement"] = self.announcement
         return d
 
     def to_json(self) -> str:
@@ -609,6 +619,10 @@ class NetworkPacket:
             if not isinstance(d["active"], bool):
                 raise ValueError("typing field active must be a boolean")
             pkt.active = d["active"]
+        if d.get("groupName") is not None:
+            pkt.group_name = str(d["groupName"])
+        if d.get("announcement") is not None:
+            pkt.announcement = str(d["announcement"])
         if pkt_type == "error" and pkt.error_message is None:
             raise ValueError("error packet missing required field: errorMessage")
         if pkt_type == "chat" and pkt.message is None:
@@ -623,6 +637,10 @@ class NetworkPacket:
             raise ValueError("read_receipt packet missing required field: upToId or readerId")
         if pkt_type == "typing" and (not pkt.sender_id or pkt.active is None):
             raise ValueError("typing packet missing required field: senderId or active")
+        if pkt_type == "group_update" and not pkt.group_id:
+            raise ValueError("group_update packet missing required field: groupId")
+        if pkt_type == "kick_member" and (not pkt.group_id or not pkt.target_id):
+            raise ValueError("kick_member packet missing required field: groupId/targetId")
         return pkt
 
     @staticmethod

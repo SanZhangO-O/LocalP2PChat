@@ -604,6 +604,19 @@ class HostGroupServer:
         self._notify_signaling()
         # keep listening: the shared port also serves direct member chats
 
+    def rename_registration(self, p2p: "P2PManager", old_name: str) -> None:
+        """Re-key a host group after the owner renamed it (group_update): the
+        registration key is the display name, and a stale entry under the old
+        name would keep resolving join handshakes to a dead name."""
+        with self._lock:
+            if self._groups.get(old_name) is p2p:
+                self._groups.pop(old_name, None)
+            # never clobber another group that already registered under the
+            # new name (p2p.group_name is already updated when this runs)
+            current = self._groups.get(p2p.group_name)
+            if current is None or current is p2p:
+                self._groups[p2p.group_name] = p2p
+
     def restart(self, port: Optional[int] = None) -> None:
         """Rebind the listener (e.g. after a bind failure or a port change).
         Existing member connections stay alive — they are owned by the groups."""
@@ -1012,6 +1025,17 @@ class P2PListener:
         that received no refresh."""
         pass
 
+    def group_info_changed(self, p2p: "P2PManager") -> None:
+        """The group owner published a new name/announcement (group_update);
+        the ViewModel refreshes its GroupMeta and persists the change."""
+        pass
+
+    def kicked_from_group(self, p2p: "P2PManager") -> None:
+        """The group owner removed this device (kick_member): every connection
+        of the group must be torn down and the group hidden from the list
+        (local history is kept)."""
+        pass
+
 
 class P2PManager:
     # Peer-presence heartbeat: both sides send a ping every interval; a read
@@ -1114,6 +1138,21 @@ class P2PManager:
         # the shared HostGroupServer.
         self._active_handlers = 0
         self._handshake_attempts: Dict[str, list] = {}
+        # The group owner's published announcement (group_update), mirrored
+        # by every member and persisted by the ViewModel.
+        self.group_announcement: str = ""
+        # Callable() -> creator (group owner) device id for this group, set by
+        # the ViewModel from its persisted group info. Only the creator may
+        # send group_update / kick_member; an unknown creator means every such
+        # packet is refused (fail-closed).
+        self.creator_id_provider = None
+        # Callable(NetworkPacket) that rebroadcasts a relayed admin packet over
+        # the group mesh (set by the ViewModel), so members whose host relay is
+        # down still receive owner commands forwarded by a connected member.
+        self.admin_rebroadcast = None
+        # Once the owner kicked this device the kicked flow must run exactly
+        # once even when the same packet arrives over both paths.
+        self._kicked_from_group = False
 
     @property
     def current_group_id(self) -> str:
@@ -1126,15 +1165,29 @@ class P2PManager:
     @property
     def numeric_group_id(self) -> str:
         """Stable 8-digit group id derived from the machine fingerprint and the
-        group name — the join identifier, separate from the display name."""
+        group name — the join identifier, separate from the display name.
+
+        When a join id was set explicitly (set_join_id) it wins: the owner may
+        RENAME the group (group_update), and the numeric id must stay the same
+        or every member's saved join id would stop matching."""
+        if self.join_id:
+            return self.join_id
         return numeric_group_id_of(self.group_name, self.hardware_id)
 
     def initialize_as_host(
-        self, user_name: str, group: str, password: Optional[str] = None
+        self,
+        user_name: str,
+        group: str,
+        password: Optional[str] = None,
+        group_id: Optional[str] = None,
     ) -> None:
         self.my_name = user_name.strip()
         self.group_name = group.strip()
-        self.group_id = f"{self.group_name}@{self.hardware_id}"
+        # A re-host must keep the ORIGINAL group id even when the display name
+        # was renamed by a group_update (the id keys the message history and
+        # the group password); fresh hosts derive it from the name (so the
+        # same group name on this device still maps to the same group).
+        self.group_id = group_id or f"{self.group_name}@{self.hardware_id}"
         self.my_ip_address = get_local_ip_address()
         self.is_host = True  # persist paths read is_host right after init
         if password is not None:
@@ -1449,6 +1502,10 @@ class P2PManager:
                 for peer in response.members:
                     if peer.id != self.my_id:
                         self.peers[peer.id] = peer
+            # the owner's current announcement travels with the ack so a
+            # newcomer sees it right away (group_update only carries changes)
+            if response.announcement is not None:
+                self.group_announcement = response.announcement
             self.listener.peers_changed(self)
             if response.deleted_ids:
                 # tombstone convergence: drop copies we still hold and record
@@ -1540,6 +1597,8 @@ class P2PManager:
                             self.peers[peer.id] = peer
                     self._host_socket = sock
                     self._host_wire = wire
+                if response.announcement is not None:
+                    self.group_announcement = response.announcement
                 sock = None
                 if response.deleted_ids:
                     # tombstone convergence from the host (no rebroadcast);
@@ -1631,7 +1690,14 @@ class P2PManager:
         if previous is not None and previous is not conn:
             self._safe_close(previous["sock"])
         try:
-            ack = NetworkPacket(type="join_ack", group_id=self.group_id, members=members)
+            ack = NetworkPacket(
+                type="join_ack",
+                group_id=self.group_id,
+                members=members,
+                # the owner's current announcement so a newcomer sees it at
+                # once (omitted when empty, matching kotlinx.serialization)
+                announcement=self.group_announcement or None,
+            )
             deleted_ids = None
             if self.deleted_ids_provider is not None:
                 try:
@@ -1752,6 +1818,10 @@ class P2PManager:
             with self._lock:
                 self.peers.pop(packet.peer.id, None)
             self.listener.peers_changed(self)
+        elif packet.type == "group_update":
+            self._handle_group_update_as_client(packet)
+        elif packet.type == "kick_member":
+            self._handle_kick_as_client(packet)
         elif packet.type == "delete_message" and packet.message_id is not None:
             target = None
             with self._lock:
@@ -1813,6 +1883,17 @@ class P2PManager:
         # "pong": traffic only; keeps the read loop alive
 
     def _process_packet_from_client(self, packet: NetworkPacket, sender_id: str) -> None:
+        if packet.type in ("group_update", "kick_member"):
+            # only the group owner (creator) may send management packets; the
+            # owner is this host, so a member sending one is a protocol
+            # violation: drop it and detach that member
+            logger.warning(
+                "reject %s from member %s: only the group owner may send it",
+                packet.type,
+                sender_id,
+            )
+            self._drop_client(sender_id)
+            return
         if packet.type in ("chat", "file_message") and packet.message is not None:
             msg = packet.message
             if msg.sender_id != sender_id or not is_valid_content(msg.content):
@@ -2083,6 +2164,185 @@ class P2PManager:
         """
         packet.target_id = peer_id
         self._enqueue_send(packet)
+
+    # ------------------------------------------------------- group management
+
+    def send_group_update(
+        self, group_name: str = "", announcement: Optional[str] = None
+    ) -> bool:
+        """Owner-only: publish a new display name and/or announcement to every
+        member. Applies locally first (so the owner's UI and persisted row
+        follow), then broadcasts a group_update carrying senderId — members
+        only accept it when senderId is the group's creator."""
+        if not self.is_host:
+            return False
+        new_name = (group_name or "").strip()
+        if not new_name and announcement is None:
+            return False
+        if new_name:
+            old_name = self.group_name
+            self.group_name = new_name
+            if self._host_server is not None:
+                try:
+                    self._host_server.rename_registration(self, old_name)
+                except Exception:
+                    pass
+        if announcement is not None:
+            self.group_announcement = announcement
+        packet = NetworkPacket(
+            type="group_update",
+            group_id=self.group_id,
+            sender_id=self.my_id,
+            group_name=new_name or None,
+            announcement=announcement,
+        )
+        try:
+            if self.is_host:
+                self._broadcast_to_clients(packet)
+        except Exception:
+            pass
+        self.listener.group_info_changed(self)
+        return True
+
+    def kick_member(self, target_id: str) -> bool:
+        """Owner-only: remove a member. The target receives a directed
+        kick_member (then its connection is closed) and every other member
+        gets the broadcast so it drops the target from its member list/mesh."""
+        if not self.is_host or not target_id:
+            return False
+        with self._lock:
+            known = target_id in self.peers
+            # pop the connection BEFORE closing: the read loop's finally only
+            # broadcasts peer_left when it still owns the registration, and
+            # the owner already announces the removal itself
+            conn = self._connected_clients.pop(target_id, None)
+            self.peers.pop(target_id, None)
+        if not known and conn is None:
+            return False
+        packet = NetworkPacket(
+            type="kick_member",
+            group_id=self.group_id,
+            sender_id=self.my_id,
+            target_id=target_id,
+        )
+        if conn is not None:
+            try:
+                conn["wire"].send_packet(packet)
+            except Exception:
+                pass
+        try:
+            self._broadcast_to_clients(packet, exclude=target_id)
+        except Exception:
+            pass
+        if conn is not None:
+            # give the directed packet a moment to flush before the socket
+            # dies; the close is what actually detaches the kicked member
+            self._spawn(self._delayed_close, conn["sock"], 0.5)
+        self.listener.peers_changed(self)
+        return True
+
+    @staticmethod
+    def _delayed_close(sock, delay: float) -> None:
+        try:
+            time.sleep(delay)
+        except Exception:
+            pass
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def _drop_client(self, peer_id: str) -> None:
+        """Detach one connected member (a protocol violation): close its
+        socket and tell the remaining members it left."""
+        with self._lock:
+            conn = self._connected_clients.pop(peer_id, None)
+            self.peers.pop(peer_id, None)
+        if conn is not None:
+            self._safe_close(conn["sock"])
+        self._broadcast_to_clients(
+            NetworkPacket(type="peer_left", peer=Peer(peer_id, "", "", 0)),
+            exclude=peer_id,
+        )
+        self.listener.peers_changed(self)
+
+    def _creator_id(self) -> str:
+        provider = self.creator_id_provider
+        if provider is None:
+            return ""
+        try:
+            return str(provider() or "")
+        except Exception:
+            return ""
+
+    def _handle_group_update_as_client(self, packet: NetworkPacket) -> None:
+        creator = self._creator_id()
+        if not creator or not packet.sender_id or packet.sender_id != creator:
+            logger.warning(
+                "reject group_update from %r: not the group owner (%r)",
+                packet.sender_id,
+                creator,
+            )
+            self._disconnect_from_host()
+            return
+        changed = False
+        new_name = (packet.group_name or "").strip()
+        if new_name and new_name != self.group_name:
+            self.group_name = new_name
+            changed = True
+        if packet.announcement is not None:
+            self.group_announcement = packet.announcement
+            changed = True
+        if changed:
+            self.listener.group_info_changed(self)
+        self._rebroadcast_admin(packet)
+
+    def _handle_kick_as_client(self, packet: NetworkPacket) -> None:
+        creator = self._creator_id()
+        if not creator or not packet.sender_id or packet.sender_id != creator:
+            logger.warning(
+                "reject kick_member from %r: not the group owner (%r)",
+                packet.sender_id,
+                creator,
+            )
+            self._disconnect_from_host()
+            return
+        target = packet.target_id
+        if not target:
+            return
+        if target == self.my_id:
+            # the owner removed this device: run the teardown once
+            if not self._kicked_from_group:
+                self._kicked_from_group = True
+                self.listener.kicked_from_group(self)
+            return
+        with self._lock:
+            self.peers.pop(target, None)
+        self._rebroadcast_admin(packet)
+        self.listener.peers_changed(self)
+
+    def _rebroadcast_admin(self, packet: NetworkPacket) -> None:
+        """Forward an owner admin packet over the group mesh so members whose
+        host relay is down still receive it (set by the ViewModel)."""
+        hook = self.admin_rebroadcast
+        if hook is None:
+            return
+        try:
+            hook(packet)
+        except Exception:
+            pass
+
+    def _disconnect_from_host(self) -> None:
+        """Drop the host relay after a protocol violation: the read loop's
+        cleanup then publishes connection_lost so the UI can reconnect."""
+        with self._lock:
+            sock = self._host_socket
+        if sock is not None:
+            self._safe_close(sock)
 
     def _send_worker_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -4076,6 +4336,13 @@ class GroupMeshListener:
         """A linked member's typing indicator changed (host-offline path)."""
         pass
 
+    def group_mesh_admin(self, group_id: str, packet: NetworkPacket) -> None:
+        """A group owner management packet (group_update / kick_member) arrived
+        over a mesh link. The mesh layer already validated that senderId is the
+        group's creator; the ViewModel applies the change (announcement/name,
+        or the kicked member's teardown)."""
+        pass
+
 
 class GroupMeshManager:
     """Group mesh: direct member-to-member links inside a group, so members
@@ -4124,6 +4391,11 @@ class GroupMeshManager:
         # Tombstone source for history pushes: callable(group_id) ->
         # [msgId, ...] (backed by the ViewModel's deleted_messages table).
         self.deleted_ids_provider = None
+        # Creator (group owner) id per group: callable(group_id) -> str. Owner
+        # management packets (group_update / kick_member) are only accepted on
+        # a link when their senderId is the creator; an unknown creator refuses
+        # them (fail-closed).
+        self.creator_id_provider = None
 
     def attach(self, listener: GroupMeshListener) -> None:
         self._listener = listener
@@ -4246,6 +4518,20 @@ class GroupMeshManager:
         if not links:
             return
         packet = NetworkPacket(type="mesh_chat", group_id=group_id, message=msg)
+        for link in links:
+            self._spawn(self._link_write, link, packet)
+
+    def broadcast_admin(self, group_id: str, packet: NetworkPacket) -> None:
+        """Relay an owner management packet over every mesh link. Called by a
+        member that received the packet on the host relay (set as the owning
+        P2PManager's admin_rebroadcast hook), so members whose own relay is down
+        still see the owner's command. Receivers validate senderId against the
+        creator and never forward again (the mesh is a complete graph)."""
+        with self._lock:
+            state = self._groups.get(group_id)
+            if state is None:
+                return
+            links = list(state["links"].values())
         for link in links:
             self._spawn(self._link_write, link, packet)
 
@@ -4686,6 +4972,8 @@ class GroupMeshManager:
                         self.apply_deleted_ids(group_id, packet.deleted_ids)
                 elif packet.type == "mesh_announce" and packet.peer is not None:
                     self.add_peer(group_id, packet.peer)
+                elif packet.type in ("group_update", "kick_member"):
+                    self._handle_admin_incoming(group_id, link, packet)
                 elif packet.type == "ping":
                     try:
                         link["wire"].send_packet(NetworkPacket(type="pong"))
@@ -4703,6 +4991,55 @@ class GroupMeshManager:
                         state["links"].pop(link["peer_id"], None)
                     self._set_has_links(group_id, bool(state["links"]))
             self._safe_close(link["sock"])
+
+    def _handle_admin_incoming(self, group_id: str, link: dict, packet: NetworkPacket) -> None:
+        """Owner management packet over a mesh link: only the group creator may
+        originate it (senderId must match the persisted creator id), otherwise
+        the link is dropped. Applied packets are forwarded to the ViewModel;
+        they are never re-forwarded (the mesh is a complete graph)."""
+        creator = ""
+        provider = self.creator_id_provider
+        if provider is not None:
+            try:
+                creator = str(provider(group_id) or "")
+            except Exception:
+                creator = ""
+        if not creator or not packet.sender_id or packet.sender_id != creator:
+            logger.warning(
+                "reject %s on mesh link %s: senderId=%r is not the creator %r",
+                packet.type,
+                link.get("peer_id"),
+                packet.sender_id,
+                creator,
+            )
+            link["alive"] = False
+            self._safe_close(link["sock"])
+            return
+        if packet.type == "kick_member":
+            target = packet.target_id
+            if not target:
+                return
+            mine = None
+            with self._lock:
+                state = self._groups.get(group_id)
+                if state is not None and state.get("my_peer") is not None:
+                    mine = state["my_peer"].id
+            if target != mine:
+                with self._lock:
+                    state = self._groups.get(group_id)
+                    if state is not None:
+                        state["peers"].pop(target, None)
+                        dead = state["links"].pop(target, None)
+                        if dead is not None:
+                            dead["alive"] = False
+                            self._safe_close(dead["sock"])
+                self._set_has_links(group_id, self.has_links(group_id))
+        listener = self._listener
+        if listener is not None:
+            try:
+                listener.group_mesh_admin(group_id, packet)
+            except Exception:
+                pass
 
     def _handle_delete_incoming(self, group_id: str, link: dict, message_id: str, sender_id: str) -> None:
         """Apply a mesh-received delete locally: remove the message from this

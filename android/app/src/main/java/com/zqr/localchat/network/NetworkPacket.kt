@@ -68,5 +68,10 @@ data class NetworkPacket(
     /** typing: true while the sender is composing in the [groupId] scope,
      *  false once it stopped. Advisory only: receivers also expire an
      *  indicator that received no refresh (see README). Null is omitted. */
-    val active: Boolean? = null
+    val active: Boolean? = null,
+    /** group_update (owner-only): a new display name and/or announcement.
+     *  Both optional; null means "unchanged" and is omitted on the wire, so
+     *  the bytes match the Windows peer's output. */
+    val groupName: String? = null,
+    val announcement: String? = null
 )

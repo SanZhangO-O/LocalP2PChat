@@ -132,6 +132,22 @@ class ChatApp : Application() {
                 .apply()
         }
 
+        private fun creatorIdKey(groupId: String) = "group_creator_id_$groupId"
+
+        /** The group owner (creator) device id, learned when joining: only
+         *  owner packets (group_update / kick_member) whose senderId matches it
+         *  are accepted. Not a secret, so it is stored as plain text. */
+        fun savedGroupCreatorId(ctx: Context, groupId: String): String =
+            ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE)
+                .getString(creatorIdKey(groupId), "") ?: ""
+
+        fun saveGroupCreatorId(ctx: Context, groupId: String, creatorId: String) {
+            ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE)
+                .edit()
+                .putString(creatorIdKey(groupId), creatorId)
+                .apply()
+        }
+
         fun startChatService(ctx: Context) {
             // The foreground service is only used to keep connections alive in
             // the background; when the user disabled background running it must

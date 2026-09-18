@@ -48,6 +48,17 @@ interface ChatDao {
     @Query("SELECT * FROM saved_messages WHERE groupId = :groupId ORDER BY timestamp ASC")
     fun getMessagesForGroup(groupId: String): Flow<List<SavedChatMessage>>
 
+    /** Owner group_update: replace the display name and announcement without
+     *  touching the reconnect metadata (updateGroup never writes these
+     *  columns, so a metadata refresh cannot revert a rename). */
+    @Query("UPDATE saved_groups SET groupName = :groupName, announcement = :announcement WHERE groupId = :groupId")
+    suspend fun updateGroupAdminInfo(groupId: String, groupName: String, announcement: String)
+
+    /** Mark a group this member was kicked out of: the row (and its history)
+     *  stays, but the group is hidden from the list. */
+    @Query("UPDATE saved_groups SET kickedAt = :kickedAt WHERE groupId = :groupId")
+    suspend fun markGroupKicked(groupId: String, kickedAt: Long)
+
     /** Undelivered (pending-send) direct-chat messages across all chats;
      *  re-queued into the outbox at process start. */
     @Query("SELECT * FROM saved_messages WHERE groupId LIKE 'direct:%' AND pending = 1 ORDER BY timestamp ASC")

@@ -109,6 +109,20 @@ object GroupMeshManager {
     @Volatile
     var deletedIdsProvider: ((groupId: String) -> List<String>)? = null
 
+    /** The group owner (creator) device id per group: owner management packets
+     *  (group_update / kick_member) are only accepted on a link when their
+     *  senderId matches it. Unknown creator -> refuse (fail-closed). Set by the
+     *  ViewModel (reads its persisted group info). */
+    @Volatile
+    var creatorIdProvider: ((groupId: String) -> String)? = null
+
+    /** An owner management packet arrived over a mesh link (already validated
+     *  against the creator id). The ViewModel applies the change: announcement
+     *  / name, or the kicked member's teardown. Never re-forwarded (the mesh
+     *  is a complete graph). */
+    @Volatile
+    var onGroupAdmin: ((String, NetworkPacket) -> Unit)? = null
+
     // ------------------------------------------------------------ lifecycle
 
     /** The ViewModel seeds a group's mesh state and connects to every other
@@ -236,10 +250,23 @@ object GroupMeshManager {
         }
     }
 
+    /** Relay an owner management packet over every mesh link. Called when a
+     *  member received it on the host relay, so members whose own relay is down
+     *  still see the owner's command. Receivers validate senderId against the
+     *  creator and never forward again. */
+    fun broadcastAdmin(groupId: String, packet: NetworkPacket) {
+        val state = groups[groupId] ?: return
+        val links = state.links.values.toList()
+        thread(name = "mesh-admin") {
+            links.forEach { link ->
+                runCatching { link.wire.sendPacket(packet) }
+            }
+        }
+    }
+
     /** Tell every linked member that [peer] joined the group, so each one
      *  links up with it (used when a member sponsors a join). */
-    fun announcePeer(groupId: String, peer: Peer) {
-        val state = groups[groupId] ?: return
+    fun announcePeer(groupId: String, peer: Peer) {        val state = groups[groupId] ?: return
         addPeer(groupId, peer)
         val packet = NetworkPacket(type = "mesh_announce", groupId = groupId, peer = peer)
         val links = state.links.values.toList()
@@ -544,6 +571,7 @@ object GroupMeshManager {
                             onGroupTyping?.invoke(state.groupId, sender, active)
                         }
                     }
+                    "group_update", "kick_member" -> handleAdminIncoming(state, link, packet)
                     "ping" -> runCatching { link.wire.sendPacket(NetworkPacket(type = "pong")) }
                     "pong" -> {}
                 }
@@ -640,6 +668,42 @@ object GroupMeshManager {
             }
         } catch (e: InterruptedException) {
             // closing
+        }
+    }
+
+    /** Owner management packet over a mesh link: only the group creator may
+     *  originate it (senderId must match the persisted creator id), otherwise
+     *  the link is dropped. Applied packets are handed to the ViewModel and
+     *  never re-forwarded. */
+    private fun handleAdminIncoming(state: GroupState, link: Link, packet: NetworkPacket) {
+        val creator = creatorIdProvider?.invoke(state.groupId).orEmpty()
+        if (creator.isEmpty() || packet.senderId != creator) {
+            Log.w(
+                TAG,
+                "reject ${packet.type} on mesh link ${link.peerId}: senderId=${packet.senderId} is not the creator ($creator)"
+            )
+            link.alive = false
+            closeSocket(link.socket)
+            return
+        }
+        if (packet.type == "kick_member") {
+            val target = packet.targetId ?: return
+            if (target != state.myPeer?.id) {
+                state.peers.remove(target)
+                state.links.remove(target)?.let { dead ->
+                    dead.alive = false
+                    closeSocket(dead.socket)
+                }
+                updateHasLinks(state.groupId)
+            }
+        }
+        val cb = onGroupAdmin
+        if (cb != null) {
+            try {
+                cb(state.groupId, packet)
+            } catch (e: Exception) {
+                Log.w(TAG, "onGroupAdmin failed", e)
+            }
         }
     }
 
