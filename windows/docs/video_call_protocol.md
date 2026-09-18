@@ -24,6 +24,23 @@
 | `mediaPort` | Int | 0 | 主叫方媒体服务器端口（offer 中携带） |
 | `accepted` | Boolean | true | 应答是否接受（默认接受；拒绝用 `call_reject`） |
 | `audioEnabled` | Boolean | true | 是否启用音频 |
+| `media` | String? | null | 通话媒体类型：`"audio"` 或 `"video"`；null/省略 = `"video"`（两端保持一致，视频为默认且省略序列化） |
+
+`media` 由主叫在 `call_offer` 中声明，被叫据此决定是否采集/渲染视频；`call_answer`/`call_reject`/`call_hangup` 复用同一 CallInfo，不改变媒体类型。语音通话（`media == "audio"`）时：
+
+- 两端都**不**启动摄像头采集，也**不**解码/渲染对端视频帧（即使收到 channel 0 帧也直接丢弃）；
+- 媒体连接、安全握手、`call_media_hello` 校验与信令流程与视频通话完全一致；
+- 任一端麦克风不可用时，媒体发送线程会周期性发送静音 PCM 帧保活（避免对端 15s 读超时误判断线）。
+
+### 1.1.1 通话记录（本地，非协议）
+
+通话结束时两端各自在本地写一条通话记录（去电/来电、结果、开始时间、时长、是否视频），
+并展示在对应的直聊会话中。通话记录**不进入本协议**、不做端到端同步、不参与 `history_reply`：
+
+- 存储：Windows `ChatStore` 的 `call_logs` 表 / Android Room 的 `call_logs` 实体，
+  按 `direct:<peerId>` 会话键归类，每会话保留最近 200 条；
+- 展示：会话内以系统样式行穿插（不是普通气泡，不参与删除/转发/墓碑），点击可回拨；
+- 未接来电：除会话内系统行外，Android 端额外发一条可点击跳转到该会话的通知。
 
 ### 1.2 新增包类型
 

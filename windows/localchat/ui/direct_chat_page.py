@@ -28,14 +28,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..models import MAX_CONTENT_LENGTH, MAX_FOLDER_FILES, MEDIA_KINDS, Peer
+from ..models import MAX_CONTENT_LENGTH, MAX_FOLDER_FILES, MEDIA_AUDIO, MEDIA_KINDS, Peer
 from ..view_model import ChatViewModel
 from .chat_page import (
     HEADER_ROLE,
     MSG_ROLE,
+    CallLogEntry,
     FolderGroup,
     MessageDelegate,
     _safe_save_name,
+    call_log_row,
     file_offer_expired,
     iter_message_rows,
 )
@@ -113,6 +115,7 @@ class DirectChatPage(QWidget):
                 folder_states=self._folder_states,
                 on_folder_click=self._download_folder,
                 on_folder_open=self._open_folder,
+                on_call_click=self._call_back,
                 parent=self,
             )
         )
@@ -142,6 +145,13 @@ class DirectChatPage(QWidget):
         self.call_btn.setToolTip("视频通话")
         self.call_btn.clicked.connect(self._start_call)
         input_row.addWidget(self.call_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+
+        self.voice_btn = QPushButton("语音")
+        self.voice_btn.setObjectName("ghost")
+        self.voice_btn.setMinimumSize(64, 40)
+        self.voice_btn.setToolTip("语音通话")
+        self.voice_btn.clicked.connect(self._start_voice_call)
+        input_row.addWidget(self.voice_btn, alignment=Qt.AlignmentFlag.AlignBottom)
 
         self.file_btn = QPushButton()
         if getattr(sys, "_MEIPASS", None):
@@ -182,6 +192,7 @@ class DirectChatPage(QWidget):
         self.vm.media_ready.connect(self._on_media_ready)
         self.vm.file_progress.connect(self._on_file_progress)
         self.vm.direct_chat_migrated.connect(self._on_chat_migrated)
+        self.vm.call_logs_changed.connect(self._on_call_logs_changed)
         self.vm.folder_progress.connect(self._on_folder_progress)
 
         self.vm.folder_download_finished.connect(self._on_folder_download_finished)
@@ -219,6 +230,10 @@ class DirectChatPage(QWidget):
         if peer_id == self._peer_id:
             self._refresh_status()
 
+    def _on_call_logs_changed(self, peer_id: str) -> None:
+        if peer_id == self._peer_id:
+            self._refresh()
+
     def _refresh_status(self):
         peer_id = self._peer_id
         if peer_id is None:
@@ -230,6 +245,7 @@ class DirectChatPage(QWidget):
         )
         self.banner_label.setVisible(not alive)
         self.call_btn.setEnabled(alive)
+        self.voice_btn.setEnabled(alive)
 
     def _on_chat_migrated(self, from_id: str, to_id: str) -> None:
         # a handshake revealed the real device id for this chat (a manually
@@ -263,15 +279,16 @@ class DirectChatPage(QWidget):
         if peer_id is None:
             return
         msgs = self.vm.direct_messages(peer_id)
+        logs = [call_log_row(log) for log in self.vm.direct_call_logs(peer_id)]
         self.model.setRowCount(0)
-        self.list_view.setVisible(bool(msgs))
-        self.empty_label.setVisible(not msgs)
-        if not msgs:
+        self.list_view.setVisible(bool(msgs) or bool(logs))
+        self.empty_label.setVisible(not msgs and not logs)
+        if not msgs and not logs:
             self.empty_label.setText(
                 "已连接，开始聊天吧" if self.vm.direct_chat_alive(peer_id) else "点击发送即可尝试重新连接"
             )
             return
-        for kind, payload in iter_message_rows(msgs):
+        for kind, payload in iter_message_rows(msgs, logs):
             item = QStandardItem()
             if kind == "header":
                 item.setData(date_header_text(payload), HEADER_ROLE)
@@ -320,6 +337,19 @@ class DirectChatPage(QWidget):
         if peer_id is None:
             return
         self.vm.start_direct_call(peer_id)
+
+    def _start_voice_call(self):
+        peer_id = self._peer_id
+        if peer_id is None:
+            return
+        self.vm.start_direct_call(peer_id, media=MEDIA_AUDIO)
+
+    def _call_back(self, entry: CallLogEntry):
+        """Clicking a call-log line redials the peer with the same media kind."""
+        peer_id = self._peer_id
+        if peer_id is None:
+            return
+        self.vm.start_direct_call(peer_id, media=entry.media)
 
     def _pick_file(self):
         if self._peer_id is None:
@@ -493,6 +523,9 @@ class DirectChatPage(QWidget):
         index = self.list_view.indexAt(pos)
         msg = index.data(MSG_ROLE) if index.isValid() else None
         if msg is None:
+            return
+        if isinstance(msg, CallLogEntry):
+            # call-log lines are not messages: no copy/forward/delete menu
             return
         if isinstance(msg, FolderGroup):
             self._show_folder_menu(msg, pos)

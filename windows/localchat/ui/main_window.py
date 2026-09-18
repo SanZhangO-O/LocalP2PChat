@@ -110,6 +110,7 @@ class MainWindow(QMainWindow):
             on_accept=self.vm.accept_call,
             on_reject=self.vm.reject_call,
             parent=self,
+            audio=self.vm.call_manager.media == "audio",
         )
         self._incoming_dialog = dialog
         dialog.finished.connect(lambda _: setattr(self, "_incoming_dialog", None))
@@ -120,7 +121,11 @@ class MainWindow(QMainWindow):
     def _on_call_state(self, state: str, peer_name: str, detail: str):
         if state in ("outgoing", "active"):
             if self._call_window is None:
-                win = CallWindow(self.vm.call_manager, self)
+                win = CallWindow(
+                    self.vm.call_manager,
+                    self,
+                    audio=self.vm.call_manager.media == "audio",
+                )
                 self._call_window = win
                 win.finished.connect(lambda _: setattr(self, "_call_window", None))
                 win.show()

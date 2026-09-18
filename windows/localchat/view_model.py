@@ -17,6 +17,8 @@ from .hardware import get_hardware_id, get_local_ip_address
 from .models import (
     FILE_KIND_IMAGE,
     MAX_FOLDER_FILES,
+    MEDIA_AUDIO,
+    MEDIA_VIDEO,
     TCP_PORT,
     ChatMessage,
     ContactRequest,
@@ -32,7 +34,7 @@ from . import network as network_module
 from .network import DirectChatListener, DirectChatManager, P2PListener, P2PManager, Protocol
 from .punch import DEFAULT_SIGNALING_PORT, parse_server_endpoint
 from .securewire import DeviceIdentity
-from .storage import ChatStore, SavedGroup, to_saved_message
+from .storage import ChatStore, SavedCallLog, SavedGroup, to_saved_message
 
 # Display-name cap for nicknames, group names and contact remarks — Android
 # parity (20 chars). Enforced by truncation here plus QLineEdit.maxLength in
@@ -110,6 +112,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # A direct chat's key moved from an "ip:..." placeholder id to the member's
     # real device id (revealed by a handshake): the UI re-keys the open chat.
     direct_chat_migrated = pyqtSignal(str, str)
+    # A conversation's local call log changed (one finished call recorded):
+    # carries the peer id so an open direct chat re-renders its system rows.
+    call_logs_changed = pyqtSignal(str)
 
     # Burst window in ms: incoming notifications within this span are merged
     # into a single tray bubble instead of one popup per message.
@@ -179,6 +184,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # Video/audio call engine (created on the GUI thread; it owns the
         # QAudioSource/QAudioSink and all call state).
         self.call_manager = CallManager(self)
+        # Every finished call is recorded to the local call log (per 1:1
+        # conversation with the other participant); missed incoming calls also
+        # surface as a system row in that conversation (Android parity).
+        self.call_manager.call_finished.connect(self._on_call_finished)
 
         # Direct member chats: members are first-class — the shared listener
         # must be reachable even with no host group, and the identity must
@@ -742,9 +751,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # kills a call on another session
         self.call_manager.end_if_on(self.direct, "连接已断开", peer_id=peer_id)
 
-    def start_direct_call(self, peer_id: str) -> None:
-        """Start a video call with a direct-chat member: signaling rides the
-        direct session socket, media over the usual TCP connection."""
+    def start_direct_call(self, peer_id: str, media: str = MEDIA_VIDEO) -> None:
+        """Start a video/audio call with a direct-chat member: signaling rides
+        the direct session socket, media over the usual TCP connection.
+        [media] is "video" (default) or "audio"."""
         contact = next(
             (c for c in self.direct.contacts_list() if c.id == peer_id), None
         )
@@ -760,7 +770,47 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             peer=contact,
             my_id=self.direct.my_id_value,
             my_name=self.direct.my_name_value,
+            media=media,
         )
+
+    # ---------------------------------------------------------- call log
+    # Local-only call history (never sent over the wire, never synced): one
+    # row per finished call keyed to the 1:1 conversation with the other
+    # participant. The UI interleaves these as system-style rows.
+
+    def _on_call_finished(self, info) -> None:
+        """CallManager finished a call: persist its local log row."""
+        if not isinstance(info, dict):
+            return
+        peer_id = str(info.get("peer_id") or "")
+        if not peer_id:
+            return
+        try:
+            self.store.add_call_log(
+                SavedCallLog(
+                    id=str(info.get("call_id") or uuid.uuid4()),
+                    conversation_key="direct:" + peer_id,
+                    peer_id=peer_id,
+                    peer_name=str(info.get("peer_name") or ""),
+                    direction=str(info.get("direction") or "outgoing"),
+                    result=str(info.get("result") or "failed"),
+                    media=str(info.get("media") or MEDIA_VIDEO),
+                    start_time=int(info.get("started_at") or 0),
+                    duration=int(info.get("duration") or 0),
+                )
+            )
+        except Exception:
+            return
+        # refresh an open direct chat's merged message + call-log flow
+        self.call_logs_changed.emit(peer_id)
+
+    def direct_call_logs(self, peer_id: str) -> list:
+        """Newest call logs of the 1:1 conversation with [peer_id], oldest
+        first (render order)."""
+        try:
+            return self.store.get_call_logs("direct:" + peer_id)
+        except Exception:
+            return []
 
     def send_direct_file(self, peer_id: str, path: str) -> bool:
         """Offer a local file over a direct session (download server + shared
@@ -1211,6 +1261,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             )
         )
         self.store.move_messages("direct:" + from_id, "direct:" + to_id)
+        self.store.move_call_logs("direct:" + from_id, "direct:" + to_id)
         self.store.delete_group("direct:" + from_id)
         self.direct_chat_migrated.emit(from_id, to_id)
 
@@ -2094,8 +2145,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
 
     # ------------------------------------------------------------- video call
 
-    def start_call(self, peer_id: str) -> None:
-        """Start a video call with a member of the active group."""
+    def start_call(self, peer_id: str, media: str = MEDIA_VIDEO) -> None:
+        """Start a video/audio call with a member of the active group.
+        [media] is "video" (default) or "audio"."""
         gid = self.active_group_id
         if gid is None:
             self.status_message.emit("请先进入一个群组")
@@ -2104,7 +2156,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         if p2p is None or p2p.connection_lost:
             self.status_message.emit("未连接到群组，无法发起通话")
             return
-        self.call_manager.start_call(p2p, peer_id)
+        self.call_manager.start_call(p2p, peer_id, media=media)
 
     def accept_call(self) -> None:
         self.call_manager.accept_call()

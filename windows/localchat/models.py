@@ -48,6 +48,21 @@ FILE_KIND_IMAGE = "image"
 FILE_KIND_VIDEO = "video"
 MEDIA_KINDS = (FILE_KIND_IMAGE, FILE_KIND_VIDEO)
 
+# Call media kinds carried by CallInfo.media: "audio" or (implicit) "video".
+# Omitted on the wire for video so a plain video offer stays byte-identical.
+MEDIA_AUDIO = "audio"
+MEDIA_VIDEO = "video"
+
+# Call log direction/result vocabulary (local-only, shared with the UI and
+# storage: never sent over the wire).
+CALL_DIRECTION_INCOMING = "incoming"
+CALL_DIRECTION_OUTGOING = "outgoing"
+CALL_RESULT_ANSWERED = "answered"
+CALL_RESULT_MISSED = "missed"
+CALL_RESULT_REJECTED = "rejected"
+CALL_RESULT_CANCELLED = "cancelled"
+CALL_RESULT_FAILED = "failed"
+
 
 def detect_media_kind(name: str) -> str:
     """Classify a file by extension: "image", "video" or "file". Used on the
@@ -361,6 +376,9 @@ class CallInfo:
     media_port: int = 0
     accepted: bool = True
     audio_enabled: bool = True
+    # "audio" | "video"; empty = video (omitted on the wire so a plain video
+    # offer stays byte-identical to the pre-media-field format).
+    media: str = ""
 
     def to_dict(self) -> dict:
         d = {
@@ -375,6 +393,8 @@ class CallInfo:
             d["accepted"] = False
         if not self.audio_enabled:
             d["audioEnabled"] = False
+        if self.media:
+            d["media"] = self.media
         return d
 
     @staticmethod
@@ -385,6 +405,11 @@ class CallInfo:
             raise ValueError("call field accepted must be a boolean")
         if not isinstance(audio_enabled, bool):
             raise ValueError("call field audioEnabled must be a boolean")
+        # Unknown media kinds degrade to video (empty) rather than failing:
+        # a future kind must never break the whole call packet.
+        media = str(d.get("media", "") or "")
+        if media != MEDIA_AUDIO:
+            media = ""
         return CallInfo(
             call_id=str(d.get("callId", "")),
             caller_id=str(d.get("callerId", "")),
@@ -393,6 +418,7 @@ class CallInfo:
             media_port=_strict_port(d.get("mediaPort", 0), "mediaPort"),
             accepted=accepted,
             audio_enabled=audio_enabled,
+            media=media,
         )
 
 

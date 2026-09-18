@@ -13,14 +13,15 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import network as network_module
-from ..models import Peer
+from ..models import MEDIA_AUDIO, Peer
 from ..view_model import ChatViewModel
 from .theme import ERROR, PRIMARY, TEXT_SUBTLE
 from .widgets import AvatarLabel, Toast
 
 
 class PeerRow(QFrame):
-    def __init__(self, peer: Peer, is_self: bool = False, on_call=None, parent=None):
+    def __init__(self, peer: Peer, is_self: bool = False, on_call=None,
+                 on_voice_call=None, parent=None):
         super().__init__(parent)
         self.setObjectName("card")
         layout = QHBoxLayout(self)
@@ -55,6 +56,14 @@ class PeerRow(QFrame):
             call_btn.setFixedSize(64, 40)
             call_btn.clicked.connect(lambda checked=False, pid=peer.id: on_call(pid))
             layout.addWidget(call_btn)
+
+        if not is_self and on_voice_call is not None:
+            voice_btn = QPushButton("语音")
+            voice_btn.setObjectName("ghost")
+            voice_btn.setToolTip("语音通话")
+            voice_btn.setFixedSize(64, 40)
+            voice_btn.clicked.connect(lambda checked=False, pid=peer.id: on_voice_call(pid))
+            layout.addWidget(voice_btn)
 
 
 class GroupLobbyPage(QWidget):
@@ -320,10 +329,18 @@ class GroupLobbyPage(QWidget):
 
     def _add_peer_row(self, peer: Peer, is_self: bool):
         item = QListWidgetItem()
-        row = PeerRow(peer, is_self, on_call=self._start_call if not is_self else None)
+        row = PeerRow(
+            peer,
+            is_self,
+            on_call=self._start_call if not is_self else None,
+            on_voice_call=self._start_voice_call if not is_self else None,
+        )
         item.setSizeHint(row.sizeHint())
         self.peer_list.addItem(item)
         self.peer_list.setItemWidget(item, row)
 
     def _start_call(self, peer_id: str):
         self.vm.start_call(peer_id)
+
+    def _start_voice_call(self, peer_id: str):
+        self.vm.start_call(peer_id, media=MEDIA_AUDIO)
