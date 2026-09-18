@@ -21,12 +21,16 @@ from .theme import ERROR, PRIMARY, SURFACE_VARIANT, TEXT_SUBTLE
 
 
 class IncomingCallDialog(QDialog):
-    """Ringing dialog shown when a call_offer arrives."""
+    """Ringing dialog shown when a call_offer arrives ([audio] = voice-only
+    invitation)."""
 
-    def __init__(self, caller_name: str, on_accept, on_reject, parent=None):
+    def __init__(self, caller_name: str, on_accept, on_reject, parent=None,
+                 audio: bool = False):
         super().__init__(parent)
         self.setObjectName("confirmDialog")
-        self.setWindowTitle("视频通话邀请")
+        self._audio = audio
+        kind = "语音通话" if audio else "视频通话"
+        self.setWindowTitle(f"{kind}邀请")
         self.setModal(True)
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumWidth(360)
@@ -35,12 +39,12 @@ class IncomingCallDialog(QDialog):
         layout.setContentsMargins(24, 22, 24, 18)
         layout.setSpacing(10)
 
-        title = QLabel("视频通话邀请")
+        title = QLabel(f"{kind}邀请")
         title.setStyleSheet(f"font-size: 18px; font-weight: 700; color: {PRIMARY};")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
 
-        detail = QLabel(f"<b>{caller_name.toHtmlEscaped()}</b> 邀请你进行视频通话")
+        detail = QLabel(f"<b>{caller_name.toHtmlEscaped()}</b> 邀请你进行{kind}")
         detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         detail.setWordWrap(True)
         layout.addWidget(detail)
@@ -128,14 +132,18 @@ class _VideoLabel(QLabel):
 
 
 class CallWindow(QDialog):
-    """In-call window: remote video, local preview, mute and hangup controls."""
+    """In-call window: remote video, local preview, mute and hangup controls.
+    For an audio-only call the video surfaces are replaced by an avatar
+    placeholder and only mute/hangup remain."""
 
-    def __init__(self, call_manager, parent=None):
+    def __init__(self, call_manager, parent=None, audio: bool = False):
         super().__init__(parent)
         self.setObjectName("confirmDialog")
-        self.setWindowTitle("视频通话")
-        self.setMinimumSize(680, 520)
-        self.resize(820, 620)
+        self._audio = audio
+        kind = "语音通话" if audio else "视频通话"
+        self.setWindowTitle(kind)
+        self.setMinimumSize(360 if audio else 680, 420 if audio else 520)
+        self.resize(420 if audio else 820, 520 if audio else 620)
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self._call_manager = call_manager
         self._audio_muted = False
@@ -152,14 +160,28 @@ class CallWindow(QDialog):
         self.status_label.setStyleSheet(f"font-size: 14px; color: {TEXT_SUBTLE};")
         layout.addWidget(self.status_label)
 
-        video_area = QHBoxLayout()
-        video_area.setSpacing(10)
-        self.remote_label = _VideoLabel("等待对方视频...")
-        video_area.addWidget(self.remote_label, 1)
-        self.local_label = _VideoLabel("")
-        self.local_label.setFixedSize(200, 150)
-        video_area.addWidget(self.local_label, 0, Qt.AlignmentFlag.AlignBottom)
-        layout.addLayout(video_area, 1)
+        if audio:
+            # voice-only: a large avatar placeholder instead of video surfaces
+            self.avatar_label = QLabel("")
+            self.avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.avatar_label.setStyleSheet(
+                "background: #141318; color: #EAE7F0; border-radius: 12px;"
+                "font-size: 64px; font-weight: 700;"
+            )
+            self.avatar_label.setMinimumHeight(260)
+            layout.addWidget(self.avatar_label, 1)
+            self.remote_label = None
+            self.local_label = None
+        else:
+            self.avatar_label = None
+            video_area = QHBoxLayout()
+            video_area.setSpacing(10)
+            self.remote_label = _VideoLabel("等待对方视频...")
+            video_area.addWidget(self.remote_label, 1)
+            self.local_label = _VideoLabel("")
+            self.local_label.setFixedSize(200, 150)
+            video_area.addWidget(self.local_label, 0, Qt.AlignmentFlag.AlignBottom)
+            layout.addLayout(video_area, 1)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(10)
@@ -173,13 +195,19 @@ class CallWindow(QDialog):
         self.video_btn.setObjectName("outline")
         self.video_btn.setMinimumWidth(120)
         self.video_btn.clicked.connect(self._toggle_video)
-        buttons.addWidget(self.video_btn)
+        if not audio:
+            buttons.addWidget(self.video_btn)
+        else:
+            self.video_btn.hide()
         self.camera_btn = QPushButton("切换摄像头")
         self.camera_btn.setObjectName("outline")
         self.camera_btn.setMinimumWidth(120)
         self.camera_btn.setToolTip("在可用的摄像头之间切换（如笔记本内置与 USB 摄像头）")
         self.camera_btn.clicked.connect(self._toggle_camera)
-        buttons.addWidget(self.camera_btn)
+        if not audio:
+            buttons.addWidget(self.camera_btn)
+        else:
+            self.camera_btn.hide()
         self.hangup_btn = QPushButton("挂断")
         self.hangup_btn.setStyleSheet(
             f"background: {ERROR}; color: white; font-weight: 700;"
@@ -202,19 +230,27 @@ class CallWindow(QDialog):
         call_manager.call_error.connect(self._on_call_error)
 
     def _on_remote_frame(self, qimage) -> None:
-        self.remote_label.show_image(qimage)
+        if self.remote_label is not None:
+            self.remote_label.show_image(qimage)
 
     def _on_local_frame(self, qimage) -> None:
-        self.local_label.show_image(qimage)
+        if self.local_label is not None:
+            self.local_label.show_image(qimage)
 
     def _on_state_changed(self, state: str, peer_name: str, detail: str) -> None:
         if state == "active":
             if self._connected_at is None:
                 self._connected_at = time.monotonic()
             self.status_label.setText(f"与 {peer_name} 通话中")
+            if self.avatar_label is not None:
+                initial = (peer_name or "?").strip()[:1] or "?"
+                self.avatar_label.setText(initial)
         elif state in ("outgoing", "incoming"):
             self._connected_at = None
             self.status_label.setText(f"正在呼叫 {peer_name}...")
+            if self.avatar_label is not None:
+                initial = (peer_name or "?").strip()[:1] or "?"
+                self.avatar_label.setText(initial)
         elif state == "idle":
             self._connected_at = None
 
@@ -236,13 +272,17 @@ class CallWindow(QDialog):
         self.audio_btn.setText("取消静音" if self._audio_muted else "静音")
 
     def _toggle_video(self) -> None:
+        if self._audio:
+            return
         self._video_muted = not self._video_muted
         self._call_manager.set_video_muted(self._video_muted)
         self.video_btn.setText("开启摄像头" if self._video_muted else "关闭摄像头")
-        if self._video_muted:
+        if self._video_muted and self.local_label is not None:
             self.local_label.clear()
 
     def _toggle_camera(self) -> None:
+        if self._audio:
+            return
         self._call_manager.switch_camera()
         idx = self._call_manager.camera_index
         self.camera_btn.setText(f"切换到摄像头 {2 - idx}")

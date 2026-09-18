@@ -47,16 +47,58 @@ fun CallOverlay(
     // full-screen overlay too would stack two UIs on top of each other.
     if (state !is CallManager.CallState.Outgoing && state !is CallManager.CallState.Active) return
 
+    // Voice-only call: no video surfaces at all (the media kind is carried
+    // by the offer and lives on the call state).
+    val audioOnly = when (state) {
+        is CallManager.CallState.Outgoing -> state.media == CallManager.MEDIA_AUDIO
+        is CallManager.CallState.Active -> state.media == CallManager.MEDIA_AUDIO
+        else -> false
+    }
+    val peerName = when (state) {
+        is CallManager.CallState.Outgoing -> state.peerName
+        is CallManager.CallState.Active -> state.peerName
+        else -> ""
+    }
+
     val title = when (state) {
-        is CallManager.CallState.Outgoing -> "正在呼叫 ${state.peerName}..."
-        is CallManager.CallState.Active -> "与 ${state.peerName} 通话中"
+        is CallManager.CallState.Outgoing -> "正在呼叫 $peerName..."
+        is CallManager.CallState.Active -> "与 $peerName 通话中"
         else -> ""
     }
 
     Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
         Box(modifier = Modifier.fillMaxSize()) {
-            // remote video fills the screen; a placeholder until the first frame
-            if (remoteVideo != null) {
+            if (audioOnly) {
+                // voice-only: avatar placeholder instead of video
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Surface(
+                            modifier = Modifier.size(120.dp),
+                            shape = CircleShape,
+                            color = Color.White.copy(alpha = 0.15f)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = avatarChar(peerName.ifBlank { "?" }),
+                                    fontSize = 48.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            text = if (state is CallManager.CallState.Outgoing) "等待对方接听..."
+                            else "语音通话中",
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 15.sp
+                        )
+                    }
+                }
+            } else if (remoteVideo != null) {
                 Image(
                     bitmap = remoteVideo.asImageBitmap(),
                     contentDescription = "对方视频",
@@ -80,18 +122,20 @@ fun CallOverlay(
                 }
             }
 
-            // mirrored local preview, top-end corner
-            localVideo?.let { bmp ->
-                Image(
-                    bitmap = bmp.asImageBitmap(),
-                    contentDescription = "本机预览",
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(top = 16.dp, end = 16.dp)
-                        .size(width = 150.dp, height = 112.dp)
-                        .clip(RoundedCornerShape(12.dp)),
-                    contentScale = ContentScale.Crop
-                )
+            // mirrored local preview, top-end corner (video calls only)
+            if (!audioOnly) {
+                localVideo?.let { bmp ->
+                    Image(
+                        bitmap = bmp.asImageBitmap(),
+                        contentDescription = "本机预览",
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 16.dp, end = 16.dp)
+                            .size(width = 150.dp, height = 112.dp)
+                            .clip(RoundedCornerShape(12.dp)),
+                        contentScale = ContentScale.Crop
+                    )
+                }
             }
 
             Text(
@@ -125,21 +169,23 @@ fun CallOverlay(
                         tint = if (audioMuted) MaterialTheme.colorScheme.onErrorContainer else Color.White
                     )
                 }
-                FloatingActionButton(
-                    onClick = onToggleVideo,
-                    containerColor = if (videoMuted)
-                        MaterialTheme.colorScheme.errorContainer
-                    else
-                        Color.White.copy(alpha = 0.25f),
-                    shape = CircleShape
-                ) {
-                    Icon(
-                        if (videoMuted) Icons.Filled.VideocamOff else Icons.Filled.Videocam,
-                        contentDescription = if (videoMuted) "开启摄像头" else "关闭摄像头",
-                        tint = if (videoMuted) MaterialTheme.colorScheme.onErrorContainer else Color.White
-                    )
+                if (!audioOnly) {
+                    FloatingActionButton(
+                        onClick = onToggleVideo,
+                        containerColor = if (videoMuted)
+                            MaterialTheme.colorScheme.errorContainer
+                        else
+                            Color.White.copy(alpha = 0.25f),
+                        shape = CircleShape
+                    ) {
+                        Icon(
+                            if (videoMuted) Icons.Filled.VideocamOff else Icons.Filled.Videocam,
+                            contentDescription = if (videoMuted) "开启摄像头" else "关闭摄像头",
+                            tint = if (videoMuted) MaterialTheme.colorScheme.onErrorContainer else Color.White
+                        )
+                    }
                 }
-                if (state is CallManager.CallState.Active) {
+                if (!audioOnly && state is CallManager.CallState.Active) {
                     FloatingActionButton(
                         onClick = onSwitchCamera,
                         containerColor = Color.White.copy(alpha = 0.25f),

@@ -134,12 +134,95 @@ class FolderGroup:
         return self.entries[0].timestamp if self.entries else 0
 
 
-def iter_message_rows(messages):
+class CallLogEntry:
+    """Synthetic conversation row: one local call-log line (system style, not
+    a chat bubble). Never sent over the wire, never deletable/forwardable and
+    never a delete tombstone — it is only displayed and (on click) can redial."""
+
+    __slots__ = (
+        "id",
+        "peer_id",
+        "peer_name",
+        "direction",
+        "result",
+        "media",
+        "timestamp",
+        "duration",
+    )
+
+    def __init__(
+        self,
+        log_id: str,
+        peer_id: str,
+        direction: str,
+        result: str,
+        media: str,
+        timestamp: int,
+        duration: int = 0,
+        peer_name: str = "",
+    ):
+        self.id = log_id
+        self.peer_id = peer_id
+        self.peer_name = peer_name
+        self.direction = direction
+        self.result = result
+        self.media = media
+        self.timestamp = timestamp
+        self.duration = duration
+
+    # duck-type placeholders so generic message code paths cannot crash on a
+    # call-log row (it is filtered out of menus/deletes explicitly)
+    file_info = None
+    is_from_me = False
+    pending = False
+    content = ""
+    sender_name = ""
+
+
+def call_log_text(entry: CallLogEntry) -> str:
+    """Display text of one call-log row ("未接来电", "视频通话 02:31", ...).
+    Audio is called out explicitly; video is the implicit default."""
+    if entry.result == "answered":
+        mm, ss = divmod(max(0, int(entry.duration)), 60)
+        hh, mm = divmod(mm, 60)
+        dur = f"{hh:d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
+        base = f"{'语音' if entry.media == 'audio' else '视频'}通话 {dur}"
+    elif entry.result == "missed":
+        base = "未接来电" if entry.direction == "incoming" else "对方未接听"
+    elif entry.result == "rejected":
+        base = "已拒绝" if entry.direction == "incoming" else "对方已拒绝"
+    elif entry.result == "cancelled":
+        base = "已取消"
+    else:
+        base = "通话未接通"
+    if entry.media == "audio" and entry.result != "answered":
+        base += "（语音）"
+    return base
+
+
+def call_log_row(log) -> CallLogEntry:
+    """Build a conversation row from a persisted SavedCallLog."""
+    return CallLogEntry(
+        log_id=log.id,
+        peer_id=log.peer_id,
+        direction=log.direction,
+        result=log.result,
+        media=log.media,
+        timestamp=log.start_time,
+        duration=log.duration,
+        peer_name=log.peer_name,
+    )
+
+
+def iter_message_rows(messages, call_logs=None):
     """Expand a flat message list into conversation rows:
-    ("header", ts) / ("msg", ChatMessage) / ("folder", FolderGroup).
+    ("header", ts) / ("msg", ChatMessage) / ("folder", FolderGroup) /
+    ("call", CallLogEntry).
     File messages sharing a folderId collapse into one folder row placed at
     the first entry, so a folder offer renders as a single card (Android
-    parity) while old peers still saw the individual files."""
+    parity) while old peers still saw the individual files. [call_logs] are
+    local call-log rows merged into the flow by timestamp (never part of the
+    message protocol)."""
     rows = []
     folders = {}
     for msg in messages:
@@ -158,6 +241,9 @@ def iter_message_rows(messages):
         group.entries.sort(
             key=lambda m: (m.file_info.relative_path or m.file_info.file_name)
         )
+    for entry in call_logs or ():
+        rows.append(("call", entry))
+    rows.sort(key=lambda row: row[1].timestamp if row[1] is not None else 0)
     out = []
     prev_day = None
     for kind, payload in rows:
@@ -181,6 +267,7 @@ class MessageDelegate(QStyledItemDelegate):
         on_folder_click=None,
         on_folder_open=None,
         show_read_state=False,
+        on_call_click=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -200,6 +287,8 @@ class MessageDelegate(QStyledItemDelegate):
         # Direct chats only: own bubbles carry 已读/未读 (read_receipt). Group
         # chats do not track per-reader receipts, so their page leaves it off.
         self.show_read_state = show_read_state
+        # CallLogEntry -> redial with the same media kind (audio/video).
+        self.on_call_click = on_call_click
         self._pixmaps: dict = {}
 
     # ------------------------------------------------------------- media
@@ -293,6 +382,8 @@ class MessageDelegate(QStyledItemDelegate):
         msg = index.data(MSG_ROLE)
         if msg is None:
             return QSize(100, 40)
+        if isinstance(msg, CallLogEntry):
+            return QSize(100, 30)
         view_w = self._view.viewport().width()
         max_bubble_w = max(int(view_w * 0.72), 200)
         bubble_w, height, _ = self._layout(msg, max_bubble_w)
@@ -304,6 +395,11 @@ class MessageDelegate(QStyledItemDelegate):
             and event.button() == Qt.MouseButton.LeftButton
         ):
             msg = index.data(MSG_ROLE)
+            if isinstance(msg, CallLogEntry):
+                # clicking a call-log line redials the same media kind
+                if self.on_call_click is not None:
+                    self.on_call_click(msg)
+                return True
             if isinstance(msg, FolderGroup):
                 if msg.is_from_me or msg.expired:
                     return True
@@ -352,6 +448,9 @@ class MessageDelegate(QStyledItemDelegate):
         msg = index.data(MSG_ROLE)
         if msg is None:
             return
+        if isinstance(msg, CallLogEntry):
+            self._paint_call_log(painter, option, msg)
+            return
         if isinstance(msg, FolderGroup):
             self._paint_folder_message(painter, option, msg)
             return
@@ -372,6 +471,23 @@ class MessageDelegate(QStyledItemDelegate):
         font = self._view.font()
         font.setPointSize(8)
         painter.setFont(font)
+        painter.drawText(
+            option.rect,
+            Qt.AlignmentFlag.AlignCenter,
+            text,
+        )
+        painter.restore()
+
+    def _paint_call_log(self, painter: QPainter, option, entry: CallLogEntry) -> None:
+        """System-style call-log line: centered, no bubble, not selectable."""
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        missed = entry.result == "missed" and entry.direction == "incoming"
+        painter.setPen(QColor("#B3261E") if missed else QColor("#8A8794"))
+        font = self._view.font()
+        font.setPointSize(9)
+        painter.setFont(font)
+        text = f"{call_log_text(entry)} {format_message_time(entry.timestamp)}"
         painter.drawText(
             option.rect,
             Qt.AlignmentFlag.AlignCenter,

@@ -8,7 +8,7 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-    entities = [SavedGroup::class, SavedChatMessage::class, DeletedMessage::class],
+    entities = [SavedGroup::class, SavedChatMessage::class, DeletedMessage::class, CallLogEntity::class],
     version = 5,
     exportSchema = false
 )
@@ -90,10 +90,11 @@ abstract class ChatDatabase : RoomDatabase() {
         }
 
         /**
-         * v4 -> v5: add the reply/quote + own-message read columns (chat UX)
-         * and the group-management columns (announcement, kick marker).
-         * History must survive the upgrade (NEVER destructive): every column
-         * gets its empty/0 default, so pre-existing rows behave as before.
+         * v4 -> v5: add the reply/quote + own-message read columns (chat UX),
+         * the group-management columns (announcement, kick marker) and the
+         * local call-log table (call history). History must survive the
+         * upgrade (NEVER destructive): every new column gets its empty/0
+         * default and the new table is created empty.
          */
         private val MIGRATION_4_5 = object : Migration(4, 5) {
             override fun migrate(db: SupportSQLiteDatabase) {
@@ -114,6 +115,19 @@ abstract class ChatDatabase : RoomDatabase() {
                 )
                 db.execSQL(
                     "ALTER TABLE saved_groups ADD COLUMN kickedAt INTEGER NOT NULL DEFAULT 0"
+                )
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `call_logs` (" +
+                        "`id` TEXT NOT NULL, `conversationKey` TEXT NOT NULL, " +
+                        "`peerId` TEXT NOT NULL, `peerName` TEXT NOT NULL, " +
+                        "`direction` TEXT NOT NULL, `result` TEXT NOT NULL, " +
+                        "`media` TEXT NOT NULL DEFAULT 'video', " +
+                        "`startTime` INTEGER NOT NULL, `duration` INTEGER NOT NULL DEFAULT 0, " +
+                        "PRIMARY KEY(`id`))"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_call_logs_conversationKey` " +
+                        "ON `call_logs` (`conversationKey`)"
                 )
             }
         }

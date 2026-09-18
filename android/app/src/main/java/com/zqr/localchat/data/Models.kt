@@ -182,8 +182,11 @@ fun ChatMessage.withSanitizedFileInfo(): ChatMessage =
 /**
  * Metadata for a video/audio call.
  * Serialized with kotlinx defaults: fields equal to their default value
- * (mediaPort=0, accepted=true, audioEnabled=true) are omitted, matching the
- * Python side's output.
+ * (mediaPort=0, accepted=true, audioEnabled=true, media=null) are omitted,
+ * matching the Python side's output.
+ *
+ * [media] is "audio" or "video"; null means video (omitted on the wire so a
+ * plain video offer stays byte-identical to the pre-media-field format).
  */
 @Serializable
 data class CallInfo(
@@ -193,5 +196,27 @@ data class CallInfo(
     val calleeId: String,
     val mediaPort: Int = 0,
     val accepted: Boolean = true,
-    val audioEnabled: Boolean = true
+    val audioEnabled: Boolean = true,
+    val media: String? = null
 )
+
+/** Call media kinds carried by CallInfo.media. */
+object CallMedia {
+    const val AUDIO = "audio"
+    const val VIDEO = "video"
+}
+
+/** Call-log direction/result vocabulary (local-only, never sent over the
+ *  wire): mirrors the Windows client's models constants. */
+object CallDirection {
+    const val INCOMING = "incoming"
+    const val OUTGOING = "outgoing"
+}
+
+object CallResult {
+    const val ANSWERED = "answered"
+    const val MISSED = "missed"
+    const val REJECTED = "rejected"
+    const val CANCELLED = "cancelled"
+    const val FAILED = "failed"
+}

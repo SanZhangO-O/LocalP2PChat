@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import network as network_module
-from ..models import Peer
+from ..models import MEDIA_AUDIO, Peer
 from ..view_model import MAX_NAME_LENGTH, ChatViewModel
 from .theme import ERROR, PRIMARY, TEXT_SUBTLE
 from .widgets import AvatarLabel, Toast
@@ -83,6 +83,7 @@ class PeerRow(QFrame):
         is_self: bool = False,
         on_call=None,
         on_kick=None,
+        on_voice_call=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -119,6 +120,14 @@ class PeerRow(QFrame):
             call_btn.setFixedSize(64, 40)
             call_btn.clicked.connect(lambda checked=False, pid=peer.id: on_call(pid))
             layout.addWidget(call_btn)
+
+        if not is_self and on_voice_call is not None:
+            voice_btn = QPushButton("语音")
+            voice_btn.setObjectName("ghost")
+            voice_btn.setToolTip("语音通话")
+            voice_btn.setFixedSize(64, 40)
+            voice_btn.clicked.connect(lambda checked=False, pid=peer.id: on_voice_call(pid))
+            layout.addWidget(voice_btn)
 
         if not is_self and on_kick is not None:
             kick_btn = QPushButton("移出")
@@ -441,12 +450,13 @@ class GroupLobbyPage(QWidget):
             peer,
             is_self,
             on_call=self._start_call if not is_self else None,
-            # the owner may remove members; members only get the call button
+            # the owner may remove members; members only get the call buttons
             on_kick=(
                 self._confirm_kick
                 if (not is_self and self.vm.active_is_host)
                 else None
             ),
+            on_voice_call=self._start_voice_call if not is_self else None,
         )
         item.setSizeHint(row.sizeHint())
         self.peer_list.addItem(item)
@@ -454,3 +464,6 @@ class GroupLobbyPage(QWidget):
 
     def _start_call(self, peer_id: str):
         self.vm.start_call(peer_id)
+
+    def _start_voice_call(self, peer_id: str):
+        self.vm.start_call(peer_id, media=MEDIA_AUDIO)

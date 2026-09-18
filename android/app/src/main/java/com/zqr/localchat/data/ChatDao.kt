@@ -118,4 +118,31 @@ interface ChatDao {
             "ORDER BY deletedAt DESC LIMIT :max)"
     )
     suspend fun trimDeletedMessages(groupId: String, max: Int)
+
+    // -------------------------------------------------------------- call log
+    // Local call history (never synced): one row per finished call, keyed to
+    // the 1:1 conversation with the other participant.
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertCallLog(log: CallLogEntity)
+
+    @Query("SELECT * FROM call_logs WHERE conversationKey = :key ORDER BY startTime ASC")
+    fun callLogsFor(key: String): Flow<List<CallLogEntity>>
+
+    /** Keep only the newest [max] call logs of a conversation. */
+    @Query(
+        "DELETE FROM call_logs WHERE conversationKey = :key AND id NOT IN " +
+            "(SELECT id FROM call_logs WHERE conversationKey = :key " +
+            "ORDER BY startTime DESC LIMIT :max)"
+    )
+    suspend fun trimCallLogs(key: String, max: Int)
+
+    @Query("DELETE FROM call_logs WHERE conversationKey = :key")
+    suspend fun deleteCallLogs(key: String)
+
+    /** Re-key a conversation's call logs (placeholder id -> real device id).
+     *  OR REPLACE: the target chat may already hold call logs (id collisions
+     *  are impossible, but REPLACE keeps the move idempotent). */
+    @Query("UPDATE OR REPLACE call_logs SET conversationKey = :toKey WHERE conversationKey = :fromKey")
+    suspend fun moveCallLogs(fromKey: String, toKey: String)
 }

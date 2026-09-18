@@ -49,7 +49,17 @@ from PyQt6.QtMultimedia import (
 
 from .aec import Aec
 from .crypto import GCM_NONCE_LEN, aes_gcm_decrypt, aes_gcm_encrypt
-from .models import CallInfo, NetworkPacket
+from .models import (
+    CALL_RESULT_ANSWERED,
+    CALL_RESULT_CANCELLED,
+    CALL_RESULT_FAILED,
+    CALL_RESULT_MISSED,
+    CALL_RESULT_REJECTED,
+    MEDIA_AUDIO,
+    MEDIA_VIDEO,
+    CallInfo,
+    NetworkPacket,
+)
 from .network import _read_raw_line, make_wire
 from .securewire import DeviceIdentity, Handshake, Protocol, Wire
 
@@ -62,6 +72,11 @@ CH_AUDIO = 1
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_CHUNK_MS = 20  # 640 bytes of PCM16 mono
 MEDIA_READ_TIMEOUT = 15.0  # seconds without traffic -> call considered dead
+# Audio-only calls have no video to keep the link warm: if neither audio
+# capture nor playback produced a frame for this long, send one silent PCM
+# chunk so the peer's read timeout can never fire on an idle-but-live call
+# (a dead microphone on one side must not drop the call).
+AUDIO_KEEPALIVE = 3.0
 RING_TIMEOUT = 45.0  # caller gives up if the callee never connects
 CONNECT_TIMEOUT = 8.0  # callee -> caller media connect
 MAX_FRAME_LEN = 512 * 1024
@@ -209,6 +224,11 @@ class CallManager(QObject):
     remote_audio = pyqtSignal(bytes)
     call_ended = pyqtSignal(str)  # reason
     call_error = pyqtSignal(str)  # message
+    # One finished call's local log record (dict): callId/peerId/peerName/
+    # role/media/result/startedAt/connectedAt/endedAt/duration. Emitted once
+    # per call, AFTER the media is torn down; the ViewModel persists it as a
+    # local call-log row (never sent over the wire).
+    call_finished = pyqtSignal(object)
 
     # Cross-thread plumbing (network threads -> GUI thread). Every call-scoped
     # signal carries its call_id so a late event from a PREVIOUS call is
@@ -232,6 +252,19 @@ class CallManager(QObject):
         self._peer_ip = ""
         self._call_id = ""
         self._media_port = 0
+        # "audio" | "video": set on start/offer; an audio call never starts
+        # the camera and ignores inbound video frames (both sides agree on
+        # the media type via the offer).
+        self._media = MEDIA_VIDEO
+        # Local call-log bookkeeping: when the call started, when media went
+        # active (0 while still ringing) and the outcome the ending path
+        # recorded (answered/missed/rejected/cancelled/failed).
+        self._call_started_at = 0.0
+        self._connected_at = 0.0
+        self._outcome = ""
+        # Last time any frame was written to the media socket, for the
+        # audio-only keepalive (see AUDIO_KEEPALIVE).
+        self._last_media_sent_at = 0.0
         self._p2p = None
         self._role = ""  # "caller" | "callee"
         # Signaling channel of the current call: callable(peer_id, packet).
@@ -320,6 +353,11 @@ class CallManager(QObject):
     def peer_name(self) -> str:
         return self._peer_name
 
+    @property
+    def media(self) -> str:
+        """Current call's media kind ("audio" | "video"); video when idle."""
+        return self._media
+
     def attach(self, p2p) -> None:
         """Register the signaling listener on a group connection. Safe to call
         for every P2PManager (the listener dispatches by packet)."""
@@ -333,7 +371,7 @@ class CallManager(QObject):
         """Network-thread entry: hop to the GUI thread."""
         self._sig_packet.emit(p2p, packet)
 
-    def start_call(self, p2p, peer_id: str) -> None:
+    def start_call(self, p2p, peer_id: str, media: str = MEDIA_VIDEO) -> None:
         if self._state != STATE_IDLE:
             self.call_error.emit("已有进行中的通话")
             return
@@ -360,6 +398,10 @@ class CallManager(QObject):
             self._peer_ip = peer.ip_address
             self._call_id = str(uuid.uuid4())
             self._role = "caller"
+            self._media = MEDIA_AUDIO if media == MEDIA_AUDIO else MEDIA_VIDEO
+            self._call_started_at = time.time()
+            self._connected_at = 0.0
+            self._outcome = ""
             self._media_server = server
             self._state = STATE_OUTGOING
         self.state_changed.emit(STATE_OUTGOING, self._peer_name, "")
@@ -373,6 +415,8 @@ class CallManager(QObject):
                     caller_name=p2p.my_name,
                     callee_id=peer_id,
                     media_port=server.getsockname()[1],
+                    # omitted for video so the bytes stay as before
+                    media="" if self._media == MEDIA_VIDEO else MEDIA_AUDIO,
                 ),
             ),
         )
@@ -380,11 +424,13 @@ class CallManager(QObject):
             target=self._accept_loop, args=(server, self._call_id), daemon=True
         ).start()
 
-    def start_direct_call(self, channel_send, identity, peer, my_id: str, my_name: str) -> None:
-        """Start a video call over a DIRECT member session: signaling rides the
-        session socket via [channel_send](peer_id, packet), media over the
-        usual TCP connection. [identity] is the DirectChatManager owning the
-        session (used by end_if_on)."""
+    def start_direct_call(self, channel_send, identity, peer, my_id: str, my_name: str,
+                          media: str = MEDIA_VIDEO) -> None:
+        """Start a video/audio call over a DIRECT member session: signaling
+        rides the session socket via [channel_send](peer_id, packet), media
+        over the usual TCP connection. [identity] is the DirectChatManager
+        owning the session (used by end_if_on). [media] is "video" (default)
+        or "audio" (no camera capture on either side)."""
         if self._state != STATE_IDLE:
             self.call_error.emit("已有进行中的通话")
             return
@@ -410,6 +456,10 @@ class CallManager(QObject):
             self._peer_ip = peer.ip_address
             self._call_id = str(uuid.uuid4())
             self._role = "caller"
+            self._media = MEDIA_AUDIO if media == MEDIA_AUDIO else MEDIA_VIDEO
+            self._call_started_at = time.time()
+            self._connected_at = 0.0
+            self._outcome = ""
             self._media_server = server
             self._state = STATE_OUTGOING
         self.state_changed.emit(STATE_OUTGOING, self._peer_name, "")
@@ -423,6 +473,7 @@ class CallManager(QObject):
                     caller_name=my_name,
                     callee_id=peer.id,
                     media_port=server.getsockname()[1],
+                    media="" if self._media == MEDIA_VIDEO else MEDIA_AUDIO,
                 ),
             ),
         )
@@ -506,11 +557,15 @@ class CallManager(QObject):
             if self._state not in (STATE_INCOMING, STATE_OUTGOING):
                 return
             if self._state == STATE_INCOMING:
+                # the user actively declined an incoming call
+                self._outcome = CALL_RESULT_REJECTED
                 self._send_call_packet(p2p, "call_reject", call_id)
             server = self._media_server
+            finished = self._finished_payload_locked()
             self._reset()
         run_catching_close(server)
         self.state_changed.emit(STATE_IDLE, "", "")
+        self._emit_finished(finished)
         self.call_ended.emit(detail)
 
     def hangup(self) -> None:
@@ -519,6 +574,15 @@ class CallManager(QObject):
             p2p = self._p2p
             call_id = self._call_id
             state = self._state
+            if state == STATE_OUTGOING:
+                # user cancelled while still ringing
+                self._outcome = CALL_RESULT_CANCELLED
+            elif state == STATE_ACTIVE:
+                self._outcome = CALL_RESULT_ANSWERED
+            elif state == STATE_INCOMING:
+                # UI only offers accept/reject for incoming; treat a hangup
+                # as a declined (unanswered) call
+                self._outcome = CALL_RESULT_MISSED
         if state in (STATE_ACTIVE, STATE_OUTGOING, STATE_INCOMING):
             # notify the peer over the current call's signaling channel —
             # must NOT be gated on p2p: a direct call has no p2p, only the
@@ -645,6 +709,12 @@ class CallManager(QObject):
             self._peer_name = call.caller_name
             self._peer_ip = caller_ip
             self._media_port = call.media_port
+            # Both ends agree on the media kind from the offer: an audio offer
+            # never starts a camera on either side.
+            self._media = MEDIA_AUDIO if call.media == MEDIA_AUDIO else MEDIA_VIDEO
+            self._call_started_at = time.time()
+            self._connected_at = 0.0
+            self._outcome = ""
             self._state = STATE_INCOMING
         self.state_changed.emit(STATE_INCOMING, call.caller_name, "")
         self.incoming_call.emit(call.call_id, call.caller_name)
@@ -661,6 +731,8 @@ class CallManager(QObject):
                 # must never disturb the running media read loop.
                 return
             self._state = STATE_ACTIVE
+            if not self._connected_at:
+                self._connected_at = time.time()
         self.state_changed.emit(STATE_ACTIVE, self._peer_name, "")
         self._start_capture()
         self._start_audio()
@@ -670,12 +742,15 @@ class CallManager(QObject):
             if call.caller_id != self._my_id:
                 return
             if self._state == STATE_OUTGOING and call.call_id == self._call_id:
+                self._outcome = CALL_RESULT_REJECTED
                 server = self._media_server
+                finished = self._finished_payload_locked()
                 self._reset()
             else:
                 return
         run_catching_close(server)
         self.state_changed.emit(STATE_IDLE, "", "")
+        self._emit_finished(finished)
         self.call_ended.emit("对方拒绝了通话")
 
     def _on_call_failed(self, call) -> None:
@@ -683,12 +758,15 @@ class CallManager(QObject):
             if call.caller_id != self._my_id:
                 return
             if self._state == STATE_OUTGOING and call.call_id == self._call_id:
+                self._outcome = CALL_RESULT_FAILED
                 server = self._media_server
+                finished = self._finished_payload_locked()
                 self._reset()
             else:
                 return
         run_catching_close(server)
         self.state_changed.emit(STATE_IDLE, "", "")
+        self._emit_finished(finished)
         self.call_error.emit(
             "通话建立失败：对方无法连接本机的媒体端口。\n"
             "请在 Windows 防火墙中放行本程序的入站连接（不只是 9999 端口）后重试"
@@ -699,12 +777,20 @@ class CallManager(QObject):
             if call.call_id != self._call_id or self._state == STATE_IDLE or (call.caller_id != self._my_id and call.callee_id != self._my_id):
                 return
             was_ringing = self._state in (STATE_INCOMING, STATE_OUTGOING)
+            if was_ringing:
+                # the peer cancelled: our side never answered. On the callee
+                # that is a missed call; on the caller it is a cancelled one.
+                self._outcome = CALL_RESULT_MISSED if self._role == "callee" else CALL_RESULT_CANCELLED
+            else:
+                self._outcome = CALL_RESULT_ANSWERED
             server = self._media_server
             sock = self._media_socket
+            finished = self._finished_payload_locked()
             self._reset()
         run_catching_close(server)
         run_catching_close(sock)
         self._shutdown_engines()
+        self._emit_finished(finished)
         if was_ringing:
             self.call_ended.emit("对方取消了通话")
         else:
@@ -737,6 +823,8 @@ class CallManager(QObject):
                 activate = state == STATE_OUTGOING
                 if activate:
                     self._state = STATE_ACTIVE
+                    if not self._connected_at:
+                        self._connected_at = time.time()
             else:
                 # Callee: tell the caller and go live (answer is idempotent).
                 p2p = self._p2p
@@ -744,6 +832,8 @@ class CallManager(QObject):
                 activate = state != STATE_ACTIVE
                 if activate:
                     self._state = STATE_ACTIVE
+                    if not self._connected_at:
+                        self._connected_at = time.time()
         if activate:
             self.state_changed.emit(STATE_ACTIVE, self._peer_name, "")
             self._start_capture()
@@ -763,14 +853,18 @@ class CallManager(QObject):
             call_id = self._call_id
             if self._state != STATE_INCOMING:
                 return
+            # the callee accepted but the media handshake/connect failed
+            self._outcome = CALL_RESULT_FAILED
             self._send_call_packet(
                 p2p,
                 "call_failed",
                 call_id,
                 error_message=f"无法连接媒体通道: {message}",
             )
+            finished = self._finished_payload_locked()
             self._reset()
         self.state_changed.emit(STATE_IDLE, "", "")
+        self._emit_finished(finished)
         self.call_error.emit(
             f"无法连接媒体通道（{message}）。请检查对方电脑的防火墙，或确认两台设备在同一网络"
         )
@@ -780,11 +874,16 @@ class CallManager(QObject):
             if self._state != STATE_OUTGOING or call_id != self._call_id:
                 return
             p2p = self._p2p
+            # nobody answered before the ring timeout: on the caller side this
+            # is an outgoing call that was never picked up
+            self._outcome = CALL_RESULT_MISSED
             self._send_call_packet(p2p, "call_hangup", call_id)
             server = self._media_server
+            finished = self._finished_payload_locked()
             self._reset()
         run_catching_close(server)
         self.state_changed.emit(STATE_IDLE, "", "")
+        self._emit_finished(finished)
         self.call_ended.emit("对方未接听")
 
     # ------------------------------------------------------------- internals
@@ -951,6 +1050,11 @@ class CallManager(QObject):
                     # other side is not who we secured the channel with
                     return
                 if channel == CH_VIDEO:
+                    # audio-only calls carry no video: never decode (or render)
+                    # a video frame on a call that never announced video,
+                    # even if a malformed/mismatched peer sends one
+                    if self._media == MEDIA_AUDIO:
+                        continue
                     # AEAD already verified above; decode with the header
                     # size check (no full decode for oversized frames)
                     qimg = _decode_video_frame(payload)
@@ -1025,6 +1129,20 @@ class CallManager(QObject):
                 self._send_pending_video(call_id)
                 continue
             self._send_pending_video(call_id)
+            self._keepalive_audio(call_id)
+
+    def _keepalive_audio(self, call_id: str) -> None:
+        """Audio calls: send one silent PCM chunk when no media has flowed for
+        AUDIO_KEEPALIVE seconds (e.g. a dead microphone on this side), so the
+        peer's 15 s read timeout can never drop a live call."""
+        if self._media != MEDIA_AUDIO:
+            return
+        now = time.monotonic()
+        if now - self._last_media_sent_at < AUDIO_KEEPALIVE:
+            return
+        self._last_media_sent_at = now
+        silence = b"\x00" * (AUDIO_SAMPLE_RATE * 2 // 50)  # 20 ms PCM16 mono
+        self._write_frame(CH_AUDIO, silence, call_id)
 
     def _send_pending_video(self, call_id: str) -> None:
         try:
@@ -1048,12 +1166,17 @@ class CallManager(QObject):
             with self._send_lock:
                 if sock is not None and not self._send_stop.is_set():
                     sock.sendall(build_frame(channel, blob))
+                    self._last_media_sent_at = time.monotonic()
         except OSError:
             self._sig_media_ended.emit(call_id, "连接已断开")
 
     # ------------------------------------------------------------ capture
 
     def _start_capture(self) -> None:
+        # Audio-only calls never open the camera: both sides learn the media
+        # kind from the offer, so neither captures video.
+        if self._media == MEDIA_AUDIO:
+            return
         # A previous capture loop may still be winding down (shutdown joins
         # it only briefly to keep the GUI responsive): make sure it has fully
         # left its `while not stop_event.is_set()` loop BEFORE clearing the
@@ -1806,6 +1929,11 @@ class CallManager(QObject):
         self._peer_ip = ""
         self._media_port = 0
         self._role = ""
+        self._media = MEDIA_VIDEO
+        self._call_started_at = 0.0
+        self._connected_at = 0.0
+        self._outcome = ""
+        self._last_media_sent_at = 0.0
         self._p2p = None
         self._channel_send = None
         self._identity = None
@@ -1814,6 +1942,40 @@ class CallManager(QObject):
         self._media_server = None
         self._media_socket = None
         self._media_key = None
+
+    def _finished_payload_locked(self) -> dict:
+        """Snapshot the current call as a local call-log record. MUST be called
+        with self._lock held and BEFORE _reset() clears the fields. The result
+        defaults to answered when media went active, failed otherwise (an
+        explicit outcome recorded by the ending path wins)."""
+        result = self._outcome
+        if not result:
+            result = CALL_RESULT_ANSWERED if self._connected_at else CALL_RESULT_FAILED
+        ended_at = time.time()
+        duration = 0
+        if self._connected_at:
+            duration = max(0, int(round(ended_at - self._connected_at)))
+        return {
+            "call_id": self._call_id,
+            "peer_id": self._peer_id,
+            "peer_name": self._peer_name,
+            "role": self._role,
+            "direction": (
+                "outgoing" if self._role == "caller" else "incoming"
+            ),
+            "media": self._media,
+            "result": result,
+            "started_at": int(self._call_started_at * 1000) if self._call_started_at else int(ended_at * 1000),
+            "connected_at": int(self._connected_at * 1000) if self._connected_at else 0,
+            "ended_at": int(ended_at * 1000),
+            "duration": duration,
+        }
+
+    def _emit_finished(self, payload: dict) -> None:
+        """Emit one finished-call record (never for an idle manager)."""
+        if not payload or not payload.get("peer_id"):
+            return
+        self.call_finished.emit(payload)
 
     def _end_call(self, reason: str) -> None:
         """End the call from any thread. Idempotent."""
@@ -1824,6 +1986,7 @@ class CallManager(QObject):
             self._stop_event.set()
             self._media_stop.set()
             server, sock = self._media_server, self._media_socket
+            finished = self._finished_payload_locked()
             self._reset()
         run_catching_close(server)
         run_catching_close(sock)
@@ -1831,6 +1994,7 @@ class CallManager(QObject):
             self._sig_shutdown_engines.emit()
         else:
             self._shutdown_engines()
+        self._emit_finished(finished)
         self.call_ended.emit(reason)
         self.state_changed.emit(STATE_IDLE, "", "")
 

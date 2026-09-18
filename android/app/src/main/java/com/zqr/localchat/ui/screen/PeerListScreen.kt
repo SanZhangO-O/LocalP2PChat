@@ -51,6 +51,7 @@ fun PeerListScreen(
     onBack: () -> Unit,
     onOpenChat: () -> Unit,
     onCallPeer: (String) -> Unit = {},
+    onCallAudioPeer: (String) -> Unit = {},
     announcement: String = "",
     onUpdateGroupInfo: (String?, String?) -> Unit = { _, _ -> },
     onKickMember: (String) -> Unit = {}
@@ -406,7 +407,10 @@ fun PeerListScreen(
                             },
                             onKick = if (isHost) {
                                 { pendingKick = entry.value.id }
-                            } else null
+                            } else null,
+                            onCallAudio = {
+                                if (!connectionLost) onCallAudioPeer(entry.value.id)
+                            }
                         )
                     }
                 }
@@ -510,7 +514,8 @@ private fun PeerItem(
     peer: com.zqr.localchat.data.Peer,
     isSelf: Boolean = false,
     onCall: (() -> Unit)? = null,
-    onKick: (() -> Unit)? = null
+    onKick: (() -> Unit)? = null,
+    onCallAudio: (() -> Unit)? = null
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -567,6 +572,15 @@ private fun PeerItem(
                     }
                 }
                 Text(text = peer.ipAddress, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (!isSelf && onCallAudio != null) {
+                IconButton(onClick = onCallAudio) {
+                    Icon(
+                        Icons.Filled.Phone,
+                        contentDescription = "语音通话",
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
             if (!isSelf && onCall != null) {
                 IconButton(onClick = onCall) {

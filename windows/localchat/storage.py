@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from . import secretbox
-from .models import FILE_KIND_FILE, ChatMessage
+from .models import FILE_KIND_FILE, MEDIA_VIDEO, ChatMessage
 
 
 @dataclass
@@ -67,10 +67,27 @@ class SavedMessage:
     read: bool = False
 
 
+@dataclass
+class SavedCallLog:
+    """One local call-log entry (never sent over the wire, not synced)."""
+
+    id: str
+    conversation_key: str  # "direct:<peer_id>"
+    peer_id: str
+    peer_name: str
+    direction: str  # "incoming" | "outgoing"
+    result: str  # answered | missed | rejected | cancelled | failed
+    media: str = MEDIA_VIDEO  # "audio" | "video"
+    start_time: int = 0  # epoch ms
+    duration: int = 0  # seconds actually connected (0 when never answered)
+
+
 class ChatStore:
     # Delete tombstones kept per group: enough for convergence after a short
     # offline period without growing the table forever.
     TOMBSTONE_CAP = 200
+    # Call-log history kept per conversation (newest kept, oldest trimmed).
+    CALL_LOG_CAP = 200
 
     def __init__(self, db_path: str):
         self._lock = threading.RLock()
@@ -200,6 +217,27 @@ class ChatStore:
                 """
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)
                 """
+            )
+            # Local call history: one row per finished call, keyed to the 1:1
+            # conversation with the other participant ("direct:<peer_id>").
+            # Never sent over the wire and never synced (Android parity).
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS call_logs (
+                    id TEXT PRIMARY KEY,
+                    conversationKey TEXT NOT NULL,
+                    peerId TEXT NOT NULL,
+                    peerName TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    media TEXT NOT NULL DEFAULT 'video',
+                    startTime INTEGER NOT NULL,
+                    duration INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_call_logs_conv ON call_logs(conversationKey, startTime)"
             )
             self._conn.commit()
 
@@ -605,6 +643,10 @@ class ChatStore:
             self._conn.execute("DELETE FROM saved_messages WHERE groupId = ?", (group_id,))
             self._conn.execute("DELETE FROM deleted_messages WHERE group_id = ?", (group_id,))
             self._conn.execute("DELETE FROM saved_groups WHERE groupId = ?", (group_id,))
+            # local call history of a removed conversation must go with it
+            self._conn.execute(
+                "DELETE FROM call_logs WHERE conversationKey = ?", (group_id,)
+            )
             # the join credential and join id of a removed group must not
             # linger in the settings table
             self._conn.execute(
@@ -659,6 +701,88 @@ class ChatStore:
                 (group_id,),
             ).fetchall()
         return [r["msg_id"] for r in rows]
+
+    # ------------------------------------------------------------- call logs
+
+    def add_call_log(self, entry: SavedCallLog) -> None:
+        """Persist one finished call and keep only the newest CALL_LOG_CAP
+        entries of its conversation (oldest trimmed)."""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO call_logs
+                    (id, conversationKey, peerId, peerName, direction, result,
+                     media, startTime, duration)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry.id,
+                    entry.conversation_key,
+                    entry.peer_id,
+                    entry.peer_name,
+                    entry.direction,
+                    entry.result,
+                    entry.media or MEDIA_VIDEO,
+                    entry.start_time,
+                    entry.duration,
+                ),
+            )
+            self._conn.execute(
+                """
+                DELETE FROM call_logs
+                WHERE conversationKey = ? AND id NOT IN (
+                    SELECT id FROM call_logs WHERE conversationKey = ?
+                    ORDER BY startTime DESC, rowid DESC LIMIT ?
+                )
+                """,
+                (entry.conversation_key, entry.conversation_key, self.CALL_LOG_CAP),
+            )
+            self._conn.commit()
+
+    def get_call_logs(self, conversation_key: str, limit: int = CALL_LOG_CAP) -> List[SavedCallLog]:
+        """Newest [limit] call logs of one conversation, oldest first (so the
+        UI can interleave them into the message flow by timestamp)."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM call_logs WHERE conversationKey = ?
+                ORDER BY startTime DESC, rowid DESC LIMIT ?
+                """,
+                (conversation_key, limit),
+            ).fetchall()
+        return [
+            SavedCallLog(
+                id=r["id"],
+                conversation_key=r["conversationKey"],
+                peer_id=r["peerId"],
+                peer_name=r["peerName"],
+                direction=r["direction"],
+                result=r["result"],
+                media=r["media"] if "media" in r.keys() else MEDIA_VIDEO,
+                start_time=r["startTime"],
+                duration=r["duration"],
+            )
+            for r in reversed(rows)
+        ]
+
+    def move_call_logs(self, from_key: str, to_key: str) -> None:
+        """Re-key a conversation's call logs (used when a manually added
+        "ip:..." placeholder chat is revealed to be a real device id)."""
+        if from_key == to_key:
+            return
+        with self._lock:
+            self._conn.execute(
+                "UPDATE OR REPLACE call_logs SET conversationKey = ? WHERE conversationKey = ?",
+                (to_key, from_key),
+            )
+            self._conn.commit()
+
+    def delete_call_logs(self, conversation_key: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM call_logs WHERE conversationKey = ?", (conversation_key,)
+            )
+            self._conn.commit()
 
     def get_setting(self, key: str, default: str = "") -> str:
         with self._lock:
