@@ -11,6 +11,7 @@ on disk. Run with:  python -m pytest tests/test_functional.py -q
 """
 
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -1078,6 +1079,158 @@ class ViewModelFlowTest(unittest.TestCase):
             if os.path.exists(p):
                 os.remove(p)
 
+    def test_folder_protocol_fields_and_traversal_safety(self):
+        """Folder offers reuse FileInfo with optional folderId/folderName/
+        relativePath/folderTotal. A crafted relative path must never escape the
+        destination directory, a crafted entry count must not be trusted, and a
+        plain file offer must stay byte-identical (fields omitted)."""
+        from localchat.models import FileInfo, sanitize_relative_path
+
+        self.assertEqual(sanitize_relative_path("../../etc/passwd"), "etc/passwd")
+        self.assertEqual(sanitize_relative_path("..\\..\\win.ini"), "win.ini")
+        self.assertEqual(sanitize_relative_path("/abs/x.txt"), "abs/x.txt")
+        self.assertEqual(sanitize_relative_path("dir/sub/f.txt"), "dir/sub/f.txt")
+        self.assertEqual(sanitize_relative_path(".."), "")
+        self.assertEqual(sanitize_relative_path(""), "")
+
+        plain = FileInfo("id", "f.txt", 3, "h", 1)
+        self.assertNotIn("folderId", plain.to_dict())
+        self.assertNotIn("relativePath", plain.to_dict())
+
+        fi = FileInfo(
+            "id",
+            "f.txt",
+            3,
+            "h",
+            1234,
+            folder_id="abc",
+            folder_name="dir",
+            relative_path="sub/f.txt",
+            folder_total=2,
+        )
+        d = fi.to_dict()
+        self.assertEqual(d["folderId"], "abc")
+        self.assertEqual(d["folderName"], "dir")
+        self.assertEqual(d["relativePath"], "sub/f.txt")
+        self.assertEqual(d["folderTotal"], 2)
+        back = FileInfo.from_dict(d)
+        self.assertEqual(back.folder_id, "abc")
+        self.assertEqual(back.folder_name, "dir")
+        self.assertEqual(back.relative_path, "sub/f.txt")
+        self.assertEqual(back.folder_total, 2)
+
+        crafted = FileInfo.from_dict(
+            {
+                "fileId": "x",
+                "fileName": "f.txt",
+                "fileSize": 1,
+                "downloadHost": "h",
+                "downloadPort": 1,
+                "folderId": "a",
+                "relativePath": "../../evil.txt",
+                "folderTotal": 999999,
+            }
+        )
+        self.assertEqual(crafted.relative_path, "evil.txt")
+        self.assertEqual(crafted.folder_total, 0)
+
+    def test_folder_offer_grouping_and_download(self):
+        """End to end: a folder is offered as one file_message per entry with
+        shared folder metadata; the receiver downloads every entry into
+        <dest>/<folderName>/ preserving the tree."""
+        port = 10049
+        network_module.TCP_PORT = port
+        host = make_vm(_fresh_db("lc_folder_host.db"))
+        host.create_group("\u4e3b\u673a", "\u6587\u4ef6\u5939\u6d4b\u8bd5")
+        password = host.active_group_password
+        join_id = host.active_group_numeric_id()
+        member = make_vm(_fresh_db("lc_folder_member.db"))
+        self._vms = [host, member]
+
+        joined = []
+        member.join_successful.connect(lambda: joined.append(True))
+        member.query_group("\u6210\u5458", join_id, "127.0.0.1", port=port, password=password)
+        self.assertTrue(
+            wait_until(lambda: member.queried_group_info() is not None, pump=self.pump)
+        )
+        member.confirm_join()
+        self.assertTrue(wait_until(lambda: joined, pump=self.pump))
+
+        root = os.path.join(tempfile.gettempdir(), "kilo", "lc_folder_src")
+        if os.path.isdir(root):
+            shutil.rmtree(root)
+        os.makedirs(os.path.join(root, "sub"))
+        files = {"a.txt": b"alpha", "sub/b.bin": b"beta" * 100}
+        for rel, data in files.items():
+            with open(os.path.join(root, *rel.split("/")), "wb") as f:
+                f.write(data)
+
+        # send_folder is async (worker thread): wait for its completion signal
+        send_done = []
+        member.folder_send_finished.connect(lambda ok: send_done.append(ok))
+        member.send_folder(root)
+        self.assertTrue(wait_until(lambda: send_done, pump=self.pump))
+        self.assertTrue(send_done[0], "send_folder must succeed")
+
+        def offers():
+            return [
+                m for m in host.active_messages() if m.file_info and m.file_info.folder_id
+            ]
+
+        self.assertTrue(wait_until(lambda: len(offers()) >= 2, pump=self.pump))
+        entries = offers()
+        folder_ids = {m.file_info.folder_id for m in entries}
+        self.assertEqual(len(folder_ids), 1, "all entries share one folderId")
+        meta = entries[0].file_info
+        self.assertEqual(meta.folder_name, "lc_folder_src")
+        self.assertEqual(meta.folder_total, 2)
+        self.assertEqual(
+            sorted(m.file_info.relative_path for m in entries), ["a.txt", "sub/b.bin"]
+        )
+
+        dest = os.path.join(tempfile.gettempdir(), "kilo", "lc_folder_dest")
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        os.makedirs(dest)
+        done = []
+        host.folder_download_finished.connect(lambda fid, ok, msg: done.append((ok, msg)))
+        host.download_folder(folder_ids.pop(), dest)
+        self.assertTrue(wait_until(lambda: done, timeout=20.0, pump=self.pump))
+        ok, message = done[0]
+        self.assertTrue(ok, message)
+
+        out_root = os.path.join(dest, "lc_folder_src")
+        for rel, data in files.items():
+            path = os.path.join(out_root, *rel.split("/"))
+            self.assertTrue(os.path.isfile(path), path)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), data)
+
+    def test_collect_folder_entries_reports_truncation(self):
+        """_collect_folder_entries caps at MAX_FOLDER_FILES and reports (not
+        silently hides) that sendable files existed beyond the cap."""
+        from localchat.models import MAX_FOLDER_FILES
+
+        root = os.path.join(tempfile.gettempdir(), "kilo", "lc_folder_cap")
+        if os.path.isdir(root):
+            shutil.rmtree(root)
+        os.makedirs(root)
+        total = MAX_FOLDER_FILES + 2
+        for i in range(total):
+            with open(os.path.join(root, f"f{i:05d}.txt"), "wb") as f:
+                f.write(b"x")
+        entries, folder_name, truncated = ChatViewModel._collect_folder_entries(root)
+        self.assertEqual(len(entries), MAX_FOLDER_FILES)
+        self.assertTrue(truncated)
+        self.assertEqual(folder_name, "lc_folder_cap")
+
+        # exactly at the cap: complete, not truncated
+        os.remove(os.path.join(root, f"f{total - 1:05d}.txt"))
+        os.remove(os.path.join(root, f"f{total - 2:05d}.txt"))
+        entries, _, truncated = ChatViewModel._collect_folder_entries(root)
+        self.assertEqual(len(entries), MAX_FOLDER_FILES)
+        self.assertFalse(truncated)
+
     def test_confirm_join_dialog_constructs_without_crash(self):
         """Regression: ConfirmJoinDialog.__init__ used to call set_loading()
         before confirm_btn/cancel_btn existed, crashing the app from inside a
@@ -1126,6 +1279,173 @@ class ViewModelFlowTest(unittest.TestCase):
         self.pump()
         self.assertGreaterEqual(page.model.rowCount(), 1)
         win.close()
+
+    def test_chat_page_groups_folder_messages_into_one_card(self):
+        """Folder entries sharing a folderId collapse into a single folder row
+        (ordered by relative_path) and painting it must not crash."""
+        from localchat.models import ChatMessage, FileInfo
+        from localchat.ui.chat_page import (
+            MSG_ROLE,
+            ChatPage,
+            FolderGroup,
+            iter_message_rows,
+        )
+
+        network_module.TCP_PORT = 10050
+        vm = make_vm(_fresh_db("lc_ui_folder.db"))
+        self._vms = [vm]
+        vm.create_group("\u4e3b\u673a", "\u6587\u4ef6\u5939\u6e32\u67d3")
+        p2p = vm.group_p2p_map[vm.active_group_id]
+        for index, (rel, size) in enumerate((("a.txt", 10), ("sub/b.bin", 20))):
+            fi = FileInfo(
+                "f%d" % index,
+                rel.split("/")[-1],
+                size,
+                "192.168.1.5",
+                42001,
+                folder_id="fold1",
+                folder_name="bundle",
+                relative_path=rel,
+                folder_total=2,
+            )
+            p2p.messages.append(
+                ChatMessage(
+                    "f%d" % index,
+                    rel.split("/")[-1],
+                    1700000000000 + index,
+                    "someone",
+                    "\u5f20\u4e09",
+                    file_info=fi,
+                )
+            )
+
+        rows = iter_message_rows(p2p.messages)
+        self.assertEqual([kind for kind, _ in rows].count("folder"), 1)
+        group = next(payload for kind, payload in rows if kind == "folder")
+        self.assertIsInstance(group, FolderGroup)
+        self.assertEqual(group.total, 2)
+        self.assertEqual(
+            [e.file_info.relative_path for e in group.entries], ["a.txt", "sub/b.bin"]
+        )
+
+        page = ChatPage(vm, lambda: None)
+        vm.active_messages_changed.emit()
+        self.pump()
+        # one date header + exactly one folder card
+        self.assertEqual(page.model.rowCount(), 2)
+        page.list_view.viewport().update()
+        page.list_view.repaint()
+        self.pump()
+        rendered = page.model.item(1).data(MSG_ROLE)
+        self.assertIsInstance(rendered, FolderGroup)
+        self.assertEqual(rendered.folder_id, "fold1")
+        self.assertEqual(rendered.total, 2)
+        page.deleteLater()
+
+    @staticmethod
+    def _drag_enter(widget, mime):
+        from PyQt6.QtCore import QPointF, Qt
+        from PyQt6.QtGui import QDragEnterEvent
+
+        event = QDragEnterEvent(
+            QPointF(5, 5).toPoint(),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        widget.dragEnterEvent(event)
+        return event.isAccepted()
+
+    @staticmethod
+    def _drop(widget, mime):
+        from PyQt6.QtCore import QPointF, Qt
+        from PyQt6.QtGui import QDropEvent
+
+        event = QDropEvent(
+            QPointF(5, 5),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        widget.dropEvent(event)
+        return event.isAccepted()
+
+    def test_input_accepts_dropped_files_and_sends(self):
+        """Dropping image/file(s)/folder(s) onto a chat input offers them over
+        the same path as the paperclip picker; remote URLs are ignored.
+        Regression for the drag-and-drop entry point, which had no handler
+        before."""
+        from PyQt6.QtCore import QMimeData, QUrl
+        from PyQt6.QtGui import QDragLeaveEvent
+        from localchat.ui.chat_page import ChatPage
+        from localchat.ui.direct_chat_page import DirectChatPage
+
+        network_module.TCP_PORT = 10048
+        vm = make_vm(_fresh_db("lc_input_drop.db"))
+        self._vms = [vm]
+        vm.create_group("\u4e3b\u673a", "\u62d6\u62fd\u6d4b\u8bd5")
+
+        tmpdir = tempfile.mkdtemp(prefix="lc_drop_")
+        img = os.path.join(tmpdir, "pic.png")
+        doc = os.path.join(tmpdir, "notes.txt")
+        for path in (img, doc):
+            with open(path, "wb") as f:
+                f.write(b"payload")
+        folder = os.path.join(tmpdir, "bundle")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "inner.txt"), "wb") as f:
+            f.write(b"inner")
+
+        group_calls = []
+        folder_calls = []
+        vm.send_file = lambda path: group_calls.append(path) or True
+        vm.send_folder = lambda path: folder_calls.append(path) or True
+        page = ChatPage(vm, lambda: None)
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(img), QUrl.fromLocalFile(doc)])
+        self.assertTrue(self._drag_enter(page.input_edit, mime))
+        self.assertTrue(page.input_edit.property("dragActive"))
+        page.input_edit.dragLeaveEvent(QDragLeaveEvent())
+        self.assertFalse(page.input_edit.property("dragActive"))
+        self._drop(page.input_edit, mime)
+        self.assertFalse(page.input_edit.property("dragActive"))
+        self.assertEqual(group_calls, [img, doc])
+
+        folder_mime = QMimeData()
+        folder_mime.setUrls([QUrl.fromLocalFile(folder)])
+        self.assertTrue(
+            self._drag_enter(page.input_edit, folder_mime),
+            "a dropped directory must be accepted",
+        )
+        self._drop(page.input_edit, folder_mime)
+        self.assertEqual(folder_calls, [folder])
+        self.assertEqual(group_calls, [img, doc])
+
+        remote = QMimeData()
+        remote.setUrls([QUrl("https://example.com/pic.png")])
+        self._drop(page.input_edit, remote)
+        self.assertEqual(group_calls, [img, doc], "remote URLs must not be sent")
+        page.deleteLater()
+
+        direct_calls = []
+        direct_folder_calls = []
+        vm.send_direct_file = (
+            lambda peer_id, path: direct_calls.append((peer_id, path)) or True
+        )
+        vm.send_direct_folder = (
+            lambda peer_id, path: direct_folder_calls.append((peer_id, path)) or True
+        )
+        dpage = DirectChatPage(vm, lambda: None)
+        dpage._peer_id = "dev-1"
+        dmime = QMimeData()
+        dmime.setUrls([QUrl.fromLocalFile(img), QUrl.fromLocalFile(folder)])
+        self._drop(dpage.input_edit, dmime)
+        self.assertEqual(direct_calls, [("dev-1", img)])
+        self.assertEqual(direct_folder_calls, [("dev-1", folder)])
+        dpage.deleteLater()
 
     def test_tray_aggregation_flushes_on_group_change(self):
         """A gid change inside the burst window flushes the old bubble first:

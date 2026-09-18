@@ -21,6 +21,8 @@ from .crypto import (
 )
 from .hardware import get_hardware_id, get_local_ip_address
 from .models import (
+    FILE_KIND_FILE,
+    MAX_FOLDER_FILES,
     MAX_LINE_LENGTH,
     TCP_PORT,
     ChatMessage,
@@ -31,6 +33,7 @@ from .models import (
     Peer,
     detect_media_kind,
     is_valid_content,
+    sanitize_relative_path,
 )
 from .punch import (
     PUNCH_TIMEOUT,
@@ -2076,13 +2079,24 @@ class P2PManager:
 
     # -------------------------------------------------------- file transfer
 
-    def send_file(self, path: str) -> Optional[ChatMessage]:
+    def send_file(
+        self,
+        path: str,
+        folder_id: str = "",
+        folder_name: str = "",
+        relative_path: str = "",
+        folder_total: int = 0,
+    ) -> Optional[ChatMessage]:
         """Offer a local file to the group. Returns the created file message
         (or None if the file cannot be served) so the caller can also
         broadcast it over the group mesh. The file bytes travel over a
         separate download server, not over the message stream; a per-file
         random key travels INSIDE the encrypted message channel and protects
-        the raw download stream."""
+        the raw download stream.
+
+        A folder entry passes folder_id/folder_name/relative_path/folder_total
+        so receivers can group the offers and rebuild the tree; folder entries
+        are always plain "file" kind (they are never rendered inline)."""
         if not path:
             return None
         if not os.path.isfile(path):
@@ -2099,6 +2113,10 @@ class P2PManager:
                 "sendFile rejected: %s bytes exceeds the %s cap", file_size, MAX_DOWNLOAD_BYTES
             )
             return None
+        if folder_id:
+            relative_path = sanitize_relative_path(relative_path)
+            if not relative_path or folder_total > MAX_FOLDER_FILES:
+                return None
         file_id = str(uuid.uuid4())
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -2126,7 +2144,11 @@ class P2PManager:
             advertised,
             port,
             to_b64(file_key),
-            kind=detect_media_kind(file_name),
+            kind=FILE_KIND_FILE if folder_id else detect_media_kind(file_name),
+            folder_id=folder_id,
+            folder_name=folder_name,
+            relative_path=relative_path,
+            folder_total=folder_total,
         )
         with self._lock:
             self._file_servers[file_id] = srv
@@ -3415,13 +3437,22 @@ class DirectChatManager:
         if contact is not None:
             self._ensure_redial_loop(peer_id)
 
-    def send_file(self, peer_id: str, path: str) -> Optional[ChatMessage]:
+    def send_file(
+        self,
+        peer_id: str,
+        path: str,
+        folder_id: str = "",
+        folder_name: str = "",
+        relative_path: str = "",
+        folder_total: int = 0,
+    ) -> Optional[ChatMessage]:
         """Offer a local file to a direct-chat member. The bytes are NOT sent
         over the message stream: this opens a short-lived download server on a
         random port and sends a file_message carrying [FileInfo] (incl. the
         download address and per-file key). The receiver connects back to
         download the file (shared encrypted file_download protocol, Android
-        parity). Requires a live session (files cannot queue offline)."""
+        parity). Requires a live session (files cannot queue offline). A
+        folder entry adds the optional folder metadata (see group send_file)."""
         if not path:
             return None
         if not os.path.isfile(path):
@@ -3435,6 +3466,10 @@ class DirectChatManager:
             return None
         if file_size > MAX_DOWNLOAD_BYTES:
             return None
+        if folder_id:
+            relative_path = sanitize_relative_path(relative_path)
+            if not relative_path or folder_total > MAX_FOLDER_FILES:
+                return None
         with self._lock:
             session = self._sessions.get(peer_id)
             if session is None or not session["alive"]:
@@ -3466,7 +3501,11 @@ class DirectChatManager:
             my_ip,
             port,
             to_b64(file_key),
-            kind=detect_media_kind(file_name),
+            kind=FILE_KIND_FILE if folder_id else detect_media_kind(file_name),
+            folder_id=folder_id,
+            folder_name=folder_name,
+            relative_path=relative_path,
+            folder_total=folder_total,
         )
         with self._lock:
             self._file_servers[file_id] = srv

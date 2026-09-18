@@ -9,7 +9,10 @@ import com.zqr.localchat.crypto.Crypto
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
+import com.zqr.localchat.data.MAX_FOLDER_FILES
 import com.zqr.localchat.data.Peer
+import com.zqr.localchat.data.sanitizeRelativePath
+import com.zqr.localchat.data.withSanitizedFileInfo
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlin.coroutines.ContinuationInterceptor
@@ -943,7 +946,8 @@ class P2PManager(
                 // host relay AND over the mesh (whoever arrives first wins),
                 // so a plain append would show duplicate bubbles
                 _messages.update { list ->
-                    if (list.any { it.id == msg.id }) list else list + markFromMe(msg, myId)
+                    if (list.any { it.id == msg.id }) list
+                    else list + markFromMe(msg.withSanitizedFileInfo(), myId)
                 }
             }
             "announce" -> packet.peer?.let { peer ->
@@ -1003,7 +1007,8 @@ class P2PManager(
                 // idempotent insert (same message id can never arrive twice on
                 // the relay path, but being defensive here costs nothing)
                 _messages.update { list ->
-                    if (list.any { it.id == msg.id }) list else list + markFromMe(msg, myId)
+                    if (list.any { it.id == msg.id }) list
+                    else list + markFromMe(msg.withSanitizedFileInfo(), myId)
                 }
                 broadcastToClients(packet, exclude = senderId)
             }
@@ -1214,13 +1219,21 @@ class P2PManager(
      * stream: this opens a short-lived download server on a random port and
      * broadcasts a file_message carrying [FileInfo] (incl. the download
      * address). Receivers connect back to download the file.
+     *
+     * A folder entry passes [folderId]/[folderName]/[relativePath]/[folderTotal]
+     * so receivers can group the offers and rebuild the tree; folder entries
+     * are always plain "file" kind (never rendered inline).
      */
     fun sendFile(
         fileName: String,
         resolver: ContentResolver,
         uri: Uri,
         fileSize: Long,
-        kind: String = FileKind.FILE
+        kind: String = FileKind.FILE,
+        folderId: String = "",
+        folderName: String = "",
+        relativePath: String = "",
+        folderTotal: Int = 0
     ): ChatMessage? {
         // receivers use the advertised name as their default save name: strip
         // path separators and ".." so a crafted offer cannot traverse out of
@@ -1230,6 +1243,18 @@ class P2PManager(
         if (fileSize > FileTransfer.MAX_DOWNLOAD_BYTES) {
             Log.w(TAG, "sendFile rejected: ${fileSize} bytes exceeds the ${FileTransfer.MAX_DOWNLOAD_BYTES} cap")
             return null
+        }
+        // folder entries carry a safe relative path and are capped by count;
+        // an unusable path or an over-cap total is rejected outright
+        val safeRelativePath: String
+        val effectiveKind: String
+        if (folderId.isNotEmpty()) {
+            safeRelativePath = sanitizeRelativePath(relativePath)
+            if (safeRelativePath.isEmpty() || folderTotal > MAX_FOLDER_FILES) return null
+            effectiveKind = FileKind.FILE
+        } else {
+            safeRelativePath = ""
+            effectiveKind = kind
         }
         val fileId = UUID.randomUUID().toString()
         val server = try {
@@ -1247,7 +1272,13 @@ class P2PManager(
         // switched Wi-Fi since would otherwise advertise a stale, unreachable
         // download host
         val advertised = P2PManager.getLocalIpAddress().ifBlank { myIpAddress }
-        val fileInfo = FileInfo(fileId, safeName, fileSize, advertised, port, Crypto.toB64(fileKey), kind)
+        val fileInfo = FileInfo(
+            fileId, safeName, fileSize, advertised, port, Crypto.toB64(fileKey), effectiveKind,
+            folderId = folderId,
+            folderName = folderName,
+            relativePath = safeRelativePath,
+            folderTotal = folderTotal
+        )
         fileServers[fileId] = server
         val msg = ChatMessage(
             id = fileId,

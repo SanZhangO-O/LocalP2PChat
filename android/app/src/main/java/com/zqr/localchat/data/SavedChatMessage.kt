@@ -37,6 +37,13 @@ data class SavedChatMessage(
     /** File-message kind ("file" | "image" | "video"): media kinds render
      *  inline in the conversation, also after a restart. */
     val kind: String = "file",
+    /** Folder transfer metadata (empty/0 for a plain file): survives restart so
+     *  the grouped folder card still shows its name and entry list. Mirrors the
+     *  Windows SavedMessage. */
+    val folderId: String = "",
+    val folderName: String = "",
+    val relativePath: String = "",
+    val folderTotal: Int = 0,
     /** True while an own direct-chat message is still waiting for the peer
      *  to come online (pending send). Restored into the outbox at startup. */
     val pending: Boolean = false

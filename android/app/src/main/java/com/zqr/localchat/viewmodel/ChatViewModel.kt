@@ -15,6 +15,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
+import android.provider.DocumentsContract
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -38,9 +39,11 @@ import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.DeletedMessage
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
+import com.zqr.localchat.data.MAX_FOLDER_FILES
 import com.zqr.localchat.data.Peer
 import com.zqr.localchat.data.SavedChatMessage
 import com.zqr.localchat.data.SavedGroup
+import com.zqr.localchat.data.sanitizeRelativePath
 import com.zqr.localchat.network.Constants
 import com.zqr.localchat.network.DeviceIdentity
 import com.zqr.localchat.network.DirectChatManager
@@ -61,6 +64,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.OutputStream
@@ -313,6 +317,173 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         ) ?: return false
         mirrorOwnMedia(msg.id, uri, fileName, kind)
         return true
+    }
+
+    /** One folder entry collected from the picked SAF tree: its relative
+     *  "/"-separated path inside the folder and the file's content URI. */
+    private data class FolderEntry(val relativePath: String, val uri: Uri, val size: Long)
+
+    /** Result of walking a picked SAF tree: the sorted entries, the root
+     *  folder's sanitized display name and whether sendable files existed
+     *  beyond [MAX_FOLDER_FILES] (the offer was truncated). */
+    private data class FolderScan(
+        val entries: List<FolderEntry>,
+        val folderName: String,
+        val truncated: Boolean
+    )
+
+    /**
+     * Walk a picked folder tree (SAF [treeUri]) recursively and return its
+     * file entries sorted for a stable order, plus the root folder's sanitized
+     * display name and a truncation flag. Directories are skipped; entries
+     * whose path cannot be sanitized are dropped and the list is capped at
+     * [MAX_FOLDER_FILES] (truncated=true when sendable files existed beyond
+     * the cap). Mirrors the Windows _collect_folder_entries. Blocking SAF
+     * queries: call from a worker dispatcher.
+     */
+    private fun collectFolderEntries(treeUri: Uri, rootName: String): FolderScan {
+        val resolver = getApplication<Application>().contentResolver
+        val rootDoc = DocumentsContract.buildDocumentUriUsingTree(
+            treeUri, DocumentsContract.getTreeDocumentId(treeUri)
+        )
+        val entries = ArrayList<FolderEntry>()
+        val root = rootName.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim('.', ' ').ifBlank { "文件夹" }.take(80)
+        var truncated = false
+        fun walk(dirUri: Uri, prefix: String) {
+            if (truncated) return
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+                dirUri, DocumentsContract.getDocumentId(dirUri)
+            )
+            val children = runCatching {
+                resolver.query(
+                    childrenUri,
+                    arrayOf(
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE
+                    ),
+                    null, null, null
+                )?.use { c ->
+                    val rows = ArrayList<FolderChild>()
+                    while (c.moveToNext()) {
+                        val name = c.getString(1) ?: continue
+                        val isDir = c.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR
+                        rows.add(FolderChild(name, c.getString(0) ?: "", isDir))
+                    }
+                    rows
+                }
+            }.getOrNull().orEmpty()
+            // deterministic order (the SAF query has none): sort by name, and
+            // files/folders stay in one combined list like the Windows walk
+            for (child in children.sortedBy { it.name }) {
+                if (truncated) return
+                val childUri = DocumentsContract.buildDocumentUriUsingTree(dirUri, child.docId)
+                val rel = sanitizeRelativePath(
+                    if (prefix.isEmpty()) child.name else "$prefix/${child.name}"
+                )
+                if (rel.isEmpty()) continue
+                if (child.isDir) {
+                    walk(childUri, rel)
+                } else {
+                    val size = runCatching {
+                        resolver.query(
+                            childUri,
+                            arrayOf(DocumentsContract.Document.COLUMN_SIZE),
+                            null, null, null
+                        )?.use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else 0L } ?: 0L
+                    }.getOrDefault(0L)
+                    if (entries.size >= MAX_FOLDER_FILES) {
+                        // one sendable file beyond the cap: the scan is short
+                        truncated = true
+                        return
+                    }
+                    entries.add(FolderEntry(rel, childUri, size))
+                }
+            }
+        }
+        walk(rootDoc, "")
+        entries.sortBy { it.relativePath }
+        return FolderScan(entries, root, truncated)
+    }
+
+    private data class FolderChild(val name: String, val docId: String, val isDir: Boolean)
+
+    /**
+     * Offer a folder to the active group as one file_message per entry (each
+     * carrying folderId/folderName/relativePath/folderTotal) so receivers can
+     * group them and rebuild the tree. Old peers still see ordinary file
+     * offers. The SAF walk + per-entry offers run on Dispatchers.IO so a
+     * large folder never blocks the main thread (ANR); [onDone] fires on the
+     * main thread with (ok, truncated).
+     */
+    fun sendFolder(treeUri: Uri, displayName: String, onDone: (ok: Boolean, truncated: Boolean) -> Unit) {
+        val gid = _activeGroupId.value
+        val p2p = gid?.let { groupP2pMap[it] }
+        if (gid == null || p2p == null || (!p2p.isConnected && !GroupMeshManager.hasLinks(gid))) {
+            onDone(false, false)
+            return
+        }
+        val resolver = getApplication<Application>().contentResolver
+        viewModelScope.launch(Dispatchers.IO) {
+            val scan = collectFolderEntries(treeUri, displayName)
+            if (scan.entries.isEmpty()) {
+                withContext(Dispatchers.Main) { onDone(false, false) }
+                return@launch
+            }
+            val folderId = java.util.UUID.randomUUID().toString()
+            var sent = 0
+            for (entry in scan.entries) {
+                // folder entries are always plain "file" kind: P2PManager
+                // forces FILE for every folder entry (never rendered inline)
+                val msg = p2p.sendFile(
+                    entry.relativePath.substringAfterLast('/'), resolver, entry.uri, entry.size,
+                    FileKind.FILE,
+                    folderId = folderId,
+                    folderName = scan.folderName,
+                    relativePath = entry.relativePath,
+                    folderTotal = scan.entries.size
+                ) ?: continue
+                // same dual delivery as a single file: relay + mesh, dedup by id
+                GroupMeshManager.broadcast(gid, msg)
+                sent++
+            }
+            val ok = sent > 0
+            withContext(Dispatchers.Main) { onDone(ok, scan.truncated) }
+        }
+    }
+
+    /** Offer a folder over a direct session as one file_message per entry
+     *  (see [sendFolder]); [onDone] fires on the main thread with
+     *  (ok, truncated). */
+    fun sendDirectFolder(
+        peerId: String,
+        treeUri: Uri,
+        displayName: String,
+        onDone: (ok: Boolean, truncated: Boolean) -> Unit
+    ) {
+        val resolver = getApplication<Application>().contentResolver
+        viewModelScope.launch(Dispatchers.IO) {
+            val scan = collectFolderEntries(treeUri, displayName)
+            if (scan.entries.isEmpty()) {
+                withContext(Dispatchers.Main) { onDone(false, false) }
+                return@launch
+            }
+            val folderId = java.util.UUID.randomUUID().toString()
+            var sent = 0
+            for (entry in scan.entries) {
+                val msg = DirectChatManager.sendFile(
+                    peerId, entry.relativePath.substringAfterLast('/'), resolver, entry.uri, entry.size,
+                    FileKind.FILE,
+                    folderId = folderId,
+                    folderName = scan.folderName,
+                    relativePath = entry.relativePath,
+                    folderTotal = scan.entries.size
+                ) ?: continue
+                sent++
+            }
+            val ok = sent > 0
+            withContext(Dispatchers.Main) { onDone(ok, scan.truncated) }
+        }
     }
 
     /** After an own IMAGE goes out, copy it into the media dir (worker
@@ -648,6 +819,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                         downloadHost = msg.fileInfo?.downloadHost ?: "",
                                         downloadPort = msg.fileInfo?.downloadPort ?: 0,
                                         kind = msg.fileInfo?.kind ?: FileKind.FILE,
+                                        folderId = msg.fileInfo?.folderId ?: "",
+                                        folderName = msg.fileInfo?.folderName ?: "",
+                                        relativePath = msg.fileInfo?.relativePath ?: "",
+                                        folderTotal = msg.fileInfo?.folderTotal ?: 0,
                                         pending = msg.pending
                                     )
                                 })
@@ -932,6 +1107,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _downloadStates = MutableStateFlow<Map<String, DownloadState>>(emptyMap())
     val downloadStates: StateFlow<Map<String, DownloadState>> = _downloadStates.asStateFlow()
 
+    /** Progress/outcome of a folder download, keyed by folderId (analogous to
+     *  [DownloadState] for a single file). [total] is the number of entries
+     *  being saved, [done] how many finished so far. */
+    data class FolderDownloadState(
+        val downloading: Boolean = false,
+        val done: Int = 0,
+        val total: Int = 0,
+        val savedPath: String = "",
+        val message: String = ""
+    )
+
+    private val _folderDownloadStates =
+        MutableStateFlow<Map<String, FolderDownloadState>>(emptyMap())
+    val folderDownloadStates: StateFlow<Map<String, FolderDownloadState>> =
+        _folderDownloadStates.asStateFlow()
+
     /** One running download: the cancel flag the transfer loop polls per chunk
      *  plus every socket the transfer opened, so a cancel can shut a blocked
      *  read down at once (the flag alone only lands at the next chunk). */
@@ -949,12 +1140,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private const val CHANNEL_MESSAGES = "localchat_messages"
         private val activeDownloads = ConcurrentHashMap<String, DownloadHandle>()
 
+        /** Active folder downloads keyed by folderId, so the UI can cancel a
+         *  whole folder save via [cancelDownload] without the ViewModel. */
+        private val activeFolderDownloads = ConcurrentHashMap<String, DownloadHandle>()
+
         /** User tapped 取消下载: the download aborts, the partial file is
          *  deleted and the state becomes 失败（已取消）. The transfer socket is
          *  shut down so an in-flight read returns immediately (a stalled peer
-         *  must not hold the cancel for the whole 120s read timeout). */
+         *  must not hold the cancel for the whole 120s read timeout). The key
+         *  is a file message id OR a folderId. */
         fun cancelDownload(fileId: String) {
-            val handle = activeDownloads[fileId] ?: return
+            val handle = activeDownloads[fileId] ?: activeFolderDownloads[fileId] ?: return
             handle.cancelled.set(true)
             for (s in handle.socks.toList()) {
                 runCatching { s.shutdownInput() }
@@ -1128,6 +1324,217 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 })
             }
         }
+    }
+
+    /**
+     * Save every entry of a folder offer (all messages sharing [folderId]) to
+     * the user-picked [destTreeUri] tree, sequentially on one IO coroutine.
+     * Missing child directories/files are created under the tree (parents
+     * first) and every path segment is re-sanitized, so a crafted relativePath
+     * can never write outside the chosen folder. Progress and the outcome are
+     * surfaced via [folderDownloadStates]; cancel via [cancelDownload] keyed by
+     * folderId. Returns false when the folder has no entries.
+     */
+    fun downloadFolder(folderId: String, destTreeUri: Uri): Boolean {
+        val gid = _activeGroupId.value ?: return false
+        val p2p = groupP2pMap[gid] ?: return false
+        return startFolderDownload(folderId, destTreeUri, p2p.messages.value) { fi, out, progress, cancelled, socks ->
+            p2p.downloadFile(fi, out, progress, cancelled, socks)
+        }
+    }
+
+    /** Save every entry of a direct-chat folder offer (see [downloadFolder]). */
+    fun downloadDirectFolder(peerId: String, folderId: String, destTreeUri: Uri): Boolean {
+        val messages = DirectChatManager.messagesFor(peerId).value
+        return startFolderDownload(folderId, destTreeUri, messages) { fi, out, progress, cancelled, socks ->
+            DirectChatManager.downloadFile(fi, out, progress, cancelled, socks)
+        }
+    }
+
+    private fun startFolderDownload(
+        folderId: String,
+        destTreeUri: Uri,
+        messages: List<ChatMessage>,
+        transfer: (
+            FileInfo,
+            OutputStream,
+            (Long, Long) -> Unit,
+            () -> Boolean,
+            MutableList<java.net.Socket>
+        ) -> FileTransfer.DownloadResult
+    ): Boolean {
+        // de-duplicate by message id (the group offers the folder over both the
+        // relay and the mesh, so the same entry can appear twice) and order by
+        // relativePath for a deterministic, parent-before-child creation order
+        val seen = HashSet<String>()
+        val entries = messages
+            .filter { m ->
+                val fi = m.fileInfo
+                fi != null && fi.folderId == folderId && seen.add(m.id)
+            }
+            .sortedBy { it.fileInfo!!.relativePath.ifEmpty { it.fileInfo!!.fileName } }
+        if (entries.isEmpty()) return false
+
+        val handle = DownloadHandle()
+        activeFolderDownloads[folderId] = handle
+        val rootName = entries.firstNotNullOfOrNull {
+            it.fileInfo!!.folderName.ifBlank { null }
+        } ?: ""
+        val total = entries.size
+        _folderDownloadStates.update {
+            it + (folderId to FolderDownloadState(downloading = true, done = 0, total = total))
+        }
+
+        val resolver = getApplication<Application>().contentResolver
+        val rootDoc = DocumentsContract.buildDocumentUriUsingTree(
+            destTreeUri, DocumentsContract.getTreeDocumentId(destTreeUri)
+        )
+        viewModelScope.launch(Dispatchers.IO) {
+            var done = 0
+            var failedMessage = ""
+            for (entry in entries) {
+                if (handle.cancelled.get()) {
+                    failedMessage = "已取消"
+                    break
+                }
+                val fi = entry.fileInfo!!
+                if (fi.downloadHost.isBlank() || fi.downloadPort <= 0) {
+                    failedMessage = "部分文件已过期，请对方重新发送"
+                    break
+                }
+                val rel = sanitizeRelativePath(fi.relativePath.ifEmpty { fi.fileName })
+                if (rel.isEmpty()) {
+                    failedMessage = "无效的文件路径"
+                    break
+                }
+                // defense in depth: relativePath is already sanitized, but
+                // re-sanitize every segment here and reject any that comes back
+                // empty so nothing can traverse out of the picked tree
+                val segments = rel.split('/').filter { it.isNotEmpty() }
+                if (segments.isEmpty()) {
+                    failedMessage = "无效的文件路径"
+                    break
+                }
+                val parentUri = ensureFolderDirs(resolver, rootDoc, rootName, segments.dropLast(1))
+                if (parentUri == null) {
+                    failedMessage = "无法创建保存目录"
+                    break
+                }
+                val fileName = segments.last()
+                val existing = findChildByName(resolver, parentUri, fileName)
+                val targetUri = existing ?: runCatching {
+                    DocumentsContract.createDocument(
+                        resolver, parentUri, "application/octet-stream", fileName
+                    )
+                }.getOrNull()
+                if (targetUri == null) {
+                    failedMessage = "无法创建文件"
+                    break
+                }
+                val result = runCatching {
+                    resolver.openOutputStream(targetUri, "wt")?.use { out ->
+                        transfer(fi, out, { _, _ -> }, { handle.cancelled.get() }, handle.socks)
+                    } ?: FileTransfer.DownloadResult(false, "无法打开输出流")
+                }.getOrElse { FileTransfer.DownloadResult(false, it.message ?: "未知错误") }
+                if (!result.ok) {
+                    // drop the partial file so a failed entry leaves no corrupt copy
+                    runCatching { DocumentsContract.deleteDocument(resolver, targetUri) }
+                    failedMessage = result.message.ifBlank { "下载失败" }
+                    break
+                }
+                done++
+                _folderDownloadStates.update {
+                    it + (folderId to FolderDownloadState(
+                        downloading = true, done = done, total = total
+                    ))
+                }
+            }
+            activeFolderDownloads.remove(folderId)
+            val cancelled = handle.cancelled.get()
+            _folderDownloadStates.update {
+                it + (folderId to FolderDownloadState(
+                    downloading = false,
+                    done = done,
+                    total = total,
+                    savedPath = if (failedMessage.isEmpty()) destTreeUri.toString() else "",
+                    message = if (failedMessage.isEmpty()) "" else failedMessage
+                ))
+            }
+            if (cancelled) Log.i("ChatViewModel", "folder download cancelled: $folderId")
+        }
+        return true
+    }
+
+    /** Walk (and create) the child directories [segments] under [rootDoc],
+     *  returning the URI of the innermost one. [segments] is already sanitized;
+     *  each name is re-sanitized and a null return means the tree could not be
+     *  created. */
+    private fun ensureFolderDirs(
+        resolver: android.content.ContentResolver,
+        rootDoc: Uri,
+        rootName: String,
+        segments: List<String>
+    ): Uri? {
+        var current = rootDoc
+        val rootSegment = sanitizePathSegmentForTree(rootName)
+        if (rootSegment.isNotEmpty()) {
+            val created = findChildByName(resolver, current, rootSegment) ?: runCatching {
+                DocumentsContract.createDocument(resolver, current, DocumentsContract.Document.MIME_TYPE_DIR, rootSegment)
+            }.getOrNull()
+            if (created == null) return null
+            current = created
+        }
+        for (raw in segments) {
+            val segment = sanitizePathSegmentForTree(raw)
+            if (segment.isEmpty()) return null
+            val child = findChildByName(resolver, current, segment) ?: runCatching {
+                DocumentsContract.createDocument(resolver, current, DocumentsContract.Document.MIME_TYPE_DIR, segment)
+            }.getOrNull()
+            if (child == null) return null
+            current = child
+        }
+        return current
+    }
+
+    /** Find an existing child document named [name] (directory or file) directly
+     *  under [parentUri], or null. */
+    private fun findChildByName(
+        resolver: android.content.ContentResolver,
+        parentUri: Uri,
+        name: String
+    ): Uri? {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+            parentUri, DocumentsContract.getDocumentId(parentUri)
+        )
+        return runCatching {
+            resolver.query(
+                childrenUri,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME
+                ),
+                null, null, null
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    if (c.getString(1) == name) {
+                        return@use DocumentsContract.buildDocumentUriUsingTree(
+                            parentUri, c.getString(0)
+                        )
+                    }
+                }
+                null
+            }
+        }.getOrNull()
+    }
+
+    /** Sanitize one path segment for a SAF document name: strip separators and
+     *  control characters, drop trailing dots/spaces and cap the length. An
+     *  empty result is rejected by the callers so no entry can escape the
+     *  picked tree. */
+    private fun sanitizePathSegmentForTree(raw: String): String {
+        val base = raw.replace('\\', '/').substringAfterLast('/')
+        val cleaned = base.filter { ch -> ch.code >= 32 && ch.code !in 0x7F..0xA0 && ch != ':' }
+        return cleaned.trim('.', ' ').take(200).trim('.', ' ')
     }
 
     private fun activeP2pFlow(): Flow<P2PManager?> =
@@ -1595,7 +2002,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun restoredFileInfo(sm: SavedChatMessage): FileInfo? {
         if (sm.fileSize <= 0 && sm.downloadHost.isEmpty()) return null
         // blank the address for every restored offer, own or received
-        return FileInfo(sm.id, sm.content, sm.fileSize, "", 0, kind = sm.kind)
+        return FileInfo(
+            sm.id, sm.content, sm.fileSize, "", 0, kind = sm.kind,
+            folderId = sm.folderId,
+            folderName = sm.folderName,
+            relativePath = sm.relativePath,
+            folderTotal = sm.folderTotal
+        )
     }
 
     /** DB boundary for message bodies: persisted rows carry the content
@@ -2357,7 +2770,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                         fileSize = msg.fileInfo?.fileSize ?: 0L,
                                         downloadHost = msg.fileInfo?.downloadHost ?: "",
                                         downloadPort = msg.fileInfo?.downloadPort ?: 0,
-                                        kind = msg.fileInfo?.kind ?: FileKind.FILE
+                                        kind = msg.fileInfo?.kind ?: FileKind.FILE,
+                                        folderId = msg.fileInfo?.folderId ?: "",
+                                        folderName = msg.fileInfo?.folderName ?: "",
+                                        relativePath = msg.fileInfo?.relativePath ?: "",
+                                        folderTotal = msg.fileInfo?.folderTotal ?: 0
                                     )
                                 }
                                 val inserted = runCatching { chatDao.insertMessages(saved) }.isSuccess

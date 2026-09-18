@@ -158,6 +158,11 @@ QTextEdit:focus {{
     border: 2px solid {PRIMARY};
     padding: 7px 11px;
 }}
+QTextEdit[dragActive="true"] {{
+    border: 2px dashed {PRIMARY};
+    background: rgba(103, 80, 164, 0.06);
+    padding: 7px 11px;
+}}
 QFrame#card {{
     background: {SURFACE_VARIANT};
     border-radius: 12px;

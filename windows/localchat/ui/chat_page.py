@@ -28,13 +28,13 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QStyledItemDelegate,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from ..models import (
     MAX_CONTENT_LENGTH,
+    MAX_FOLDER_FILES,
     ChatMessage,
     FILE_KIND_IMAGE,
     FILE_KIND_VIDEO,
@@ -48,9 +48,16 @@ from .theme import (
     BUBBLE_OTHER,
     BUBBLE_TEXT_OTHER,
     PRIMARY,
+    TEXT_SUBTLE,
     bubble_path,
 )
-from .widgets import Toast, date_header_text, format_message_time, is_same_day
+from .widgets import (
+    DroppableTextEdit,
+    Toast,
+    date_header_text,
+    format_message_time,
+    is_same_day,
+)
 
 MSG_ROLE = Qt.ItemDataRole.UserRole + 1
 HEADER_ROLE = Qt.ItemDataRole.UserRole + 2
@@ -87,6 +94,76 @@ def file_offer_expired(fi) -> bool:
     return fi is None or not fi.download_host or fi.download_port <= 0
 
 
+class FolderGroup:
+    """Synthetic conversation row: one folder card for the file messages that
+    share a folderId (a folder offer). Entries are ordered by relative_path and
+    include the sender's own offers (rendered as "已发送")."""
+
+    __slots__ = ("folder_id", "folder_name", "entries")
+
+    def __init__(self, folder_id: str, folder_name: str, entries):
+        self.folder_id = folder_id
+        self.folder_name = folder_name or "文件夹"
+        self.entries = entries
+
+    @property
+    def total(self) -> int:
+        return len(self.entries)
+
+    @property
+    def size(self) -> int:
+        return sum(
+            e.file_info.file_size for e in self.entries if e.file_info is not None
+        )
+
+    @property
+    def is_from_me(self) -> bool:
+        return bool(self.entries) and all(e.is_from_me for e in self.entries)
+
+    @property
+    def expired(self) -> bool:
+        return all(file_offer_expired(e.file_info) for e in self.entries)
+
+    @property
+    def timestamp(self) -> int:
+        return self.entries[0].timestamp if self.entries else 0
+
+
+def iter_message_rows(messages):
+    """Expand a flat message list into conversation rows:
+    ("header", ts) / ("msg", ChatMessage) / ("folder", FolderGroup).
+    File messages sharing a folderId collapse into one folder row placed at
+    the first entry, so a folder offer renders as a single card (Android
+    parity) while old peers still saw the individual files."""
+    rows = []
+    folders = {}
+    for msg in messages:
+        fi = msg.file_info
+        if fi is not None and fi.folder_id:
+            group = folders.get(fi.folder_id)
+            if group is None:
+                group = FolderGroup(fi.folder_id, fi.folder_name, [msg])
+                folders[fi.folder_id] = group
+                rows.append(("folder", group))
+            else:
+                group.entries.append(msg)
+            continue
+        rows.append(("msg", msg))
+    for group in folders.values():
+        group.entries.sort(
+            key=lambda m: (m.file_info.relative_path or m.file_info.file_name)
+        )
+    out = []
+    prev_day = None
+    for kind, payload in rows:
+        ts = payload.timestamp
+        if prev_day is None or not is_same_day(prev_day, ts):
+            out.append(("header", ts))
+            prev_day = ts
+        out.append((kind, payload))
+    return out
+
+
 class MessageDelegate(QStyledItemDelegate):
     def __init__(
         self,
@@ -95,6 +172,9 @@ class MessageDelegate(QStyledItemDelegate):
         file_states=None,
         media_resolver=None,
         on_media_open=None,
+        folder_states=None,
+        on_folder_click=None,
+        on_folder_open=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -106,6 +186,11 @@ class MessageDelegate(QStyledItemDelegate):
         self.media_resolver = media_resolver
         # path -> open a downloaded media file with the system viewer/player.
         self.on_media_open = on_media_open
+        # folderId -> (status, detail) for folder cards; click starts saving
+        # the whole tree, a second click on a finished card opens the folder.
+        self.folder_states = folder_states if folder_states is not None else {}
+        self.on_folder_click = on_folder_click
+        self.on_folder_open = on_folder_open
         self._pixmaps: dict = {}
 
     # ------------------------------------------------------------- media
@@ -156,6 +241,8 @@ class MessageDelegate(QStyledItemDelegate):
         return w, h
 
     def _layout(self, msg: ChatMessage, max_bubble_w: int) -> tuple:
+        if isinstance(msg, FolderGroup):
+            return min(max_bubble_w, 320), FILE_CARD_H, None
         if msg.file_info is not None:
             if self._is_media(msg):
                 size = self._media_image_size(msg, max_bubble_w)
@@ -205,6 +292,16 @@ class MessageDelegate(QStyledItemDelegate):
             and event.button() == Qt.MouseButton.LeftButton
         ):
             msg = index.data(MSG_ROLE)
+            if isinstance(msg, FolderGroup):
+                if msg.is_from_me or msg.expired:
+                    return True
+                state = self.folder_states.get(msg.folder_id, ("idle", ""))[0]
+                if state == "done":
+                    if self.on_folder_open:
+                        self.on_folder_open(msg)
+                elif state != "downloading" and self.on_folder_click:
+                    self.on_folder_click(msg)
+                return True
             if msg is not None and msg.file_info is not None:
                 if self._is_media(msg):
                     # downloaded media: click opens the system viewer/player;
@@ -242,6 +339,9 @@ class MessageDelegate(QStyledItemDelegate):
             return
         msg = index.data(MSG_ROLE)
         if msg is None:
+            return
+        if isinstance(msg, FolderGroup):
+            self._paint_folder_message(painter, option, msg)
             return
         if msg.file_info is not None:
             if self._is_media(msg) and self._media_path(msg):
@@ -424,6 +524,92 @@ class MessageDelegate(QStyledItemDelegate):
         )
         painter.restore()
 
+    def _paint_folder_message(self, painter: QPainter, option, group: FolderGroup) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = option.rect
+        view_w = rect.width()
+        max_bubble_w = max(int(view_w * 0.72), 200)
+        bubble_w = min(max_bubble_w, 320)
+        bubble_h = FILE_CARD_H
+        if group.is_from_me:
+            bubble_x = rect.left() + rect.width() - bubble_w - SIDE_MARGIN
+        else:
+            bubble_x = rect.left() + SIDE_MARGIN
+        bubble_y = rect.top() + V_PAD
+        bubble_rect = QRectF(bubble_x, bubble_y, bubble_w, bubble_h)
+        path = bubble_path(bubble_rect.toRect(), 14, group.is_from_me)
+        painter.fillPath(path, QColor(BUBBLE_MINE if group.is_from_me else BUBBLE_OTHER))
+
+        state = self.folder_states.get(group.folder_id, ("idle", ""))
+        if group.is_from_me:
+            status_text = "已发送"
+        elif group.expired:
+            status_text = "已过期"
+        else:
+            status_text = {
+                "idle": "点击保存",
+                "downloading": state[1] or "保存中...",
+                "done": "已保存",
+                "failed": state[1] or "保存失败",
+                "cancelled": "已取消",
+            }.get(state[0], "点击保存")
+        text_color = QColor("#FFFFFF" if group.is_from_me else BUBBLE_TEXT_OTHER)
+        subtle = QColor("#FFFFFF" if group.is_from_me else TEXT_SUBTLE)
+        subtle.setAlpha(200 if group.is_from_me else 255)
+        name_font = self._view.font()
+        name_font.setPointSize(10)
+        fm = QFontMetrics(name_font)
+        small_font = QFont(name_font)
+        small_font.setPointSize(8)
+
+        painter.setPen(text_color)
+        icon_rect = QRectF(bubble_rect.x() + 12, bubble_rect.y() + 12, 34, 34)
+        self._paint_folder_icon(painter, icon_rect, text_color)
+
+        status_fm = QFontMetrics(small_font)
+        status_rect = QRectF(bubble_rect.right() - 96, bubble_rect.y(), 84, bubble_rect.height())
+        painter.setFont(small_font)
+        painter.setPen(text_color)
+        painter.drawText(
+            status_rect,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            status_fm.elidedText(status_text, Qt.TextElideMode.ElideRight, 84),
+        )
+
+        inner_x = icon_rect.right() + 10
+        text_w = status_rect.left() - inner_x - 8
+        name = fm.elidedText(
+            group.folder_name, Qt.TextElideMode.ElideRight, max(int(text_w), 40)
+        )
+        painter.setFont(name_font)
+        painter.drawText(
+            QRectF(inner_x, bubble_rect.y() + 12, text_w, 20),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            name,
+        )
+        painter.setFont(small_font)
+        painter.setPen(subtle)
+        painter.drawText(
+            QRectF(inner_x, bubble_rect.y() + 32, text_w, 16),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            f"{group.total} 个文件 · {format_file_size(group.size)}",
+        )
+        painter.restore()
+
+    def _paint_folder_icon(self, painter: QPainter, rect: QRectF, color: QColor) -> None:
+        """Draw a simple folder glyph (back tab + body)."""
+        painter.save()
+        pen = QPen(color, 2)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        body = QRectF(rect.x() + 4, rect.y() + 13, 27, 18)
+        tab = QRectF(rect.x() + 4, rect.y() + 8, 13, 7)
+        painter.drawRoundedRect(tab, 2, 2)
+        painter.drawRoundedRect(body, 3, 3)
+        painter.restore()
+
     def _paint_file_icon(self, painter: QPainter, rect: QRectF, color: QColor) -> None:
         """Draw a simple document glyph (body + folded corner + text lines)."""
         painter.save()
@@ -526,22 +712,12 @@ class MessageDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-class ChatInput(QTextEdit):
-    def __init__(self, on_send, parent=None):
-        super().__init__(parent)
-        self.on_send = on_send
+class ChatInput(DroppableTextEdit):
+    def __init__(self, on_send, on_files_dropped=None, parent=None):
+        super().__init__(on_send, on_files_dropped, parent)
         self.setPlaceholderText("输入消息...")
         self.setMaximumHeight(120)
         self.setAcceptRichText(False)
-
-    def keyPressEvent(self, event):
-        if (
-            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-            and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier
-        ):
-            self.on_send()
-            return
-        super().keyPressEvent(event)
 
 
 class ChatPage(QWidget):
@@ -553,6 +729,8 @@ class ChatPage(QWidget):
         self._building = False
         # fileId -> (status, target_path, message) for file messages
         self._file_states: dict = {}
+        # folderId -> (status, detail) for folder cards
+        self._folder_states: dict = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -580,6 +758,9 @@ class ChatPage(QWidget):
                 file_states=self._file_states,
                 media_resolver=self._media_path,
                 on_media_open=self._open_media,
+                folder_states=self._folder_states,
+                on_folder_click=self._download_folder,
+                on_folder_open=self._open_folder,
                 parent=self,
             )
         )
@@ -614,7 +795,7 @@ class ChatPage(QWidget):
         self.file_btn.setToolTip("发送文件")
         self.file_btn.clicked.connect(self._pick_file)
         input_row.addWidget(self.file_btn, alignment=Qt.AlignmentFlag.AlignBottom)
-        self.input_edit = ChatInput(self._send_input)
+        self.input_edit = ChatInput(self._send_input, self._send_files)
         input_row.addWidget(self.input_edit, 1)
         self.send_btn = QPushButton("发送")
         self.send_btn.setMinimumSize(80, 40)
@@ -635,12 +816,17 @@ class ChatPage(QWidget):
         self.vm.file_download_finished.connect(self._on_file_download_finished)
         self.vm.media_ready.connect(self._on_media_ready)
         self.vm.file_progress.connect(self._on_file_progress)
+        self.vm.folder_progress.connect(self._on_folder_progress)
+        self.vm.folder_download_finished.connect(self._on_folder_download_finished)
+        self.vm.folder_send_finished.connect(self._on_folder_send_finished)
+        self.vm.folder_send_truncated.connect(self._on_folder_send_truncated)
 
     def _on_group_changed(self):
         self.title_label.setText(self.vm.active_group_name)
         self.model.setRowCount(0)
         self.input_edit.clear()
         self._file_states.clear()
+        self._folder_states.clear()
         self._stick_to_bottom = True
         self._rebuild()
 
@@ -651,15 +837,12 @@ class ChatPage(QWidget):
         self._building = True
         self.model.setRowCount(0)
         msgs = self.vm.active_messages()
-        prev_day = None
-        for msg in msgs:
-            if prev_day is None or not is_same_day(prev_day, msg.timestamp):
-                header = QStandardItem()
-                header.setData(date_header_text(msg.timestamp), HEADER_ROLE)
-                self.model.appendRow(header)
-                prev_day = msg.timestamp
+        for kind, payload in iter_message_rows(msgs):
             item = QStandardItem()
-            item.setData(msg, MSG_ROLE)
+            if kind == "header":
+                item.setData(date_header_text(payload), HEADER_ROLE)
+            else:
+                item.setData(payload, MSG_ROLE)
             self.model.appendRow(item)
         self._building = False
         if self._stick_to_bottom and msgs:
@@ -728,11 +911,81 @@ class ChatPage(QWidget):
             self.count_label.hide()
 
     def _pick_file(self):
-        path, _ = QFileDialog.getOpenFileName(self.window(), "选择要发送的文件")
-        if not path:
-            return
-        if not self.vm.send_file(path):
+        menu = QMenu(self)
+        file_action = menu.addAction("发送文件")
+        folder_action = menu.addAction("发送文件夹")
+        chosen = menu.exec(self.file_btn.mapToGlobal(self.file_btn.rect().bottomLeft()))
+        if chosen is file_action:
+            path, _ = QFileDialog.getOpenFileName(self.window(), "选择要发送的文件")
+            if path:
+                self._send_files([path])
+        elif chosen is folder_action:
+            path = QFileDialog.getExistingDirectory(self.window(), "选择要发送的文件夹")
+            if path:
+                self._send_files([path])
+
+    def _send_files(self, paths):
+        """Offer dropped/picked files and folders to the active group. Every
+        path is tried so one unavailable entry never swallows the rest; a
+        folder is offered as one file_message per contained file. Folder
+        offers are built on a worker thread (folder_send_finished reports the
+        outcome) so a large folder never freezes the UI; plain files stay
+        synchronous so their failure toast shows right away."""
+        failed = False
+        for path in paths:
+            if os.path.isdir(path):
+                self.vm.send_folder(path)
+            elif not self.vm.send_file(path):
+                failed = True
+        if failed:
             Toast(self.window()).show_message("无法发送文件：未连接或文件不可用")
+
+    def _on_folder_send_finished(self, ok: bool):
+        if not ok:
+            Toast(self.window()).show_message("无法发送文件夹：未连接或文件夹不可用")
+
+    def _on_folder_send_truncated(self, folder_name: str):
+        Toast(self.window()).show_message(
+            f"文件夹超过 {MAX_FOLDER_FILES} 个文件，仅发送前 {MAX_FOLDER_FILES} 个"
+        )
+
+    # ------------------------------------------------------- folder saving
+
+    def _download_folder(self, group: FolderGroup):
+        if group.is_from_me or group.expired:
+            return
+        dest = QFileDialog.getExistingDirectory(self.window(), "选择保存文件夹位置")
+        if not dest:
+            return
+        self._folder_states[group.folder_id] = ("downloading", f"0/{group.total}")
+        self.list_view.viewport().update()
+        self.vm.download_folder(group.folder_id, dest)
+
+    def _open_folder(self, group: FolderGroup):
+        state = self._folder_states.get(group.folder_id, ("", ""))
+        path = state[1] if state[0] == "done" else ""
+        if path and os.path.isdir(path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _on_folder_progress(self, folder_id: str, done: int, total: int):
+        if folder_id not in self._folder_states:
+            return
+        self._folder_states[folder_id] = ("downloading", f"{done}/{total}")
+        self.list_view.viewport().update()
+
+    def _on_folder_download_finished(self, folder_id: str, ok: bool, message: str):
+        if folder_id not in self._folder_states:
+            return
+        if ok:
+            self._folder_states[folder_id] = ("done", message)
+            Toast(self.window()).show_message("文件夹已保存")
+        elif "取消" in message:
+            self._folder_states[folder_id] = ("cancelled", message)
+        else:
+            self._folder_states[folder_id] = ("failed", message)
+            Toast(self.window()).show_message(f"文件夹保存失败：{message}")
+        self.list_view.viewport().update()
+        self.list_view.doItemsLayout()
 
     def _media_path(self, msg):
         fi = msg.file_info
@@ -822,6 +1075,9 @@ class ChatPage(QWidget):
         msg = index.data(MSG_ROLE) if index.isValid() else None
         if msg is None:
             return
+        if isinstance(msg, FolderGroup):
+            self._show_folder_menu(msg, pos)
+            return
         menu = QMenu(self.list_view)
         if msg.file_info is not None:
             is_media = msg.file_info.kind in MEDIA_KINDS
@@ -870,6 +1126,50 @@ class ChatPage(QWidget):
             self._show_forward_dialog(msg.content)
         elif chosen is delete_action:
             self._confirm_delete(msg.id)
+
+    def _show_folder_menu(self, group: FolderGroup, pos):
+        menu = QMenu(self.list_view)
+        state = self._folder_states.get(group.folder_id, ("idle", ""))[0]
+        save_action = None
+        cancel_action = None
+        if not group.is_from_me and not group.expired:
+            if state == "downloading":
+                cancel_action = menu.addAction("取消下载")
+            else:
+                save_action = menu.addAction("保存文件夹...")
+        copy_action = menu.addAction("复制文件夹名")
+        delete_action = None
+        if group.is_from_me:
+            menu.addSeparator()
+            delete_action = menu.addAction("删除")
+        chosen = menu.exec(self.list_view.viewport().mapToGlobal(pos))
+        if chosen is save_action:
+            self._download_folder(group)
+        elif chosen is cancel_action:
+            self._cancel_folder(group)
+        elif chosen is copy_action:
+            QApplication.clipboard().setText(group.folder_name)
+        elif chosen is delete_action:
+            self._confirm_delete_folder(group)
+
+    def _cancel_folder(self, group: FolderGroup):
+        gid = self.vm.active_group_id
+        if gid is None:
+            return
+        self.vm.cancel_download(gid, group.folder_id)
+        self._folder_states[group.folder_id] = ("cancelled", "")
+        self.list_view.viewport().update()
+
+    def _confirm_delete_folder(self, group: FolderGroup):
+        box = QMessageBox(self.window())
+        box.setWindowTitle("删除文件夹")
+        box.setText("删除后，这个文件夹的所有消息会从群内聊天记录中移除，且无法恢复。")
+        delete_btn = box.addButton("删除", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is delete_btn:
+            for entry in list(group.entries):
+                self.vm.delete_message(entry.id)
 
     def _show_forward_dialog(self, content: str):
         gid = self.vm.active_group_id

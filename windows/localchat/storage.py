@@ -38,6 +38,12 @@ class SavedMessage:
     # file-message kind ("file" | "image" | "video"): media kinds render
     # inline in the conversation, also after a restart
     kind: str = FILE_KIND_FILE
+    # Folder transfer metadata (empty/0 for a plain file): survives restart so
+    # the grouped folder card still shows its name and entry list.
+    folder_id: str = ""
+    folder_name: str = ""
+    relative_path: str = ""
+    folder_total: int = 0
     # True while an own direct-chat message still waits for the peer to come
     # online (pending send). Restored into the outbox at startup.
     pending: bool = False
@@ -194,6 +200,22 @@ class ChatStore:
                 c.execute(
                     "ALTER TABLE saved_messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'"
                 )
+            if "folderId" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN folderId TEXT NOT NULL DEFAULT ''"
+                )
+            if "folderName" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN folderName TEXT NOT NULL DEFAULT ''"
+                )
+            if "relativePath" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN relativePath TEXT NOT NULL DEFAULT ''"
+                )
+            if "folderTotal" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN folderTotal INTEGER NOT NULL DEFAULT 0"
+                )
             return
         # old schema: rebuild with the composite PK (+ pending) and copy rows
         c.execute("ALTER TABLE saved_messages RENAME TO saved_messages_old")
@@ -211,6 +233,10 @@ class ChatStore:
                 downloadHost TEXT NOT NULL DEFAULT '',
                 downloadPort INTEGER NOT NULL DEFAULT 0,
                 kind TEXT NOT NULL DEFAULT 'file',
+                folderId TEXT NOT NULL DEFAULT '',
+                folderName TEXT NOT NULL DEFAULT '',
+                relativePath TEXT NOT NULL DEFAULT '',
+                folderTotal INTEGER NOT NULL DEFAULT 0,
                 pending INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (groupId) REFERENCES saved_groups(groupId) ON DELETE CASCADE,
                 PRIMARY KEY (groupId, id)
@@ -225,10 +251,13 @@ class ChatStore:
             f"""
             INSERT INTO saved_messages
                 (id, groupId, content, timestamp, senderId, senderName, isFromMe,
-                 fileSize, downloadHost, downloadPort, kind, pending)
+                 fileSize, downloadHost, downloadPort, kind,
+                 folderId, folderName, relativePath, folderTotal, pending)
             SELECT id, groupId, content, timestamp, senderId, senderName, isFromMe,
                    {_col('fileSize', '0')}, {_col('downloadHost', "''")},
-                   {_col('downloadPort', '0')}, {_col('kind', "'file'")}, 0
+                   {_col('downloadPort', '0')}, {_col('kind', "'file'")},
+                   {_col('folderId', "''")}, {_col('folderName', "''")},
+                   {_col('relativePath', "''")}, {_col('folderTotal', '0')}, 0
             FROM saved_messages_old
             """
         )
@@ -322,8 +351,9 @@ class ChatStore:
                 """
                 INSERT OR REPLACE INTO saved_messages
                 (id, groupId, content, timestamp, senderId, senderName, isFromMe,
-                 fileSize, downloadHost, downloadPort, kind, pending)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 fileSize, downloadHost, downloadPort, kind,
+                 folderId, folderName, relativePath, folderTotal, pending)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -340,6 +370,10 @@ class ChatStore:
                         m.download_host,
                         m.download_port,
                         m.kind,
+                        m.folder_id,
+                        m.folder_name,
+                        m.relative_path,
+                        m.folder_total,
                         1 if m.pending else 0,
                     )
                     for m in messages
@@ -366,6 +400,10 @@ class ChatStore:
                 download_host=r["downloadHost"] if "downloadHost" in r.keys() else "",
                 download_port=r["downloadPort"] if "downloadPort" in r.keys() else 0,
                 kind=r["kind"] if "kind" in r.keys() else FILE_KIND_FILE,
+                folder_id=r["folderId"] if "folderId" in r.keys() else "",
+                folder_name=r["folderName"] if "folderName" in r.keys() else "",
+                relative_path=r["relativePath"] if "relativePath" in r.keys() else "",
+                folder_total=r["folderTotal"] if "folderTotal" in r.keys() else 0,
                 pending=bool(r["pending"]) if "pending" in r.keys() else False,
             )
             for r in rows
@@ -395,6 +433,10 @@ class ChatStore:
                 download_host=r["downloadHost"] if "downloadHost" in r.keys() else "",
                 download_port=r["downloadPort"] if "downloadPort" in r.keys() else 0,
                 kind=r["kind"] if "kind" in r.keys() else FILE_KIND_FILE,
+                folder_id=r["folderId"] if "folderId" in r.keys() else "",
+                folder_name=r["folderName"] if "folderName" in r.keys() else "",
+                relative_path=r["relativePath"] if "relativePath" in r.keys() else "",
+                folder_total=r["folderTotal"] if "folderTotal" in r.keys() else 0,
                 pending=True,
             )
             for r in rows
@@ -420,9 +462,11 @@ class ChatStore:
                 """
                 INSERT OR REPLACE INTO saved_messages
                     (id, groupId, content, timestamp, senderId, senderName, isFromMe,
-                     fileSize, downloadHost, downloadPort, kind, pending)
+                     fileSize, downloadHost, downloadPort, kind,
+                     folderId, folderName, relativePath, folderTotal, pending)
                 SELECT id, ?, content, timestamp, senderId, senderName, isFromMe,
-                       fileSize, downloadHost, downloadPort, kind, pending
+                       fileSize, downloadHost, downloadPort, kind,
+                       folderId, folderName, relativePath, folderTotal, pending
                 FROM saved_messages WHERE groupId = ?
                 """,
                 (to_group_id, from_group_id),
@@ -523,5 +567,9 @@ def to_saved_message(group_id: str, msg: ChatMessage) -> SavedMessage:
         download_host=fi.download_host if fi is not None else "",
         download_port=fi.download_port if fi is not None else 0,
         kind=fi.kind if fi is not None else FILE_KIND_FILE,
+        folder_id=fi.folder_id if fi is not None else "",
+        folder_name=fi.folder_name if fi is not None else "",
+        relative_path=fi.relative_path if fi is not None else "",
+        folder_total=fi.folder_total if fi is not None else 0,
         pending=msg.pending,
     )

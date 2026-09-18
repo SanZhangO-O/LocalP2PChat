@@ -67,6 +67,50 @@ def normalize_media_kind(kind: str) -> str:
     return kind if kind in (FILE_KIND_IMAGE, FILE_KIND_VIDEO) else FILE_KIND_FILE
 
 
+# Folder transfer: a folder is offered as one file_message per entry (so old
+# peers still see ordinary downloadable files), each carrying the same
+# folderId plus its folderName/relativePath/folderTotal. Receivers group the
+# entries by folderId and reproduce the tree under a directory the user picks.
+MAX_FOLDER_FILES = 1000
+MAX_RELATIVE_PATH_LENGTH = 1024
+_FOLDER_ID_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+
+
+def sanitize_folder_id(value) -> str:
+    """Folder ids are sender-generated opaque keys (uuid4). Keep only a safe
+    alphabet so a crafted id can never do anything but group messages."""
+    text = "".join(ch for ch in str(value or "") if ch in _FOLDER_ID_CHARS)
+    return text[:64]
+
+
+def sanitize_relative_path(value) -> str:
+    """Normalize a sender-provided folder-relative path to a safe relative
+    POSIX-style path. Backslashes become "/"; empty, "." and ".." segments are
+    dropped, and each remaining segment goes through sanitize_file_name (which
+    strips separators, control characters and trailing dots/spaces). The
+    result can therefore never be absolute or escape the receiver's chosen
+    destination directory. Returns "" when nothing usable remains."""
+    text = str(value or "").replace("\\", "/")
+    parts = []
+    for seg in text.split("/"):
+        if not seg or seg in (".", ".."):
+            continue
+        # a ":" could turn a segment into a drive-relative path ("C:") that
+        # escapes a joined root; Windows file names never contain one
+        seg = sanitize_file_name(seg).replace(":", "")
+        if seg:
+            parts.append(seg)
+        if len(parts) >= 64:
+            break
+    out = "/".join(parts)
+    if len(out) > MAX_RELATIVE_PATH_LENGTH:
+        out = out[:MAX_RELATIVE_PATH_LENGTH].rstrip("/ .")
+    return out
+
+
+
 def sanitize_file_name(name: str) -> str:
     """Sanitize a file name received from the network before it is ever
     combined into a local save path: normalize separators and keep only the
@@ -125,6 +169,15 @@ class FileInfo:
     # the wire so packets match kotlinx.serialization's output (defaults are
     # not encoded), keeping old clients interoperable.
     kind: str = FILE_KIND_FILE
+    # Folder transfer (all optional, omitted on the wire at their defaults so
+    # a plain file offer stays byte-identical): one message per entry, the
+    # same folder_id on each, relative_path locating the entry inside the
+    # folder, folder_name the root folder name and folder_total the entry
+    # count (0 = unknown). Old peers ignore these fields and just see files.
+    folder_id: str = ""
+    folder_name: str = ""
+    relative_path: str = ""
+    folder_total: int = 0
 
     def to_dict(self) -> dict:
         d = {
@@ -138,10 +191,22 @@ class FileInfo:
             d["fileKey"] = self.file_key
         if self.kind != FILE_KIND_FILE:
             d["kind"] = self.kind
+        if self.folder_id:
+            d["folderId"] = self.folder_id
+            if self.folder_name:
+                d["folderName"] = self.folder_name
+            if self.relative_path:
+                d["relativePath"] = self.relative_path
+            if self.folder_total > 0:
+                d["folderTotal"] = self.folder_total
         return d
 
     @staticmethod
     def from_dict(d: dict) -> "FileInfo":
+        folder_total = _strict_size(d.get("folderTotal", 0), "folderTotal")
+        if folder_total > MAX_FOLDER_FILES:
+            # advisory only: never trust a crafted count for allocation
+            folder_total = 0
         return FileInfo(
             file_id=str(d.get("fileId", "")),
             # every inbound path (group relay, direct chat, restart recovery)
@@ -153,6 +218,10 @@ class FileInfo:
             download_port=_strict_port(d.get("downloadPort", 0), "downloadPort"),
             file_key=str(d.get("fileKey", "")),
             kind=normalize_media_kind(str(d.get("kind", FILE_KIND_FILE))),
+            folder_id=sanitize_folder_id(d.get("folderId", "")),
+            folder_name=sanitize_file_name(str(d.get("folderName", ""))) if d.get("folderName") else "",
+            relative_path=sanitize_relative_path(d.get("relativePath", "")),
+            folder_total=folder_total,
         )
 
 

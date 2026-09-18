@@ -32,6 +32,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zqr.localchat.call.CallManager
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
+import com.zqr.localchat.data.MAX_FOLDER_FILES
 import com.zqr.localchat.data.detectMediaKind
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.ui.screen.CallOverlay
@@ -214,6 +215,7 @@ fun LocalChatApp(
     val activeServerError by viewModel.activeServerError.collectAsState()
     val activeConnectionLost by viewModel.activeConnectionLost.collectAsState()
     val downloadStates by viewModel.downloadStates.collectAsState()
+    val folderDownloadStates by viewModel.folderDownloadStates.collectAsState()
 
     // --- video calls ---
     val callState by viewModel.callState.collectAsState()
@@ -311,6 +313,12 @@ fun LocalChatApp(
     var pendingFileKind by remember { mutableStateOf(FileKind.FILE) }
     var pendingDownload by remember { mutableStateOf<FileInfo?>(null) }
     var pendingDownloadIsDirect by remember { mutableStateOf(false) }
+    // pending folder send/save: the chat the folder pick was launched from
+    // (null = active group, otherwise the direct-chat peer id)
+    var pendingFolderSendChat by remember { mutableStateOf<String?>(null) }
+    // pending folder save: (folderId, direct-chat peer id) awaiting the tree
+    // picker result; a null peer id means the active group
+    var pendingFolderDownload by remember { mutableStateOf<Pair<String, String?>?>(null) }
     val filePickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
@@ -328,6 +336,48 @@ fun LocalChatApp(
             if (!sent) {
                 Toast.makeText(context, "文件发送失败：文件过大或未连接", Toast.LENGTH_SHORT).show()
             }
+        }
+    }
+    val folderPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        val target = pendingFolderSendChat
+        pendingFolderSendChat = null
+        if (uri != null) {
+            val name = queryTreeDisplayName(context, uri)
+            // sendFolder/sendDirectFolder do the SAF walk + per-entry offers on
+            // Dispatchers.IO (a large folder must never block the main thread,
+            // ANR); the result — including the truncation notice — comes back
+            // here on the main thread
+            val onSent: (Boolean, Boolean) -> Unit = { sent, truncated ->
+                if (truncated) {
+                    Toast.makeText(
+                        context,
+                        "文件夹超过 ${MAX_FOLDER_FILES} 个文件，仅发送前 ${MAX_FOLDER_FILES} 个",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+                if (!sent) {
+                    Toast.makeText(
+                        context, "文件夹发送失败：没有可发送的文件或未连接", Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+            if (target != null) viewModel.sendDirectFolder(target, uri, name, onSent)
+            else viewModel.sendFolder(uri, name, onSent)
+        }
+    }
+    val folderSaverLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        // always clear the pending folder, even when the user cancels the
+        // picker, so a later save can never reuse a stale folderId
+        val pending = pendingFolderDownload
+        pendingFolderDownload = null
+        if (uri != null && pending != null) {
+            val (folderId, peerId) = pending
+            if (peerId != null) viewModel.downloadDirectFolder(peerId, folderId, uri)
+            else viewModel.downloadFolder(folderId, uri)
         }
     }
     val fileSaverLauncher = rememberLauncherForActivityResult(
@@ -516,6 +566,20 @@ fun LocalChatApp(
                         pendingDownloadIsDirect = true
                         fileSaverLauncher.launch(fileInfo.fileName)
                     },
+                    onPickFolder = {
+                        pendingFolderSendChat = peerId
+                        folderPickerLauncher.launch(null)
+                    },
+                    folderDownloadStates = folderDownloadStates,
+                    onDownloadFolder = { folderId ->
+                        pendingFolderDownload = folderId to peerId
+                        folderSaverLauncher.launch(null)
+                    },
+                    onDeleteFolder = { group ->
+                        group.entries.forEach {
+                            viewModel.deleteDirectMessage(peerId, it.id, it.senderId)
+                        }
+                    },
                     onDownloadMedia = { fileInfo ->
                         viewModel.downloadMedia(fileInfo, isDirect = true)
                     },
@@ -622,6 +686,18 @@ fun LocalChatApp(
                     pendingDownload = fileInfo
                     fileSaverLauncher.launch(fileInfo.fileName)
                 },
+                onPickFolder = {
+                    pendingFolderSendChat = null
+                    folderPickerLauncher.launch(null)
+                },
+                folderDownloadStates = folderDownloadStates,
+                onDownloadFolder = { folderId ->
+                    pendingFolderDownload = folderId to null
+                    folderSaverLauncher.launch(null)
+                },
+                onDeleteFolder = { group ->
+                    group.entries.forEach { viewModel.deleteMessage(it.id) }
+                },
                 onDownloadMedia = { fileInfo ->
                     viewModel.downloadMedia(fileInfo, isDirect = false)
                 },
@@ -724,6 +800,21 @@ private fun queryFileSize(context: Context, uri: Uri): Long {
         }
     }
     return 0L
+}
+
+/** Display name of a picked folder tree, falling back to "文件夹". */
+private fun queryTreeDisplayName(context: Context, treeUri: Uri): String {
+    return runCatching {
+        val docId = android.provider.DocumentsContract.getTreeDocumentId(treeUri)
+        val docUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+        context.contentResolver.query(
+            docUri,
+            arrayOf(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+            null, null, null
+        )?.use { c ->
+            if (c.moveToFirst() && !c.isNull(0)) c.getString(0) else null
+        }
+    }.getOrNull()?.takeIf { it.isNotBlank() } ?: "文件夹"
 }
 
 /** Classify a picked document: the provider-reported MIME type wins, the

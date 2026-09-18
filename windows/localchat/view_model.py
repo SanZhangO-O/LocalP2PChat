@@ -16,6 +16,7 @@ from .crypto import random_password
 from .hardware import get_hardware_id, get_local_ip_address
 from .models import (
     FILE_KIND_IMAGE,
+    MAX_FOLDER_FILES,
     TCP_PORT,
     ChatMessage,
     ContactRequest,
@@ -25,6 +26,7 @@ from .models import (
     Peer,
     detect_media_kind,
     sanitize_file_name,
+    sanitize_relative_path,
 )
 from . import network as network_module
 from .network import DirectChatListener, DirectChatManager, P2PListener, P2PManager, Protocol
@@ -76,6 +78,19 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # (file_id, received, total) while a download runs, throttled to at most
     # one emission per 250ms or 64KB (whichever comes first).
     file_progress = pyqtSignal(str, int, int)
+    # Folder transfer: (folder_id, completed_entries, total_entries) as a
+    # folder's files are saved one by one, and (folder_id, ok, message) when
+    # the whole folder download finishes (emitted on the main thread).
+    folder_progress = pyqtSignal(str, int, int)
+    folder_download_finished = pyqtSignal(str, bool, str)
+    # An async folder offer (send_folder / send_direct_folder) finished: ok is
+    # False when nothing could be sent (not connected / unreadable folder).
+    # The walk + per-entry offers run on a worker thread so a large folder
+    # never freezes the UI; this is emitted on the main thread.
+    folder_send_finished = pyqtSignal(bool)
+    # The folder had more sendable files than MAX_FOLDER_FILES and the offer
+    # was truncated; carries the folder display name.
+    folder_send_truncated = pyqtSignal(str)
     # Emitted from network threads with (group_id | "direct:<peer_id>",
     # sender_name, body); the aggregator slot runs on the main thread (queued
     # connection).
@@ -611,7 +626,18 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         if m.file_size <= 0 and not m.download_host:
             return None
         # blank the address for every restored offer, own or received
-        return FileInfo(m.id, m.content, m.file_size, "", 0, kind=m.kind)
+        return FileInfo(
+            m.id,
+            m.content,
+            m.file_size,
+            "",
+            0,
+            kind=m.kind,
+            folder_id=m.folder_id,
+            folder_name=m.folder_name,
+            relative_path=m.relative_path,
+            folder_total=m.folder_total,
+        )
 
     def send_direct_message(self, peer_id: str, content: str) -> bool:
         # peers are first-class: a message may queue as pending while the peer
@@ -744,6 +770,68 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             return False
         self._mirror_own_media(msg, path)
         return True
+
+    def send_direct_folder(self, peer_id: str, path: str) -> None:
+        """Offer a folder over a direct session as one file_message per entry
+        (each carrying folder_id/folder_name/relative_path/folder_total). Old
+        peers still see ordinary file offers; new peers group them into one
+        folder card. The walk + offers run on a worker thread so a large
+        folder never blocks the caller; folder_send_finished reports the
+        outcome."""
+        threading.Thread(
+            target=self._send_direct_folder_worker, args=(peer_id, path), daemon=True
+        ).start()
+
+    def _send_direct_folder_worker(self, peer_id: str, path: str) -> None:
+        entries, folder_name, truncated = self._collect_folder_entries(path)
+        if not entries:
+            self.folder_send_finished.emit(False)
+            return
+        if truncated:
+            self.folder_send_truncated.emit(folder_name)
+        folder_id = str(uuid.uuid4())
+        sent = 0
+        for relative_path, abs_path in entries:
+            msg = self.direct.send_file(
+                peer_id,
+                abs_path,
+                folder_id=folder_id,
+                folder_name=folder_name,
+                relative_path=relative_path,
+                folder_total=len(entries),
+            )
+            if msg is not None:
+                sent += 1
+        self.folder_send_finished.emit(sent > 0)
+
+    @staticmethod
+    def _collect_folder_entries(path: str) -> tuple:
+        """Walk [path] and return ([(relative_posix_path, abs_path), ...],
+        folder_name, truncated), sorted for a stable order. Entries that cannot
+        be sanitized to a safe relative path or that exceed the per-file size
+        cap are skipped; the list is capped at MAX_FOLDER_FILES and truncated
+        is True when sendable files existed beyond that cap."""
+        if not path or not os.path.isdir(path):
+            return [], "", False
+        folder_name = sanitize_file_name(os.path.basename(os.path.normpath(path)))
+        entries = []
+        for root, dirs, files in os.walk(path):
+            dirs.sort()
+            for name in sorted(files):
+                abs_path = os.path.join(root, name)
+                rel = os.path.relpath(abs_path, path).replace(os.sep, "/")
+                rel = sanitize_relative_path(rel)
+                if not rel:
+                    continue
+                try:
+                    if os.path.getsize(abs_path) > network_module.MAX_DOWNLOAD_BYTES:
+                        continue
+                except OSError:
+                    continue
+                if len(entries) >= MAX_FOLDER_FILES:
+                    return entries, folder_name, True
+                entries.append((rel, abs_path))
+        return entries, folder_name, False
 
     def _mirror_own_media(self, msg: ChatMessage, source_path: str) -> None:
         """After an own IMAGE goes out, copy it into the media dir on a worker
@@ -1806,6 +1894,46 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self._mirror_own_media(msg, path)
         return True
 
+    def send_folder(self, path: str) -> None:
+        """Offer a folder to the active group as one file_message per entry
+        (each carrying folder_id/folder_name/relative_path/folder_total) so
+        receivers can group them and rebuild the tree. Old peers still see
+        ordinary file offers. The walk + offers run on a worker thread so a
+        large folder never blocks the caller; folder_send_finished reports the
+        outcome."""
+        gid = self.active_group_id
+        p2p = self.group_p2p_map.get(gid) if gid is not None else None
+        if p2p is None or (p2p.connection_lost and not self.mesh.has_links(gid)):
+            self.folder_send_finished.emit(False)
+            return
+        threading.Thread(
+            target=self._send_group_folder_worker, args=(gid, p2p, path), daemon=True
+        ).start()
+
+    def _send_group_folder_worker(self, gid: str, p2p, path: str) -> None:
+        entries, folder_name, truncated = self._collect_folder_entries(path)
+        if not entries:
+            self.folder_send_finished.emit(False)
+            return
+        if truncated:
+            self.folder_send_truncated.emit(folder_name)
+        folder_id = str(uuid.uuid4())
+        sent = 0
+        for relative_path, abs_path in entries:
+            msg = p2p.send_file(
+                abs_path,
+                folder_id=folder_id,
+                folder_name=folder_name,
+                relative_path=relative_path,
+                folder_total=len(entries),
+            )
+            if msg is None:
+                continue
+            # same dual delivery as a single file: relay + mesh, dedup by id
+            self.mesh.broadcast(gid, msg)
+            sent += 1
+        self.folder_send_finished.emit(sent > 0)
+
     def download_file(self, file_id: str, target_path: str) -> None:
         """Download a file offer by file_id to target_path on a worker thread;
         file_download_finished(file_id, ok, message) fires on completion."""
@@ -1841,6 +1969,104 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             self.file_download_finished.emit(file_id, ok, message)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def download_folder(self, folder_id: str, dest_dir: str) -> None:
+        """Save every entry of a group folder offer under dest_dir/<folderName>/
+        (or dest_dir when the sender gave no name). One worker thread downloads
+        the entries sequentially, each reusing the hardened single-file
+        download; folder_progress / folder_download_finished report progress
+        and the outcome."""
+        gid = self.active_group_id
+        if gid is None:
+            self.folder_download_finished.emit(folder_id, False, "未连接到群组")
+            return
+        p2p = self.group_p2p_map.get(gid)
+        if p2p is None:
+            self.folder_download_finished.emit(folder_id, False, "未连接到群组")
+            return
+        self._start_folder_download(
+            p2p.download_file, list(p2p.messages), folder_id, dest_dir, (gid, folder_id)
+        )
+
+    def download_direct_folder(self, peer_id: str, folder_id: str, dest_dir: str) -> None:
+        """Save every entry of a direct-chat folder offer (see download_folder)."""
+        self._start_folder_download(
+            self.direct.download_file,
+            list(self.direct.messages_for(peer_id)),
+            folder_id,
+            dest_dir,
+            (peer_id, folder_id),
+        )
+
+    def _start_folder_download(self, downloader, messages, folder_id, dest_dir, key) -> None:
+        threading.Thread(
+            target=self._run_folder_download,
+            args=(downloader, messages, folder_id, dest_dir, key),
+            daemon=True,
+        ).start()
+
+    def _run_folder_download(self, downloader, messages, folder_id, dest_dir, key) -> None:
+        entries = []
+        seen = set()
+        for m in messages:
+            fi = m.file_info
+            if fi is None or fi.folder_id != folder_id or m.id in seen:
+                continue
+            seen.add(m.id)
+            entries.append(m)
+        if not entries:
+            self.folder_download_finished.emit(folder_id, False, "文件夹消息不存在")
+            return
+        entries.sort(key=lambda m: (m.file_info.relative_path or m.file_info.file_name))
+        root_name = next(
+            (m.file_info.folder_name for m in entries if m.file_info.folder_name), ""
+        )
+        root = os.path.join(dest_dir, sanitize_file_name(root_name)) if root_name else dest_dir
+        root_abs = os.path.abspath(root)
+        total = len(entries)
+        event, socks = self._register_download(key)
+        ok_all = True
+        message = ""
+        for index, m in enumerate(entries):
+            if event.is_set():
+                ok_all = False
+                message = "下载已取消"
+                break
+            fi = m.file_info
+            if not fi.download_host or fi.download_port <= 0:
+                ok_all = False
+                message = "部分文件已过期，请对方重新发送"
+                break
+            rel = fi.relative_path or fi.file_name
+            target = os.path.abspath(os.path.join(root_abs, *rel.split("/")))
+            try:
+                # defense in depth: relative_path is already sanitized, but a
+                # crafted path must never write outside the chosen directory
+                if os.path.commonpath([root_abs, target]) != root_abs:
+                    ok_all = False
+                    message = "无效的文件路径"
+                    continue
+            except ValueError:
+                ok_all = False
+                message = "无效的文件路径"
+                continue
+            try:
+                os.makedirs(os.path.dirname(target) or root_abs, exist_ok=True)
+            except OSError:
+                ok_all = False
+                message = "无法创建保存目录"
+                continue
+            progress = self._make_file_progress(m.id)
+            ok, entry_message = downloader(
+                fi, target, progress=progress, cancel=event, sock_holder=socks
+            )
+            if not ok:
+                ok_all = False
+                message = entry_message or "下载失败"
+                break
+            self.folder_progress.emit(folder_id, index + 1, total)
+        self._finish_download(key)
+        self.folder_download_finished.emit(folder_id, ok_all, root_abs if ok_all else message)
 
     # ------------------------------------------------- media (image / video)
 

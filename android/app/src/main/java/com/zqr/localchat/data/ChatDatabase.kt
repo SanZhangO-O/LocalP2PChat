@@ -9,7 +9,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [SavedGroup::class, SavedChatMessage::class, DeletedMessage::class],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -67,6 +67,28 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v3 -> v4: add the folder-transfer columns. History must survive the
+         * upgrade (NEVER destructive): each column is added with its empty/0
+         * default, so pre-folder rows keep behaving as plain files.
+         */
+        private val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE saved_messages ADD COLUMN folderId TEXT NOT NULL DEFAULT ''"
+                )
+                db.execSQL(
+                    "ALTER TABLE saved_messages ADD COLUMN folderName TEXT NOT NULL DEFAULT ''"
+                )
+                db.execSQL(
+                    "ALTER TABLE saved_messages ADD COLUMN relativePath TEXT NOT NULL DEFAULT ''"
+                )
+                db.execSQL(
+                    "ALTER TABLE saved_messages ADD COLUMN folderTotal INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
+
         @Volatile
         private var INSTANCE: ChatDatabase? = null
 
@@ -77,7 +99,7 @@ abstract class ChatDatabase : RoomDatabase() {
                     ChatDatabase::class.java,
                     "localchat_database"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .build()
                 INSTANCE = instance
                 instance

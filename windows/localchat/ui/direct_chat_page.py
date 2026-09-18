@@ -24,40 +24,36 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from ..models import MAX_CONTENT_LENGTH, MEDIA_KINDS, Peer
+from ..models import MAX_CONTENT_LENGTH, MAX_FOLDER_FILES, MEDIA_KINDS, Peer
 from ..view_model import ChatViewModel
 from .chat_page import (
     HEADER_ROLE,
     MSG_ROLE,
+    FolderGroup,
     MessageDelegate,
     _safe_save_name,
     file_offer_expired,
+    iter_message_rows,
 )
 from .theme import PRIMARY, TEXT_SUBTLE
-from .widgets import Toast, date_header_text, format_message_time, is_same_day
+from .widgets import (
+    DroppableTextEdit,
+    Toast,
+    date_header_text,
+    format_message_time,
+)
 
 
-class DirectChatInput(QTextEdit):
-    def __init__(self, on_send, parent=None):
-        super().__init__(parent)
-        self.on_send = on_send
+class DirectChatInput(DroppableTextEdit):
+    def __init__(self, on_send, on_files_dropped=None, parent=None):
+        super().__init__(on_send, on_files_dropped, parent)
         self.setPlaceholderText("输入消息...")
         self.setMaximumHeight(120)
         self.setAcceptRichText(False)
-
-    def keyPressEvent(self, event):
-        if (
-            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-            and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier
-        ):
-            self.on_send()
-            return
-        super().keyPressEvent(event)
 
 
 class DirectChatPage(QWidget):
@@ -69,6 +65,8 @@ class DirectChatPage(QWidget):
         self._contact: Peer | None = None
         # fileId -> (status, target_path, message) for direct file messages
         self._file_states: dict = {}
+        # folderId -> (status, detail) for folder cards
+        self._folder_states: dict = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -112,6 +110,9 @@ class DirectChatPage(QWidget):
                 file_states=self._file_states,
                 media_resolver=self._media_path,
                 on_media_open=self._open_media,
+                folder_states=self._folder_states,
+                on_folder_click=self._download_folder,
+                on_folder_open=self._open_folder,
                 parent=self,
             )
         )
@@ -159,7 +160,7 @@ class DirectChatPage(QWidget):
         self.file_btn.clicked.connect(self._pick_file)
         input_row.addWidget(self.file_btn, alignment=Qt.AlignmentFlag.AlignBottom)
 
-        self.input_edit = DirectChatInput(self._send)
+        self.input_edit = DirectChatInput(self._send, self._send_files)
         input_row.addWidget(self.input_edit, 1)
         self.send_btn = QPushButton("发送")
         self.send_btn.setMinimumSize(80, 40)
@@ -181,12 +182,17 @@ class DirectChatPage(QWidget):
         self.vm.media_ready.connect(self._on_media_ready)
         self.vm.file_progress.connect(self._on_file_progress)
         self.vm.direct_chat_migrated.connect(self._on_chat_migrated)
+        self.vm.folder_progress.connect(self._on_folder_progress)
 
+        self.vm.folder_download_finished.connect(self._on_folder_download_finished)
+        self.vm.folder_send_finished.connect(self._on_folder_send_finished)
+        self.vm.folder_send_truncated.connect(self._on_folder_send_truncated)
     def open_chat(self, contact: Peer) -> None:
         self._contact = contact
         self.title_label.setText(contact.name)
         self.input_edit.clear()
         self._file_states.clear()
+        self._folder_states.clear()
         # use the real member id returned by the handshake so messages and the
         # session line up (a manually added contact starts with a placeholder)
         peer_id = self.vm.open_direct_chat(contact)
@@ -265,15 +271,12 @@ class DirectChatPage(QWidget):
                 "已连接，开始聊天吧" if self.vm.direct_chat_alive(peer_id) else "点击发送即可尝试重新连接"
             )
             return
-        prev_day = None
-        for msg in msgs:
-            if prev_day is None or not is_same_day(prev_day, msg.timestamp):
-                header = QStandardItem()
-                header.setData(date_header_text(msg.timestamp), HEADER_ROLE)
-                self.model.appendRow(header)
-                prev_day = msg.timestamp
+        for kind, payload in iter_message_rows(msgs):
             item = QStandardItem()
-            item.setData(msg, MSG_ROLE)
+            if kind == "header":
+                item.setData(date_header_text(payload), HEADER_ROLE)
+            else:
+                item.setData(payload, MSG_ROLE)
             self.model.appendRow(item)
         self.list_view.scrollToBottom()
 
@@ -319,14 +322,87 @@ class DirectChatPage(QWidget):
         self.vm.start_direct_call(peer_id)
 
     def _pick_file(self):
+        if self._peer_id is None:
+            return
+        menu = QMenu(self)
+        file_action = menu.addAction("发送文件")
+        folder_action = menu.addAction("发送文件夹")
+        chosen = menu.exec(self.file_btn.mapToGlobal(self.file_btn.rect().bottomLeft()))
+        if chosen is file_action:
+            path, _ = QFileDialog.getOpenFileName(self.window(), "选择要发送的文件")
+            if path:
+                self._send_files([path])
+        elif chosen is folder_action:
+            path = QFileDialog.getExistingDirectory(self.window(), "选择要发送的文件夹")
+            if path:
+                self._send_files([path])
+
+    def _send_files(self, paths):
+        """Offer dropped/picked files and folders over the direct session.
+        Every path is tried so one unavailable entry never swallows the rest;
+        a folder is offered as one file_message per contained file. Folder
+        offers are built on a worker thread (folder_send_finished reports the
+        outcome) so a large folder never freezes the UI; plain files stay
+        synchronous so their failure toast shows right away."""
         peer_id = self._peer_id
         if peer_id is None:
             return
-        path, _ = QFileDialog.getOpenFileName(self.window(), "选择要发送的文件")
-        if not path:
-            return
-        if not self.vm.send_direct_file(peer_id, path):
+        failed = False
+        for path in paths:
+            if os.path.isdir(path):
+                self.vm.send_direct_folder(peer_id, path)
+            elif not self.vm.send_direct_file(peer_id, path):
+                failed = True
+        if failed:
             Toast(self.window()).show_message("无法发送文件：未连接或文件不可用")
+
+    def _on_folder_send_finished(self, ok: bool):
+        if not ok:
+            Toast(self.window()).show_message("无法发送文件夹：未连接或文件夹不可用")
+
+    def _on_folder_send_truncated(self, folder_name: str):
+        Toast(self.window()).show_message(
+            f"文件夹超过 {MAX_FOLDER_FILES} 个文件，仅发送前 {MAX_FOLDER_FILES} 个"
+        )
+
+    # ------------------------------------------------------- folder saving
+
+    def _download_folder(self, group: FolderGroup):
+        peer_id = self._peer_id
+        if peer_id is None or group.is_from_me or group.expired:
+            return
+        dest = QFileDialog.getExistingDirectory(self.window(), "选择保存文件夹位置")
+        if not dest:
+            return
+        self._folder_states[group.folder_id] = ("downloading", f"0/{group.total}")
+        self.list_view.viewport().update()
+        self.vm.download_direct_folder(peer_id, group.folder_id, dest)
+
+    def _open_folder(self, group: FolderGroup):
+        state = self._folder_states.get(group.folder_id, ("", ""))
+        path = state[1] if state[0] == "done" else ""
+        if path and os.path.isdir(path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _on_folder_progress(self, folder_id: str, done: int, total: int):
+        if folder_id not in self._folder_states:
+            return
+        self._folder_states[folder_id] = ("downloading", f"{done}/{total}")
+        self.list_view.viewport().update()
+
+    def _on_folder_download_finished(self, folder_id: str, ok: bool, message: str):
+        if folder_id not in self._folder_states:
+            return
+        if ok:
+            self._folder_states[folder_id] = ("done", message)
+            Toast(self.window()).show_message("文件夹已保存")
+        elif "取消" in message:
+            self._folder_states[folder_id] = ("cancelled", message)
+        else:
+            self._folder_states[folder_id] = ("failed", message)
+            Toast(self.window()).show_message(f"文件夹保存失败：{message}")
+        self.list_view.viewport().update()
+        self.list_view.doItemsLayout()
 
     def _media_path(self, msg):
         fi = msg.file_info
@@ -418,6 +494,9 @@ class DirectChatPage(QWidget):
         msg = index.data(MSG_ROLE) if index.isValid() else None
         if msg is None:
             return
+        if isinstance(msg, FolderGroup):
+            self._show_folder_menu(msg, pos)
+            return
         menu = QMenu(self.list_view)
         if msg.file_info is not None:
             is_media = msg.file_info.kind in MEDIA_KINDS
@@ -463,6 +542,53 @@ class DirectChatPage(QWidget):
             QApplication.clipboard().setText(msg.content)
         elif chosen is delete_action:
             self._delete(msg)
+
+    def _show_folder_menu(self, group: FolderGroup, pos):
+        menu = QMenu(self.list_view)
+        state = self._folder_states.get(group.folder_id, ("idle", ""))[0]
+        save_action = None
+        cancel_action = None
+        if not group.is_from_me and not group.expired:
+            if state == "downloading":
+                cancel_action = menu.addAction("取消下载")
+            else:
+                save_action = menu.addAction("保存文件夹...")
+        copy_action = menu.addAction("复制文件夹名")
+        delete_action = None
+        if group.is_from_me:
+            menu.addSeparator()
+            delete_action = menu.addAction("删除")
+        chosen = menu.exec(self.list_view.viewport().mapToGlobal(pos))
+        if chosen is save_action:
+            self._download_folder(group)
+        elif chosen is cancel_action:
+            self._cancel_folder(group)
+        elif chosen is copy_action:
+            QApplication.clipboard().setText(group.folder_name)
+        elif chosen is delete_action:
+            self._confirm_delete_folder(group)
+
+    def _cancel_folder(self, group: FolderGroup):
+        peer_id = self._peer_id
+        if peer_id is None:
+            return
+        self.vm.cancel_download(peer_id, group.folder_id)
+        self._folder_states[group.folder_id] = ("cancelled", "")
+        self.list_view.viewport().update()
+
+    def _confirm_delete_folder(self, group: FolderGroup):
+        peer_id = self._peer_id
+        if peer_id is None:
+            return
+        box = QMessageBox(self.window())
+        box.setWindowTitle("删除文件夹")
+        box.setText("删除后，这个文件夹的所有消息会从双方的聊天记录中移除，且无法恢复。")
+        delete_btn = box.addButton("删除", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is delete_btn:
+            for entry in list(group.entries):
+                self.vm.delete_direct_message(peer_id, entry.id, entry.sender_id)
 
     def _delete(self, msg):
         peer_id = self._peer_id

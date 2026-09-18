@@ -9,7 +9,10 @@ import com.zqr.localchat.crypto.Crypto
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
+import com.zqr.localchat.data.MAX_FOLDER_FILES
 import com.zqr.localchat.data.Peer
+import com.zqr.localchat.data.sanitizeRelativePath
+import com.zqr.localchat.data.withSanitizedFileInfo
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -1167,7 +1170,8 @@ object DirectChatManager {
      * message stream: this opens a short-lived download server on a random
      * port and sends a file_message carrying [FileInfo] (incl. the download
      * address). The receiver connects back to download the file (shared
-     * [FileTransfer] protocol).
+     * [FileTransfer] protocol). A folder entry adds the optional folder
+     * metadata (see the group path's sendFile).
      */
     fun sendFile(
         peerId: String,
@@ -1175,7 +1179,11 @@ object DirectChatManager {
         resolver: ContentResolver,
         uri: Uri,
         fileSize: Long,
-        kind: String = FileKind.FILE
+        kind: String = FileKind.FILE,
+        folderId: String = "",
+        folderName: String = "",
+        relativePath: String = "",
+        folderTotal: Int = 0
     ): ChatMessage? {
         // receivers use the advertised name as their default save name: strip
         // path separators and ".." so a crafted offer cannot traverse out of
@@ -1185,6 +1193,18 @@ object DirectChatManager {
         // name silently, so reject it on the sending side
         if (!P2PManager.isValidContent(safeName)) return null
         if (fileSize > FileTransfer.MAX_DOWNLOAD_BYTES) return null
+        // folder entries: a safe relative path is mandatory and the advisory
+        // entry count is capped; entries are always plain "file" kind
+        val safeRelativePath: String
+        val effectiveKind: String
+        if (folderId.isNotEmpty()) {
+            safeRelativePath = sanitizeRelativePath(relativePath)
+            if (safeRelativePath.isEmpty() || folderTotal > MAX_FOLDER_FILES) return null
+            effectiveKind = FileKind.FILE
+        } else {
+            safeRelativePath = ""
+            effectiveKind = kind
+        }
         val s = sessions[peerId] ?: return null
         val fileId = UUID.randomUUID().toString()
         val server = try {
@@ -1201,7 +1221,13 @@ object DirectChatManager {
         // myPeer()): myIp was set at app start and may be stale after a
         // network change, which would make the download host unreachable
         val advertised = P2PManager.getLocalIpAddress().ifBlank { myIp }
-        val fileInfo = FileInfo(fileId, safeName, fileSize, advertised, port, Crypto.toB64(fileKey), kind)
+        val fileInfo = FileInfo(
+            fileId, safeName, fileSize, advertised, port, Crypto.toB64(fileKey), effectiveKind,
+            folderId = folderId,
+            folderName = folderName,
+            relativePath = safeRelativePath,
+            folderTotal = folderTotal
+        )
         fileServers[fileId] = server
         val msg = ChatMessage(
             id = fileId,
@@ -1326,7 +1352,7 @@ object DirectChatManager {
                             // drop instead of duplicating the bubble
                             Log.i(TAG, "drop duplicate message ${msg.id} on session ${s.peerId}")
                         } else {
-                            appendMessage(s.peerId, P2PManager.markFromMe(msg, myId))
+                            appendMessage(s.peerId, P2PManager.markFromMe(msg.withSanitizedFileInfo(), myId))
                         }
                     }
                     "delete_message" -> {

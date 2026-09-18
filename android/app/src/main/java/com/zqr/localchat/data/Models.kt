@@ -40,6 +40,67 @@ fun detectMediaKind(fileName: String): String {
 }
 
 /**
+ * Folder transfer: a folder is offered as one file_message per entry (so old
+ * peers still see ordinary downloadable files), each carrying the same
+ * folderId plus its folderName/relativePath/folderTotal. Receivers group the
+ * entries by folderId and rebuild the tree under a directory the user picks.
+ * Mirrors the Windows client's models.MAX_FOLDER_FILES / sanitize_relative_path
+ * / sanitize_folder_id so both implementations agree on every wire value.
+ */
+const val MAX_FOLDER_FILES = 1000
+const val MAX_RELATIVE_PATH_LENGTH = 1024
+private const val MAX_RELATIVE_PATH_SEGMENTS = 64
+private const val MAX_PATH_SEGMENT_LENGTH = 255
+private const val FOLDER_ID_CHARS =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+
+/** Folder ids are sender-generated opaque keys (uuid4). Keep only a safe
+ *  alphabet so a crafted id can never do anything but group messages. Mirrors
+ *  Windows sanitize_folder_id. */
+fun sanitizeFolderId(value: String): String =
+    value.filter { it in FOLDER_ID_CHARS }.take(64)
+
+/** Windows sanitize_file_name for one path segment: normalize separators and
+ *  keep only the basename, strip control characters, drop trailing dots/spaces
+ *  (Windows cannot round-trip them) and cap the length. Returns "file" when
+ *  nothing usable remains — exactly like the Windows helper. */
+private fun sanitizePathSegment(segment: String): String {
+    var name = segment.replace('\\', '/').substringAfterLast('/')
+    name = name.filter { ch -> ch.code >= 32 && ch.code !in 0x7F..0xA0 }
+    name = name.trimEnd(' ', '.')
+    if (name.length > MAX_PATH_SEGMENT_LENGTH) {
+        // truncation can re-expose a trailing dot/space
+        name = name.take(MAX_PATH_SEGMENT_LENGTH).trimEnd(' ', '.')
+    }
+    return name.ifEmpty { "file" }
+}
+
+/**
+ * Normalize a sender-provided folder-relative path to a safe relative
+ * POSIX-style path. Backslashes become "/"; empty, "." and ".." segments are
+ * dropped, and each remaining segment is sanitized (separators/control chars
+ * stripped, trailing dots/spaces removed) with ":" removed so a segment can
+ * never become a drive-relative path. The result can therefore never be
+ * absolute or escape the receiver's chosen destination directory. Returns ""
+ * when nothing usable remains. Mirrors Windows sanitize_relative_path.
+ */
+fun sanitizeRelativePath(value: String): String {
+    val text = value.replace('\\', '/')
+    val parts = ArrayList<String>()
+    for (raw in text.split('/')) {
+        if (raw.isEmpty() || raw == "." || raw == "..") continue
+        val segment = sanitizePathSegment(raw).replace(":", "")
+        if (segment.isNotEmpty()) parts.add(segment)
+        if (parts.size >= MAX_RELATIVE_PATH_SEGMENTS) break
+    }
+    var out = parts.joinToString("/")
+    if (out.length > MAX_RELATIVE_PATH_LENGTH) {
+        out = out.take(MAX_RELATIVE_PATH_LENGTH).trimEnd('/', ' ', '.')
+    }
+    return out
+}
+
+/**
  * Metadata for a file offered in chat. The file bytes themselves are NOT sent
  * over the message stream: the sender opens a short-lived download server and
  * shares its address here; receivers connect back to fetch the file (see the
@@ -56,7 +117,16 @@ data class FileInfo(
     val downloadHost: String,
     val downloadPort: Int,
     val fileKey: String = "",
-    val kind: String = FileKind.FILE
+    val kind: String = FileKind.FILE,
+    /** Folder transfer (all optional, omitted on the wire at their defaults so
+     *  a plain file offer stays byte-identical): one message per entry, the
+     *  same folderId on each, relativePath locating the entry inside the
+     *  folder, folderName the root folder name and folderTotal the entry count
+     *  (0 = unknown). Old peers ignore these fields and just see files. */
+    val folderId: String = "",
+    val folderName: String = "",
+    val relativePath: String = "",
+    val folderTotal: Int = 0
 )
 
 @Serializable
@@ -73,6 +143,18 @@ data class ChatMessage(
      *  chat outbox for the peer to come online. */
     @Transient val pending: Boolean = false
 )
+
+/** Inbound advisory metadata must never be trusted: a forged folderTotal (a
+ *  display-only entry count) decodes to 0 = unknown once it exceeds the cap —
+ *  mirrors the Windows FileInfo.from_dict clamp so both platforms agree on
+ *  every wire value. */
+fun FileInfo.sanitized(): FileInfo =
+    if (folderTotal > MAX_FOLDER_FILES) copy(folderTotal = 0) else this
+
+/** Clamp the advisory folder metadata carried by an inbound message (see
+ *  [FileInfo.sanitized]); apply where a decoded file_message is accepted. */
+fun ChatMessage.withSanitizedFileInfo(): ChatMessage =
+    fileInfo?.let { copy(fileInfo = it.sanitized()) } ?: this
 
 /**
  * Metadata for a video/audio call.

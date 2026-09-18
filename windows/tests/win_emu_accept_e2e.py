@@ -41,7 +41,7 @@ from localchat.ui.member_list_page import ContactRow, RequestCard
 from win_emu_e2e import (  # reuse the adb/UI helpers from the engine E2E
     adb, adb_ok, wait_text, screenshot, launch_app, wait_listener,
     type_text as emu_type_text, tap_node_wait, has_text, back_to_member_list,
-    HOST_FWD_PORT, WIN_PORT, GUEST_ALIAS, WIN_NICK,
+    tap, HOST_FWD_PORT, WIN_PORT, GUEST_ALIAS, WIN_NICK,
 )
 
 SHOTS = os.path.join(REPO, ".interop", "shots")
@@ -265,6 +265,40 @@ def main() -> int:
         raise RuntimeError(f"Windows GUI chat page never rendered {MSG_EMU}")
     log(f"Windows GUI chat page shows {MSG_EMU}: PASS")
     screenshot("accept_win_received_reply")
+
+    # ---- 7) Windows sends a FOLDER; Android must group it into one card ----
+    # Exercises the new optional folder fields on the wire (Windows serializer
+    # -> Android parser/grouping/UI) through the real send path. A receiver
+    # that predates the folder fields ignores them and shows the entries as
+    # individual file cards: that degradation is the compatibility contract,
+    # so both outcomes pass.
+    log("== Windows sends a folder via the real send path ==")
+    import shutil as _shutil
+
+    folder_root = os.path.join(tmp, "send_folder")
+    if os.path.isdir(folder_root):
+        _shutil.rmtree(folder_root)
+    os.makedirs(os.path.join(folder_root, "sub"))
+    with open(os.path.join(folder_root, "alpha.txt"), "wb") as fh:
+        fh.write(b"alpha")
+    with open(os.path.join(folder_root, "sub", "beta.txt"), "wb") as fh:
+        fh.write(b"beta")
+    folder_name = os.path.basename(folder_root)
+    win.pages[PAGE_DIRECT]._send_files([folder_root])
+    app.processEvents()
+    grouped = wait_text(folder_name, 60) and has_text("\u4e2a\u6587\u4ef6")  # 个文件
+    if grouped:
+        screenshot("accept_emu_received_folder")
+        log("Android groups the Windows folder offer into one card: PASS")
+    else:
+        # old peer: optional folder fields ignored, entries shown separately
+        individual = wait_text("alpha.txt", 30) and has_text("beta.txt")
+        if not individual:
+            raise RuntimeError(
+                "Android showed neither a grouped folder card nor the individual entries"
+            )
+        screenshot("accept_emu_received_folder_legacy")
+        log("Android (old peer) shows individual folder entries: compat PASS")
 
     log("ACCEPT E2E ALL PASS")
     for _ in range(3):

@@ -1,7 +1,8 @@
 import datetime
+import os
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QLabel
+from PyQt6.QtWidgets import QLabel, QTextEdit
 
 from .theme import avatar_color
 
@@ -48,6 +49,89 @@ def date_header_text(timestamp_ms: int) -> str:
 
 def format_message_time(timestamp_ms: int) -> str:
     return datetime.datetime.fromtimestamp(timestamp_ms / 1000).strftime("%H:%M")
+
+
+class DroppableTextEdit(QTextEdit):
+    """Message input that also accepts OS drag-and-drop of local files and
+    folders.
+
+    Dropping one or more images/files/folders offers them over the same send
+    path as the paperclip button (the media kind is classified by extension on
+    send, folders become a grouped folder offer), so a dropped image renders
+    inline like a received one. Only URLs that resolve to an existing local
+    file or directory are treated as drops: remote links and plain text fall
+    through to QTextEdit's default drop handling."""
+
+    def __init__(self, on_send, on_files_dropped=None, parent=None):
+        super().__init__(parent)
+        self.on_send = on_send
+        self.on_files_dropped = on_files_dropped
+        self.setAcceptDrops(True)
+
+    @staticmethod
+    def _local_paths(mime) -> list:
+        if not mime.hasUrls():
+            return []
+        paths = []
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            raw = url.toLocalFile()
+            if not raw:
+                continue
+            # QUrl always yields forward slashes; normalize to native form so
+            # the send path matches what QFileDialog hands over
+            path = os.path.normpath(raw)
+            if os.path.isfile(path) or os.path.isdir(path):
+                paths.append(path)
+        return paths
+
+    def _set_drag_active(self, active: bool) -> None:
+        if self.property("dragActive") == active:
+            return
+        self.setProperty("dragActive", active)
+        style = self.style()
+        style.unpolish(self)
+        style.polish(self)
+
+    def keyPressEvent(self, event):
+        if (
+            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            self.on_send()
+            return
+        super().keyPressEvent(event)
+
+    def dragEnterEvent(self, event):
+        if self._local_paths(event.mimeData()):
+            self._set_drag_active(True)
+            # force Copy: a Move action would let the source delete the file
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._local_paths(event.mimeData()):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
+        super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event):
+        self._set_drag_active(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        paths = self._local_paths(event.mimeData())
+        self._set_drag_active(False)
+        if paths and self.on_files_dropped is not None:
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            self.on_files_dropped(paths)
+            return
+        super().dropEvent(event)
 
 
 class AvatarLabel(QLabel):

@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
@@ -59,6 +60,82 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Calendar
 
+/**
+ * Synthetic conversation row: one folder card for the file messages that share
+ * a folderId (a folder offer). Entries are ordered by relativePath and include
+ * the sender's own offers (rendered as 已发送). Mirrors the Windows FolderGroup.
+ */
+// public: appears in ChatScreen/DirectChatScreen callback signatures
+class FolderGroup(
+    val folderId: String,
+    val folderName: String,
+    val entries: List<ChatMessage>
+) {
+    val total: Int get() = entries.size
+    val size: Long get() = entries.sumOf { it.fileInfo?.fileSize ?: 0L }
+    val isFromMe: Boolean get() = entries.isNotEmpty() && entries.all { it.isFromMe }
+    /** An offer without a download address expired with its sender's previous
+     *  session (the short-lived download server is gone). */
+    val expired: Boolean get() = entries.all { it.fileInfo?.downloadHost.isNullOrBlank() }
+    val timestamp: Long get() = entries.firstOrNull()?.timestamp ?: 0L
+}
+
+/** One rendered conversation row after folder grouping. */
+internal sealed class MessageItem {
+    abstract val timestamp: Long
+    data class Msg(val message: ChatMessage) : MessageItem() {
+        override val timestamp: Long get() = message.timestamp
+    }
+    data class Folder(val group: FolderGroup) : MessageItem() {
+        override val timestamp: Long get() = group.timestamp
+    }
+}
+
+/**
+ * Expand a flat message list into conversation rows, collapsing file messages
+ * that share a folderId into ONE folder row at the position of the first
+ * entry (Android parity with the Windows iter_message_rows). Only the message
+ * that opens a folder plus its plain neighbors survive as individual rows:
+ * every later folder entry is folded into the same group and never rendered on
+ * its own. Old behavior for non-folder messages is unchanged.
+ */
+internal fun buildMessageItems(messages: List<ChatMessage>): List<MessageItem> {
+    val items = ArrayList<MessageItem>()
+    val folders = LinkedHashMap<String, MutableList<ChatMessage>>()
+    for (msg in messages) {
+        val fi = msg.fileInfo
+        if (fi != null && fi.folderId.isNotEmpty()) {
+            val bucket = folders.getOrPut(fi.folderId) { mutableListOf() }
+            if (bucket.isEmpty()) {
+                // placeholder slot keeps the first entry's position; filled
+                // after the pass once all entries are known
+                bucket.add(msg)
+                items.add(MessageItem.Folder(FolderGroup(fi.folderId, fi.folderName, bucket)))
+            } else {
+                bucket.add(msg)
+            }
+        } else {
+            items.add(MessageItem.Msg(msg))
+        }
+    }
+    for ((folderId, entries) in folders) {
+        if (entries.isEmpty()) continue
+        val sorted = entries.sortedBy {
+            it.fileInfo?.relativePath?.ifEmpty { it.fileInfo?.fileName ?: "" } ?: ""
+        }
+        val index = items.indexOfFirst {
+            it is MessageItem.Folder && it.group.folderId == folderId
+        }
+        if (index >= 0) {
+            val name = entries.firstNotNullOfOrNull {
+                it.fileInfo?.folderName?.ifBlank { null }
+            } ?: "文件夹"
+            items[index] = MessageItem.Folder(FolderGroup(folderId, name, sorted))
+        }
+    }
+    return items
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
@@ -76,6 +153,12 @@ fun ChatScreen(
     onPickVideo: () -> Unit = {},
     onDownloadFile: (FileInfo) -> Unit = {},
     onDownloadMedia: (FileInfo) -> Unit = {},
+    onPickFolder: () -> Unit = {},
+    folderDownloadStates: Map<String, ChatViewModel.FolderDownloadState> = emptyMap(),
+    onDownloadFolder: (String) -> Unit = {},
+    /** Long-press delete on a folder card: confirms with the caller, which
+     *  removes every entry message of the folder (parity with Windows). */
+    onDeleteFolder: (FolderGroup) -> Unit = {},
     resolveMedia: (FileInfo) -> String? = { null },
     /** Bumped by the ViewModel when an own sent image lands in the media
      *  dir: re-keys the local-path lookups so the sender's own bubble flips
@@ -87,10 +170,14 @@ fun ChatScreen(
     var inputText by rememberSaveable { mutableStateOf("") }
     var pendingForward by remember { mutableStateOf<String?>(null) }
     var pendingDelete by remember { mutableStateOf<String?>(null) }
+    var pendingFolderDelete by remember { mutableStateOf<FolderGroup?>(null) }
     val listState = rememberLazyListState()
     var shouldAutoScroll by remember(groupName) { mutableStateOf(true) }
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
+    // Folder grouping + sorting is O(n log n): compute once per message-list
+    // change instead of on every recomposition (and inside every scroll event)
+    val messageItems = remember(messages) { buildMessageItems(messages) }
 
     val contentTooLong = inputText.length > P2PManager.MAX_CONTENT_LENGTH
 
@@ -113,13 +200,13 @@ fun ChatScreen(
     LaunchedEffect(listState, messages.size) {
         snapshotFlow { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
             .collect { lastVisibleIndex ->
-                val last = lastItemIndex(messages)
+                val last = lastItemIndex(messageItems)
                 shouldAutoScroll = last < 0 || lastVisibleIndex == -1 || lastVisibleIndex >= last - 2
             }
     }
 
     LaunchedEffect(messages.size, shouldAutoScroll) {
-        val last = lastItemIndex(messages)
+        val last = lastItemIndex(messageItems)
         if (shouldAutoScroll && last >= 0) {
             val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
             if (last - lastVisible > 20) {
@@ -211,6 +298,19 @@ fun ChatScreen(
                                 MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+                    IconButton(
+                        onClick = onPickFolder,
+                        enabled = !connectionLost
+                    ) {
+                        Icon(
+                            Icons.Default.Folder,
+                            contentDescription = "发送文件夹",
+                            tint = if (!connectionLost)
+                                MaterialTheme.colorScheme.primary
+                            else
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     Spacer(modifier = Modifier.width(4.dp))
                     OutlinedTextField(
                         value = inputText,
@@ -281,43 +381,64 @@ fun ChatScreen(
                 contentPadding = PaddingValues(vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                itemsIndexed(messages, key = { _, message -> message.id }) { index, message ->
-                    val prev = messages.getOrNull(index - 1)
-                    if (prev == null || !isSameDay(prev.timestamp, message.timestamp)) {
-                        DateHeader(timestamp = message.timestamp)
+                val items = messageItems
+                itemsIndexed(items, key = { index, item ->
+                    when (item) {
+                        is MessageItem.Folder -> "folder:${item.group.folderId}"
+                        is MessageItem.Msg -> item.message.id
                     }
-                    if (message.fileInfo != null) {
-                        val fi = message.fileInfo!!
-                        if (fi.kind == FileKind.IMAGE || fi.kind == FileKind.VIDEO) {
-                            val saved =
-                                downloadStates[message.id] as? ChatViewModel.DownloadState.Done
-                            MediaMessageBubble(
-                                message = message,
-                                state = downloadStates[message.id],
-                                localPath = saved?.uri ?: resolveMedia(fi),
-                                onDownload = { onDownloadMedia(fi) },
-                                onSaveAs = { onDownloadFile(fi) },
-                                onOpen = onOpenFile,
-                                onDelete = { pendingDelete = message.id }
-                            )
-                        } else {
-                            val saved =
-                                downloadStates[message.id] as? ChatViewModel.DownloadState.Done
-                            FileMessageBubble(
-                                message = message,
-                                state = downloadStates[message.id],
-                                onDownload = { onDownloadFile(message.fileInfo!!) },
-                                onOpen = saved?.let { done -> { onOpenFile(done.uri) } },
-                                onCancel = { ChatViewModel.cancelDownload(message.id) },
-                                onDelete = { pendingDelete = message.id }
+                }) { index, item ->
+                    val prev = items.getOrNull(index - 1)
+                    if (prev == null || !isSameDay(prev.timestamp, item.timestamp)) {
+                        DateHeader(timestamp = item.timestamp)
+                    }
+                    when (item) {
+                        is MessageItem.Folder -> {
+                            val group = item.group
+                            FolderMessageBubble(
+                                group = group,
+                                state = folderDownloadStates[group.folderId],
+                                onSave = { onDownloadFolder(group.folderId) },
+                                onCancel = { ChatViewModel.cancelDownload(group.folderId) },
+                                onLongPress = { pendingFolderDelete = group }
                             )
                         }
-                    } else {
-                        MessageBubble(
-                            message = message,
-                            onForward = { pendingForward = it },
-                            onDelete = { pendingDelete = it }
-                        )
+                        is MessageItem.Msg -> {
+                            val message = item.message
+                            val fi = message.fileInfo
+                            if (fi != null) {
+                                if (fi.kind == FileKind.IMAGE || fi.kind == FileKind.VIDEO) {
+                                    val saved =
+                                        downloadStates[message.id] as? ChatViewModel.DownloadState.Done
+                                    MediaMessageBubble(
+                                        message = message,
+                                        state = downloadStates[message.id],
+                                        localPath = saved?.uri ?: resolveMedia(fi),
+                                        onDownload = { onDownloadMedia(fi) },
+                                        onSaveAs = { onDownloadFile(fi) },
+                                        onOpen = onOpenFile,
+                                        onDelete = { pendingDelete = message.id }
+                                    )
+                                } else {
+                                    val saved =
+                                        downloadStates[message.id] as? ChatViewModel.DownloadState.Done
+                                    FileMessageBubble(
+                                        message = message,
+                                        state = downloadStates[message.id],
+                                        onDownload = { onDownloadFile(fi) },
+                                        onOpen = saved?.let { done -> { onOpenFile(done.uri) } },
+                                        onCancel = { ChatViewModel.cancelDownload(message.id) },
+                                        onDelete = { pendingDelete = message.id }
+                                    )
+                                }
+                            } else {
+                                MessageBubble(
+                                    message = message,
+                                    onForward = { pendingForward = it },
+                                    onDelete = { pendingDelete = it }
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -339,6 +460,29 @@ fun ChatScreen(
                 }
             },
             onDismiss = { pendingForward = null }
+        )
+    }
+
+    pendingFolderDelete?.let { group ->
+        AlertDialog(
+            onDismissRequest = { pendingFolderDelete = null },
+            title = { Text("删除文件夹") },
+            text = { Text("删除后，这个文件夹的所有消息会从群内聊天记录中移除，且无法恢复。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDeleteFolder(group)
+                        pendingFolderDelete = null
+                    }
+                ) {
+                    Text("删除", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingFolderDelete = null }) {
+                    Text("取消")
+                }
+            }
         )
     }
 
@@ -445,15 +589,15 @@ private fun DateHeader(timestamp: Long) {
 }
 
 /** Index of the last item in the LazyColumn, accounting for inserted DateHeader items. */
-private fun lastItemIndex(messages: List<ChatMessage>): Int {
-    if (messages.isEmpty()) return -1
+private fun lastItemIndex(items: List<MessageItem>): Int {
+    if (items.isEmpty()) return -1
     var headers = 0
     var prev: Long? = null
-    for (m in messages) {
+    for (m in items) {
         if (prev == null || !isSameDay(prev, m.timestamp)) headers++
         prev = m.timestamp
     }
-    return messages.size + headers - 1
+    return items.size + headers - 1
 }
 
 private fun isSameDay(a: Long, b: Long): Boolean {
@@ -742,6 +886,110 @@ internal fun FileMessageBubble(
                         }
                     )
                 }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- folder
+// A folder offer renders as ONE card (all file messages sharing a folderId),
+// mirroring the Windows folder card: name, entry count + total size and a
+// status line. Own folders are not downloadable; received folders open a tree
+// picker and are saved as a whole.
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+internal fun FolderMessageBubble(
+    group: FolderGroup,
+    state: ChatViewModel.FolderDownloadState?,
+    onSave: () -> Unit,
+    onCancel: () -> Unit,
+    onLongPress: () -> Unit = {}
+) {
+    val isFromMe = group.isFromMe
+    val expired = group.expired
+    val downloading = state?.downloading == true && !isFromMe
+    val alignment = if (isFromMe) Alignment.End else Alignment.Start
+    val bgColor = if (isFromMe)
+        MaterialTheme.colorScheme.primary
+    else
+        MaterialTheme.colorScheme.surfaceVariant
+    val textColor = if (isFromMe)
+        MaterialTheme.colorScheme.onPrimary
+    else
+        MaterialTheme.colorScheme.onSurfaceVariant
+
+    val statusText = when {
+        isFromMe -> "已发送"
+        expired -> "已过期"
+        downloading -> "保存中 ${state?.done ?: 0}/${state?.total ?: group.total}"
+        state != null && state.message.isNotEmpty() -> state.message
+        state != null && !state.downloading && state.savedPath.isNotEmpty() -> "已保存"
+        else -> "点击保存"
+    }
+    val clickable = !expired && !isFromMe && when {
+        downloading -> true
+        else -> state == null || !state.downloading
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = alignment
+    ) {
+        Box(
+            modifier = Modifier
+                .widthIn(max = 300.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(bgColor)
+                .combinedClickable(
+                    onClick = {
+                        if (!clickable) return@combinedClickable
+                        if (downloading) onCancel() else onSave()
+                    },
+                    // long press = context entry point (delete via the screen's
+                    // confirm dialog) — a folder card previously had no menu at
+                    // all, which had removed the delete ability a plain file
+                    // bubble still has
+                    onLongClick = onLongPress
+                )
+                .padding(horizontal = 14.dp, vertical = 12.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(
+                    modifier = Modifier.size(40.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (isFromMe)
+                        MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.15f)
+                    else
+                        MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text("\uD83D\uDCC1", fontSize = 20.sp)
+                    }
+                }
+                Spacer(modifier = Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = group.folderName.ifBlank { "文件夹" },
+                        color = textColor,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 2,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = "${group.total} 个文件 · ${formatFileSize(group.size)}",
+                        color = textColor.copy(alpha = 0.7f),
+                        fontSize = 11.sp
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = statusText,
+                    color = textColor.copy(alpha = 0.8f),
+                    fontSize = 11.sp
+                )
             }
         }
     }

@@ -13,6 +13,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Videocam
@@ -54,8 +55,14 @@ fun DirectChatScreen(
     onPickFile: () -> Unit = {},
     onPickImage: () -> Unit = {},
     onPickVideo: () -> Unit = {},
+    onPickFolder: () -> Unit = {},
     onDownloadFile: (FileInfo) -> Unit = {},
     onDownloadMedia: (FileInfo) -> Unit = {},
+    folderDownloadStates: Map<String, ChatViewModel.FolderDownloadState> = emptyMap(),
+    onDownloadFolder: (String) -> Unit = {},
+    /** Long-press delete on a folder card: confirms with the caller, which
+     *  removes every entry message of the folder (parity with Windows). */
+    onDeleteFolder: (FolderGroup) -> Unit = {},
     resolveMedia: (FileInfo) -> String? = { null },
     /** Bumped by the ViewModel when an own sent image lands in the media
      *  dir: re-keys the local-path lookups so the sender's own bubble flips
@@ -66,9 +73,13 @@ fun DirectChatScreen(
     val context = LocalContext.current
     var input by remember { mutableStateOf("") }
     var pendingDelete by remember { mutableStateOf<ChatMessage?>(null) }
+    var pendingFolderDelete by remember { mutableStateOf<FolderGroup?>(null) }
     val tooLong = input.length > P2PManager.MAX_CONTENT_LENGTH
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    // Folder grouping + sorting is O(n log n): compute once per message-list
+    // change instead of on every recomposition
+    val messageItems = remember(messages) { buildMessageItems(messages) }
 
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
@@ -142,37 +153,60 @@ fun DirectChatScreen(
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    items(messages, key = { it.id }) { msg ->
-                        val fi = msg.fileInfo
-                        if (fi != null && (fi.kind == FileKind.IMAGE || fi.kind == FileKind.VIDEO)) {
-                            val saved =
-                                downloadStates[msg.id] as? ChatViewModel.DownloadState.Done
-                            MediaMessageBubble(
-                                message = msg,
-                                state = downloadStates[msg.id],
-                                localPath = saved?.uri ?: resolveMedia(fi),
-                                onDownload = { onDownloadMedia(fi) },
-                                onSaveAs = { onDownloadFile(fi) },
-                                onOpen = onOpenFile,
-                                onDelete = { pendingDelete = msg }
-                            )
-                        } else if (msg.fileInfo != null) {
-                            FileMessageBubble(
-                                message = msg,
-                                state = downloadStates[msg.id],
-                                onDownload = { onDownloadFile(msg.fileInfo!!) },
-                                onCancel = { ChatViewModel.cancelDownload(fi.fileId) },
-                                onDelete = { pendingDelete = msg }
-                            )
-                        } else {
-                            DirectMessageBubble(
-                                msg = msg,
-                                onCopy = {
-                                    onCopy(msg.content)
-                                    Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
-                                },
-                                onDelete = { pendingDelete = msg }
-                            )
+                    items(
+                        messageItems,
+                        key = { item ->
+                            when (item) {
+                                is MessageItem.Folder -> "folder:${item.group.folderId}"
+                                is MessageItem.Msg -> item.message.id
+                            }
+                        }
+                    ) { item ->
+                        when (item) {
+                            is MessageItem.Folder -> {
+                                val group = item.group
+                                FolderMessageBubble(
+                                    group = group,
+                                    state = folderDownloadStates[group.folderId],
+                                    onSave = { onDownloadFolder(group.folderId) },
+                                    onCancel = { ChatViewModel.cancelDownload(group.folderId) },
+                                    onLongPress = { pendingFolderDelete = group }
+                                )
+                            }
+                            is MessageItem.Msg -> {
+                                val msg = item.message
+                                val fi = msg.fileInfo
+                                if (fi != null && (fi.kind == FileKind.IMAGE || fi.kind == FileKind.VIDEO)) {
+                                    val saved =
+                                        downloadStates[msg.id] as? ChatViewModel.DownloadState.Done
+                                    MediaMessageBubble(
+                                        message = msg,
+                                        state = downloadStates[msg.id],
+                                        localPath = saved?.uri ?: resolveMedia(fi),
+                                        onDownload = { onDownloadMedia(fi) },
+                                        onSaveAs = { onDownloadFile(fi) },
+                                        onOpen = onOpenFile,
+                                        onDelete = { pendingDelete = msg }
+                                    )
+                                } else if (fi != null) {
+                                    FileMessageBubble(
+                                        message = msg,
+                                        state = downloadStates[msg.id],
+                                        onDownload = { onDownloadFile(fi) },
+                                        onCancel = { ChatViewModel.cancelDownload(fi.fileId) },
+                                        onDelete = { pendingDelete = msg }
+                                    )
+                                } else {
+                                    DirectMessageBubble(
+                                        msg = msg,
+                                        onCopy = {
+                                            onCopy(msg.content)
+                                            Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
+                                        },
+                                        onDelete = { pendingDelete = msg }
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -206,6 +240,14 @@ fun DirectChatScreen(
                     Icon(
                         Icons.Filled.Movie,
                         contentDescription = "发送视频",
+                        tint = if (connected) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(onClick = onPickFolder, enabled = connected) {
+                    Icon(
+                        Icons.Filled.Folder,
+                        contentDescription = "发送文件夹",
                         tint = if (connected) MaterialTheme.colorScheme.primary
                         else MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -260,6 +302,29 @@ fun DirectChatScreen(
             },
             dismissButton = {
                 TextButton(onClick = { pendingDelete = null }) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+
+    pendingFolderDelete?.let { group ->
+        AlertDialog(
+            onDismissRequest = { pendingFolderDelete = null },
+            title = { Text("删除文件夹") },
+            text = { Text("删除后，这个文件夹的所有消息会从双方的聊天记录中移除，且无法恢复。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDeleteFolder(group)
+                        pendingFolderDelete = null
+                    }
+                ) {
+                    Text("删除", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingFolderDelete = null }) {
                     Text("取消")
                 }
             }

@@ -3,6 +3,7 @@ package com.zqr.localchat.network
 import android.util.Log
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.Peer
+import com.zqr.localchat.data.withSanitizedFileInfo
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -477,7 +478,7 @@ object GroupMeshManager {
                         if (msg.senderId != link.peerId || !P2PManager.isValidContent(msg.content)) {
                             Log.w(TAG, "drop ${packet.type} on link ${link.peerId}: senderId=${msg.senderId} len=${msg.content.length}")
                         } else {
-                            handleIncoming(state, P2PManager.markFromMe(msg, state.myPeer?.id ?: ""))
+                            handleIncoming(state, P2PManager.markFromMe(msg.withSanitizedFileInfo(), state.myPeer?.id ?: ""))
                         }
                     }
                     "delete_message" -> {
@@ -496,7 +497,7 @@ object GroupMeshManager {
                         // 过滤一致），防止伪造 senderId 注入或超长内容入库
                         val incoming = packet.messages.orEmpty()
                             .filter { it.senderId.isNotBlank() && P2PManager.isValidContent(it.content) }
-                            .map { P2PManager.markFromMe(it, state.myPeer?.id ?: "") }
+                            .map { P2PManager.markFromMe(it.withSanitizedFileInfo(), state.myPeer?.id ?: "") }
                         handleIncoming(state, incoming)
                         // tombstone sync: drop messages deleted while this
                         // member was offline (no author check — the link's
