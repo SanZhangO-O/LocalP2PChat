@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QPushButton
 
 import localchat.network as network_module
 from localchat.models import Peer
@@ -1555,6 +1555,39 @@ class ViewModelFlowTest(unittest.TestCase):
         setup.deleteLater()
         settings.deleteLater()
         members.deleteLater()
+
+    def test_contact_request_buttons_dispatch_request_id(self):
+        """Regression: QPushButton.clicked emits a bool, which PyQt injected
+        into the defaulted `rid` parameter of the request-card lambdas, so
+        accept and ignore both ran with rid=False (no matching request) and
+        the buttons looked dead. Clicking must dispatch the real request id."""
+        from localchat.models import ContactRequest
+        from localchat.ui.member_list_page import MemberListPage, RequestCard
+
+        network_module.TCP_PORT = 10047
+        vm = make_vm(_fresh_db("lc_request_buttons.db"))
+        self._vms = [vm]
+
+        req = ContactRequest(
+            id="dev-42",
+            name="\u7528\u6237",
+            ip="192.168.0.157",
+            port=9999,
+        )
+        calls = []
+        vm.direct_requests_list = lambda: [req]
+        vm.direct_contacts_list = lambda: []
+        vm.accept_contact_request = lambda rid: calls.append(("accept", rid))
+        vm.ignore_contact_request = lambda rid: calls.append(("ignore", rid))
+
+        page = MemberListPage(vm, lambda: None, lambda: None, lambda c: None)
+        card = page.list.findChild(RequestCard)
+        self.assertIsNotNone(card, "request card must be rendered")
+        buttons = {b.text(): b for b in card.findChildren(QPushButton)}
+        buttons["\u63a5\u53d7"].click()
+        buttons["\u5ffd\u7565"].click()
+        self.assertEqual(calls, [("accept", "dev-42"), ("ignore", "dev-42")])
+        page.deleteLater()
 
 
 if __name__ == "__main__":

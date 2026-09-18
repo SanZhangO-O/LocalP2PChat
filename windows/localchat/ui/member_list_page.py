@@ -210,8 +210,8 @@ class MemberListPage(QWidget):
                 item = QListWidgetItem()
                 card = RequestCard(
                     request,
-                    on_accept=lambda rid=request.id: self.vm.accept_contact_request(rid),
-                    on_ignore=lambda rid=request.id: self.vm.ignore_contact_request(rid),
+                    on_accept=lambda checked=False, rid=request.id: self.vm.accept_contact_request(rid),
+                    on_ignore=lambda checked=False, rid=request.id: self.vm.ignore_contact_request(rid),
                 )
                 item.setSizeHint(card.sizeHint())
                 self.list.addItem(item)
