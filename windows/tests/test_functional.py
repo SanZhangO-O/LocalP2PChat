@@ -2031,8 +2031,8 @@ class ViewModelFlowTest(unittest.TestCase):
 
     def test_search_history_resolves_conversation_names(self):
         """VM.search_history covers group AND direct history and resolves the
-        conversation display name each hit belongs to (the search page shows
-        会话名 + 发送者 + 摘要 + 时间)."""
+        conversation display name each hit belongs to (the search page lists
+        conversation + sender + preview + time)."""
         network_module.TCP_PORT = 10052
         vm = make_vm(_fresh_db("lc_search_vm.db"))
         self._vms = [vm]
@@ -2075,7 +2075,7 @@ class ViewModelFlowTest(unittest.TestCase):
         self.assertIn("direct:peer-1", ids)
 
     def test_search_page_click_opens_conversation_and_highlights(self):
-        """Real UI path: member page 搜索 button -> search page -> clicking a
+        """Real UI path: member page search button -> search page -> clicking a
         result opens the chat and flashes the message (delegate.highlight_id)."""
         from localchat.models import ChatMessage
         from localchat.ui.chat_page import MSG_ROLE
@@ -2101,7 +2101,7 @@ class ViewModelFlowTest(unittest.TestCase):
         )
 
         win = MainWindow(vm)
-        # UI wiring: the 搜索 entry lives on the member page header
+        # UI wiring: the search entry lives on the member page header
         self.assertTrue(hasattr(win.pages[PAGE_MEMBERS], "search_btn"))
         win.pages[PAGE_MEMBERS].search_btn.click()
         self.pump()
