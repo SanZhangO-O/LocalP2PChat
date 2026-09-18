@@ -1,9 +1,11 @@
+import os
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from typing import List, Optional
 
+from . import secretbox
 from .models import FILE_KIND_FILE, ChatMessage
 
 
@@ -51,7 +53,58 @@ class ChatStore:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
+        # Chat bodies, last-message previews and group passwords are
+        # encrypted at rest under the installation content key (secretbox):
+        # a stolen database file alone reveals no conversation content.
+        self._data_dir = os.path.dirname(os.path.abspath(db_path)) or "."
         self._init_tables()
+
+    # -------------------------------------------------- at-rest secret layer
+
+    def _enc(self, text: str) -> str:
+        try:
+            return secretbox.protect(self._data_dir, text)
+        except Exception:
+            return text
+
+    def _dec(self, text: str) -> str:
+        try:
+            return secretbox.unprotect(self._data_dir, text)
+        except Exception:
+            return text
+
+    def get_secret(self, key: str, default: str = "") -> str:
+        """A protected settings value ("enc1:..." at rest)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
+        return self._dec(row["value"]) if row is not None else default
+
+    def set_secret(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (key, self._enc(value)),
+            )
+            self._conn.commit()
+
+    def delete_secret(self, key: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            self._conn.commit()
+
+    # Group passwords are join credentials: stored encrypted (get_secret),
+    # never in the plaintext settings namespace.
+
+    def get_group_password(self, group_id: str) -> str:
+        return self.get_secret(f"group_password_{group_id}", "")
+
+    def set_group_password(self, group_id: str, password: str) -> None:
+        self.set_secret(f"group_password_{group_id}", password)
+
+    def delete_group_password(self, group_id: str) -> None:
+        self.delete_secret(f"group_password_{group_id}")
 
     def _init_tables(self) -> None:
         with self._lock:
@@ -190,7 +243,7 @@ class ChatStore:
             host_port=row["hostPort"] if "hostPort" in row.keys() else 0,
             my_name=row["myName"],
             member_count=row["memberCount"],
-            last_message=row["lastMessage"],
+            last_message=self._dec(row["lastMessage"]),
             last_message_time=row["lastMessageTime"],
             created_at=row["createdAt"],
         )
@@ -250,7 +303,8 @@ class ChatStore:
                     merged.host_port,
                     merged.my_name,
                     merged.member_count,
-                    merged.last_message,
+                    # the preview is conversation content: encrypted at rest
+                    self._enc(merged.last_message),
                     merged.last_message_time,
                     merged.created_at,
                 ),
@@ -275,7 +329,9 @@ class ChatStore:
                     (
                         m.id,
                         m.group_id,
-                        m.content,
+                        # message bodies are the sensitive payload: encrypted
+                        # at rest (decrypted transparently on read)
+                        self._enc(m.content),
                         m.timestamp,
                         m.sender_id,
                         m.sender_name,
@@ -301,7 +357,7 @@ class ChatStore:
             SavedMessage(
                 id=r["id"],
                 group_id=r["groupId"],
-                content=r["content"],
+                content=self._dec(r["content"]),
                 timestamp=r["timestamp"],
                 sender_id=r["senderId"],
                 sender_name=r["senderName"],
@@ -330,7 +386,7 @@ class ChatStore:
             SavedMessage(
                 id=r["id"],
                 group_id=r["groupId"],
-                content=r["content"],
+                content=self._dec(r["content"]),
                 timestamp=r["timestamp"],
                 sender_id=r["senderId"],
                 sender_name=r["senderName"],
@@ -381,6 +437,12 @@ class ChatStore:
             self._conn.execute("DELETE FROM saved_messages WHERE groupId = ?", (group_id,))
             self._conn.execute("DELETE FROM deleted_messages WHERE group_id = ?", (group_id,))
             self._conn.execute("DELETE FROM saved_groups WHERE groupId = ?", (group_id,))
+            # the join credential and join id of a removed group must not
+            # linger in the settings table
+            self._conn.execute(
+                "DELETE FROM settings WHERE key IN (?, ?)",
+                (f"group_password_{group_id}", f"group_join_id_{group_id}"),
+            )
             self._conn.commit()
 
     def delete_message(self, group_id: str, message_id: str) -> None:

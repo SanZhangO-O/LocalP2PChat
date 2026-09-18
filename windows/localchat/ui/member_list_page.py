@@ -53,6 +53,12 @@ class RequestCard(QFrame):
         ip_label = QLabel(f"{request.ip}:{request.port}")
         ip_label.setObjectName("faint")
         info.addWidget(ip_label)
+        if request.peer_fingerprint:
+            # out-of-band MITM check: compare against the peer's own 安全码
+            # (settings screen) before accepting a first contact
+            fp_label = QLabel(f"对方安全码: {request.peer_fingerprint}")
+            fp_label.setObjectName("faint")
+            info.addWidget(fp_label)
         hint = QLabel(
             "已移除的成员请求重新添加" if request.from_removed else "请求添加你为成员"
         )

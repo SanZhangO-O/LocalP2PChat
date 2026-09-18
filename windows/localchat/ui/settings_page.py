@@ -150,6 +150,15 @@ class SettingsPage(QWidget):
         self.sig_edit.setMaximumWidth(320)
         self.sig_edit.setMinimumHeight(36)
         sig_layout.addWidget(self.sig_edit)
+        # Server access secret: the deployment's signaling server may require
+        # it (challenge-response HMAC); stored encrypted. Optional when the
+        # server runs without one.
+        self.sig_secret_edit = QLineEdit()
+        self.sig_secret_edit.setPlaceholderText("访问密钥（服务器要求时必填）")
+        self.sig_secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.sig_secret_edit.setMaximumWidth(320)
+        self.sig_secret_edit.setMinimumHeight(36)
+        sig_layout.addWidget(self.sig_secret_edit)
         self.sig_error = QLabel("")
         self.sig_error.setStyleSheet("font-size: 12px; color: #B3261E;")
         self.sig_error.hide()
@@ -196,6 +205,7 @@ class SettingsPage(QWidget):
         self.ip_label.setText(ip if ip else "未连接到网络")
         self.port_edit.setText(str(self.vm.local_port))
         self.sig_edit.setText(self.vm.signaling_server or "")
+        self.sig_secret_edit.setText(self.vm.signaling_secret)
         code = self.vm.security_code
         self.security_label.setText(code if code else "未生成")
         self.copy_security_btn.setEnabled(bool(code))
@@ -234,7 +244,9 @@ class SettingsPage(QWidget):
         self.vm.set_port(int(text))
 
     def _save_signaling_server(self):
-        if self.vm.set_signaling_server(self.sig_edit.text()):
+        if self.vm.set_signaling_server(
+            self.sig_edit.text(), secret=self.sig_secret_edit.text()
+        ):
             self.sig_error.hide()
             Toast(self.window()).show_message("中继服务器设置已保存")
         else:

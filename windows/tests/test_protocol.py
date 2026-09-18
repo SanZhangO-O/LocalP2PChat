@@ -164,8 +164,12 @@ class AndroidClientToPythonHost(ProtocolTestBase):
 
             m1.send(NetworkPacket(type="delete_message", message_id="m-100", sender_id="android-member-1"))
             broadcast = m2.recv()
+            # "seq" is transport metadata stamped by the Wire (replay guard),
+            # not part of the application packet shape
+            broadcast_dict = broadcast.to_dict()
+            broadcast_dict.pop("seq", None)
             self.assertEqual(
-                broadcast.to_dict(),
+                broadcast_dict,
                 NetworkPacket(type="delete_message", message_id="m-100", sender_id="android-member-1").to_dict(),
             )
             self.assertTrue(wait_until(lambda: all(m.id != "m-100" for m in host.messages)))

@@ -27,7 +27,8 @@ import javax.crypto.spec.GCMParameterSpec
  *   password modes (query/join/mesh):
  *     C -> S: hs_start {hsMode, groupId, eph}
  *     S -> C: hs_ack  {eph}
- *     C -> S: hs_confirm {mac}        (omitted when no password is known)
+ *     C -> S: hs_confirm {mac}        (UNCONDITIONAL — even with an empty
+ *                                      password the client sends a MAC of "")
  *     S -> C: hs_ok   {mac} | hs_reject {errorMessage}
  *   direct mode (identity-based, used by direct chats and call media):
  *     C -> S: hs_start  {hsMode="direct", eph, ident}
@@ -36,7 +37,12 @@ import javax.crypto.spec.GCMParameterSpec
  *
  * After a successful handshake EVERY subsequent line on the connection is
  * Base64(nonce || AES-256-GCM(json)) instead of plaintext JSON. Legacy
- * plaintext packets are rejected (no downgrade).
+ * plaintext packets are rejected (no downgrade). Every encrypted packet
+ * carries a per-direction sequence number ("seq", 1,2,3,...) stamped inside
+ * the protected JSON: the receiver accepts only the exact next number, so
+ * replayed, reordered or injected lines always fail — there is no eviction
+ * window a replay could slip through. Relay hops re-stamp on their own
+ * outgoing wire.
  *
  * Key derivation (password modes):
  *   transcript  = mode|groupId|ephClient|ephServer
@@ -124,12 +130,22 @@ class Wire(val lineIn: LineIn, val writer: PrintWriter) {
     @Volatile
     private var key: ByteArray? = null
 
+    /** Per-direction packet sequence numbers (see class doc): send stamps
+     *  1,2,3,... under the write lock; recv requires exactly last+1, so any
+     *  replayed, reordered or injected encrypted line fails even after the
+     *  nonce LRU evicted its nonce. Guarded by [seenNonces]' monitor on
+     *  recv (single read loop) and by the PrintWriter's serialization on
+     *  send. */
+    private var sendSeq: Long = 0
+    private var recvSeq: Long = 0
+
     /** Nonce replay guard: raw 12-byte nonces already seen on THIS
      *  connection, insertion-ordered, oldest evicted past
      *  [NONCE_CACHE_CAPACITY]. AES-GCM forbids nonce reuse, so a repeated
      *  nonce on one connection is a replay (or a broken peer) — the line is
      *  rejected before decryption and the connection treated as dead,
-     *  exactly like a decrypt failure. */
+     *  exactly like a decrypt failure. Defense in depth next to the seq
+     *  guard. */
     private val seenNonces = object : LinkedHashMap<String, Boolean>(1024, 0.75f, false) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>): Boolean =
             size > NONCE_CACHE_CAPACITY
@@ -147,7 +163,13 @@ class Wire(val lineIn: LineIn, val writer: PrintWriter) {
 
     fun sendPacket(packet: NetworkPacket) {
         val k = key ?: throw WireException("wire not secured yet")
-        val json = wireJson.encodeToString(packet)
+        // stamp under the write lock: seq order == wire order (relay hops
+        // forwarding the same packet object get a fresh seq per wire)
+        val stamped = synchronized(seenNonces) {
+            sendSeq += 1
+            packet.copy(seq = sendSeq)
+        }
+        val json = wireJson.encodeToString(stamped)
         val line = Crypto.toB64(Crypto.aesGcmEncrypt(k, json.toByteArray(Charsets.UTF_8)))
         if (line.length > P2PManager.MAX_LINE_LENGTH) throw WireException("encrypted line exceeds cap")
         writer.println(line)
@@ -155,7 +177,8 @@ class Wire(val lineIn: LineIn, val writer: PrintWriter) {
     }
 
     /** Decrypted packet, or null at stream end. Throws [WireException] on
-     *  tampering / wrong key — callers must treat that as a dead connection. */
+     *  tampering / wrong key / sequence violation — callers must treat that
+     *  as a dead connection. */
     fun recvPacket(): NetworkPacket? {
         val line = lineIn.readLine() ?: return null
         if (line.isEmpty()) return null
@@ -175,8 +198,19 @@ class Wire(val lineIn: LineIn, val writer: PrintWriter) {
         } catch (e: Exception) {
             throw WireException("decrypt failed (tampered or wrong key)", e)
         }
-        return runCatching { wireJson.decodeFromString<NetworkPacket>(plain.toString(Charsets.UTF_8)) }
+        val packet = runCatching { wireJson.decodeFromString<NetworkPacket>(plain.toString(Charsets.UTF_8)) }
             .getOrElse { throw WireException("malformed packet JSON", it) }
+        synchronized(seenNonces) {
+            val expected = recvSeq + 1
+            if (packet.seq != expected) {
+                Log.w(TAG, "packet sequence violation (got ${packet.seq}, want $expected)")
+                throw WireException(
+                    "packet sequence violation (replayed, reordered or injected)"
+                )
+            }
+            recvSeq = packet.seq
+        }
+        return packet
     }
 
     // ---- handshake-phase plaintext IO (never used once activate() ran) ----

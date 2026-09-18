@@ -31,6 +31,7 @@ import com.zqr.localchat.MainActivity
 import com.zqr.localchat.NotificationDismissReceiver
 import com.zqr.localchat.call.CallManager
 import com.zqr.localchat.crypto.Crypto
+import com.zqr.localchat.crypto.StoreCipher
 import com.zqr.localchat.data.ChatDao
 import com.zqr.localchat.data.ChatDatabase
 import com.zqr.localchat.data.ChatMessage
@@ -593,15 +594,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             DirectChatManager.seedMessages(
                 peerId,
                 saved.map { sm ->
+                    val plain = sm.withPlainContent()
                     ChatMessage(
-                        id = sm.id,
-                        content = sm.content,
-                        timestamp = sm.timestamp,
-                        senderId = sm.senderId,
-                        senderName = sm.senderName,
-                        isFromMe = sm.isFromMe,
-                        fileInfo = restoredFileInfo(sm),
-                        pending = sm.pending
+                        id = plain.id,
+                        content = plain.content,
+                        timestamp = plain.timestamp,
+                        senderId = plain.senderId,
+                        senderName = plain.senderName,
+                        isFromMe = plain.isFromMe,
+                        fileInfo = restoredFileInfo(plain),
+                        pending = plain.pending
                     )
                 }
             )
@@ -637,7 +639,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                     SavedChatMessage(
                                         id = msg.id,
                                         groupId = "direct:$peerId",
-                                        content = msg.content,
+                                        content = StoreCipher.protect(msg.content),
                                         timestamp = msg.timestamp,
                                         senderId = msg.senderId,
                                         senderName = msg.senderName,
@@ -1150,14 +1152,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     p2p != null -> p2p.messages
                     gid != null -> chatDao.getMessagesForGroup(gid).map { rows ->
                         rows.map { sm ->
+                            val plain = sm.withPlainContent()
                             ChatMessage(
-                                id = sm.id,
-                                content = sm.content,
-                                timestamp = sm.timestamp,
-                                senderId = sm.senderId,
-                                senderName = sm.senderName,
-                                isFromMe = sm.isFromMe,
-                                fileInfo = restoredFileInfo(sm)
+                                id = plain.id,
+                                content = plain.content,
+                                timestamp = plain.timestamp,
+                                senderId = plain.senderId,
+                                senderName = plain.senderName,
+                                isFromMe = plain.isFromMe,
+                                fileInfo = restoredFileInfo(plain)
                             )
                         }
                     }
@@ -1548,9 +1551,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      */
     private suspend fun upsertGroup(group: SavedGroup) {
         if (group.groupId in removedGroupIds) return
-        val old = chatDao.getGroup(group.groupId)
+        // lastMessage is conversation content: stored Keystore-encrypted at
+        // rest, decrypted on load — so the summary logic works on plaintext
+        // and everything written back to the DB is protected.
+        val old = chatDao.getGroup(group.groupId)?.let { it.copy(lastMessage = StoreCipher.unprotect(it.lastMessage)) }
+        val persistedSummary = StoreCipher.protect(group.lastMessage)
         if (old == null) {
-            chatDao.insertGroup(group)
+            chatDao.insertGroup(group.copy(lastMessage = persistedSummary))
         } else {
             // The last-message summary must never move BACKWARDS: concurrent
             // summary writes can land out of order, and without this an older
@@ -1564,7 +1571,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 hostPort = if (group.hostPort > 0) group.hostPort else old.hostPort,
                 myName = group.myName.ifEmpty { old.myName },
                 memberCount = group.memberCount,
-                lastMessage = if (keepOldSummary) old.lastMessage else group.lastMessage,
+                lastMessage = if (keepOldSummary) StoreCipher.protect(old.lastMessage) else persistedSummary,
                 lastMessageTime = if (keepOldSummary) old.lastMessageTime else group.lastMessageTime
             )
         }
@@ -1581,12 +1588,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      *  bubble renders it as "已过期" instead of offering a download that can
      *  no longer succeed; the sender can re-share the file for a fresh
      *  address. The kind is preserved so image/video messages keep rendering
-     *  inline (from their local media copy) across restarts. */
+     *  inline (from their local media copy) across restarts.
+     *
+     *  Callers must pass a row whose content is already decrypted (see
+     *  [withPlainContent]): the body doubles as the file display name. */
     private fun restoredFileInfo(sm: SavedChatMessage): FileInfo? {
         if (sm.fileSize <= 0 && sm.downloadHost.isEmpty()) return null
         // blank the address for every restored offer, own or received
         return FileInfo(sm.id, sm.content, sm.fileSize, "", 0, kind = sm.kind)
     }
+
+    /** DB boundary for message bodies: persisted rows carry the content
+     *  Keystore-encrypted ("enc1:...", see [StoreCipher]); decryption happens
+     *  exactly here, on the read path. */
+    private fun SavedChatMessage.withPlainContent(): SavedChatMessage =
+        copy(content = StoreCipher.unprotect(content))
 
     private fun loadPersistedGroups() {
         viewModelScope.launch(Dispatchers.IO) {
@@ -1609,7 +1625,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 hostIp = sg.hostIp,
                                 hostPort = if (sg.isHost) currentPort else sg.hostPort,
                                 memberCount = sg.memberCount,
-                                lastMessage = sg.lastMessage,
+                                lastMessage = StoreCipher.unprotect(sg.lastMessage),
                                 lastMessageTime = sg.lastMessageTime,
                                 muted = ChatApp.isGroupMuted(getApplication(), sg.groupId)
                             )
@@ -1648,7 +1664,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             for (sg in directGroups) {
                 val peerId = sg.groupId.removePrefix("direct:")
                 val msgs = chatDao.getMessagesForGroup(sg.groupId).first()
-                val last = msgs.lastOrNull() ?: continue
+                val last = msgs.lastOrNull()?.withPlainContent() ?: continue
                 DirectChatManager.seedLastMessage(
                     peerId,
                     ChatMessage(
@@ -1668,14 +1684,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     DirectChatManager.restorePending(
                         groupId.removePrefix("direct:"),
                         rows.map { sm ->
+                            val plain = sm.withPlainContent()
                             ChatMessage(
-                                id = sm.id,
-                                content = sm.content,
-                                timestamp = sm.timestamp,
-                                senderId = sm.senderId,
-                                senderName = sm.senderName,
-                                isFromMe = sm.isFromMe,
-                                fileInfo = restoredFileInfo(sm),
+                                id = plain.id,
+                                content = plain.content,
+                                timestamp = plain.timestamp,
+                                senderId = plain.senderId,
+                                senderName = plain.senderName,
+                                isFromMe = plain.isFromMe,
+                                fileInfo = restoredFileInfo(plain),
                                 pending = true
                             )
                         }
@@ -1719,14 +1736,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 persistedMessageIds[groupId] = fresh.map { it.id }.toMutableSet()
                 if (fresh.isNotEmpty()) {
                     val msgs = fresh.map { sm ->
+                        val plain = sm.withPlainContent()
                         ChatMessage(
-                            id = sm.id,
-                            content = sm.content,
-                            timestamp = sm.timestamp,
-                            senderId = sm.senderId,
-                            senderName = sm.senderName,
-                            isFromMe = sm.isFromMe,
-                            fileInfo = restoredFileInfo(sm)
+                            id = plain.id,
+                            content = plain.content,
+                            timestamp = plain.timestamp,
+                            senderId = plain.senderId,
+                            senderName = plain.senderName,
+                            isFromMe = plain.isFromMe,
+                            fileInfo = restoredFileInfo(plain)
                         )
                     }
                     p2p.replaySavedMessages(msgs)
@@ -2331,7 +2349,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                     SavedChatMessage(
                                         id = msg.id,
                                         groupId = groupId,
-                                        content = msg.content,
+                                        content = StoreCipher.protect(msg.content),
                                         timestamp = msg.timestamp,
                                         senderId = msg.senderId,
                                         senderName = msg.senderName,

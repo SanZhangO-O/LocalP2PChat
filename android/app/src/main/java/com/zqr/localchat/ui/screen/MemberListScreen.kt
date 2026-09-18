@@ -348,6 +348,16 @@ private fun RequestItem(
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    if (request.peerFingerprint.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        // out-of-band MITM check: compare against the peer's
+                        // own 安全码 (settings screen) before accepting
+                        Text(
+                            text = "对方安全码: ${request.peerFingerprint}",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
                         text = if (request.fromRemoved) "已移除的成员请求重新添加" else "请求添加你为成员",

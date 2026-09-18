@@ -18,6 +18,8 @@
 密码，假地址配对建立不了会话。
 """
 
+import hashlib
+import hmac
 import json
 import socket
 import threading
@@ -26,8 +28,14 @@ from typing import Optional, Tuple
 
 from .models import MAX_LINE_LENGTH
 
-SIGNALING_PROTO = 1
+SIGNALING_PROTO = 2
 DEFAULT_SIGNALING_PORT = 25000
+
+# Proof message for the server access secret (see signaling_server.py): the
+# server challenges with a fresh nonce, the client answers HMAC-SHA256(
+# secret, "lc-sig-auth-v1|" + nonce). An eavesdropped proof cannot be reused
+# (fresh nonce per connection), and the secret itself never crosses the wire.
+AUTH_MSG_PREFIX = "lc-sig-auth-v1|"
 
 # 打洞总时长：双方重试循环必须重叠，任何一方过早放弃都会让另一方的
 # SYN 永远等不到回应。
@@ -73,10 +81,33 @@ def parse_server_endpoint(text: str) -> Tuple[Optional[str], int]:
     return host, port
 
 
-class _Link:
-    """One control connection to the signaling server (JSON lines)."""
+def auth_proof(secret: str, nonce: str) -> str:
+    """Hex HMAC-SHA256 over prefix + server nonce under the access secret."""
+    return hmac.new(
+        secret.encode("utf-8"),
+        (AUTH_MSG_PREFIX + nonce).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
-    def __init__(self, server_host: str, server_port: int, timeout: float = 10.0):
+
+class _Link:
+    """One control connection to the signaling server (JSON lines).
+
+    Connection setup is a challenge-response authentication: hello(proto) ->
+    server challenge nonce -> auth proof (HMAC under the deployment access
+    secret) -> welcome. Without a valid proof the server never registers or
+    matches anything, so a third party cannot pair against a group, harvest
+    endpoints or consume relay slots. A secret can be disabled with an empty
+    string ONLY when the server itself was started without one.
+    """
+
+    def __init__(
+        self,
+        server_host: str,
+        server_port: int,
+        timeout: float = 10.0,
+        secret: str = "",
+    ):
         self.sock = socket.create_connection((server_host, server_port), timeout=timeout)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock.settimeout(timeout)
@@ -86,9 +117,16 @@ class _Link:
         self.local_port = self.sock.getsockname()[1]
         self.my_endpoint: Optional[Tuple[str, int]] = None
         self._send({"type": "hello", "proto": SIGNALING_PROTO})
+        challenge = self._recv(timeout)
+        if challenge is None or challenge.get("type") != "challenge":
+            raise PunchError("信令服务器响应无效")
+        nonce = str(challenge.get("nonce") or "")
+        if not nonce or not secret:
+            raise PunchError("服务器需要访问密钥")
+        self._send({"type": "auth", "proof": auth_proof(secret, nonce)})
         welcome = self._recv(timeout)
         if welcome is None or welcome.get("type") != "welcome":
-            raise PunchError("信令服务器响应无效")
+            raise PunchError("信令服务器认证失败")
         try:
             self.my_endpoint = (str(welcome["ip"]), int(welcome["port"]))
         except (KeyError, TypeError, ValueError):
@@ -179,6 +217,7 @@ def punch_connect(
     client_id: str,
     nick: str,
     punch_timeout: float = PUNCH_TIMEOUT,
+    secret: str = "",
 ) -> socket.socket:
     """Establish the cross-NAT data socket for [group_id] (numeric join id).
 
@@ -187,7 +226,7 @@ def punch_connect(
     signaling server cannot pair the peers or every path (punch and relay)
     fails.
     """
-    link = _Link(server_host, server_port)
+    link = _Link(server_host, server_port, secret=secret)
     try:
         link._send(
             {
@@ -217,7 +256,7 @@ def punch_connect(
     punched = _punch_loop(peer_endpoint, local_port, time.monotonic() + punch_timeout)
 
     # Report the outcome and wait for the server's decision.
-    rlink = _Link(server_host, server_port)
+    rlink = _Link(server_host, server_port, secret=secret)
     try:
         rlink._send(
             {"type": "punch_result", "session": session, "role": role, "ok": punched is not None}
@@ -288,10 +327,13 @@ class SignalingHostBridge:
     RECONNECT_DELAY = 3.0
     IDLE_POLL = 0.5
 
-    def __init__(self, server_host: str, server_port: int, host_server):
+    def __init__(
+        self, server_host: str, server_port: int, host_server, secret: str = ""
+    ):
         self._server_host = server_host
         self._server_port = server_port
         self._host_server = host_server
+        self._secret = secret
         self._stop = False
         self._thread: Optional[threading.Thread] = None
         self._groups_dirty = threading.Event()
@@ -320,7 +362,7 @@ class SignalingHostBridge:
     def _run(self) -> None:
         while not self._stop:
             try:
-                link = _Link(self._server_host, self._server_port)
+                link = _Link(self._server_host, self._server_port, secret=self._secret)
             except (OSError, PunchError):
                 if self._stop:
                     return
@@ -395,7 +437,7 @@ class SignalingHostBridge:
         )
         rlink = None
         try:
-            rlink = _Link(self._server_host, self._server_port)
+            rlink = _Link(self._server_host, self._server_port, secret=self._secret)
             rlink._send(
                 {
                     "type": "punch_result",

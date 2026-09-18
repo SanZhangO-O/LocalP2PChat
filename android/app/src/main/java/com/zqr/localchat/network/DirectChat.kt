@@ -219,7 +219,9 @@ object DirectChatManager {
     /** An incoming contact request parked for the user to accept or ignore.
      *  [fromRemoved] marks a request from a member the local user removed
      *  (its re-add attempts must stay visible too — nothing is dropped
-     *  silently). */
+     *  silently). [peerFingerprint] is the dialer's identity-key 安全码
+     *  proven by the secured handshake — shown in the request card so the
+     *  user can verify it out-of-band before accepting. */
     @Serializable
     data class ContactRequest(
         val id: String,
@@ -227,7 +229,8 @@ object DirectChatManager {
         val ip: String,
         val port: Int,
         val fromRemoved: Boolean = false,
-        val timestamp: Long = 0L
+        val timestamp: Long = 0L,
+        val peerFingerprint: String = ""
     )
 
     /** Box capacity: a LAN scanner hammering the port must not be able to
@@ -521,14 +524,15 @@ object DirectChatManager {
      *  must not stack two rows); only a NEW entry raises the user-facing
      *  event, so a peer's presence sweep re-dialing every minute cannot
      *  toast in a loop. */
-    fun recordContactRequest(peer: Peer, fromRemoved: Boolean) {
+    fun recordContactRequest(peer: Peer, fromRemoved: Boolean, peerFingerprint: String = "") {
         val entry = ContactRequest(
             id = peer.id,
             name = peer.name,
             ip = peer.ipAddress,
             port = peer.port,
             fromRemoved = fromRemoved,
-            timestamp = System.currentTimeMillis()
+            timestamp = System.currentTimeMillis(),
+            peerFingerprint = peerFingerprint
         )
         fun sameBoxSlot(other: ContactRequest) =
             other.id == entry.id || (other.ip == entry.ip && other.port == entry.port)
@@ -793,7 +797,11 @@ object DirectChatManager {
         val known = _contacts.value.containsKey(peer.id) ||
             _contacts.value.any { (_, c) -> c.ip == peer.ipAddress && c.port == peer.port }
         if (removed || !known) {
-            recordContactRequest(peer, fromRemoved = removed)
+            recordContactRequest(
+                peer,
+                fromRemoved = removed,
+                peerFingerprint = peerIdent?.let { DeviceIdentity.peerFingerprint(it) } ?: ""
+            )
             runCatching { wire.sendPacket(NetworkPacket(type = Protocol.DIRECT_PENDING)) }
             closeSocket(socket)
             return

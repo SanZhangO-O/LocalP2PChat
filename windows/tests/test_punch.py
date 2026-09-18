@@ -33,6 +33,7 @@ from server.signaling_server import SignalingServer
 from localchat.network import HostGroupServer, P2PListener, P2PManager
 
 PASSWORD = "pass123"
+SECRET = "test-deployment-secret"
 HOST_NAME = "\u4e3b\u673aA"  # 主机A
 GROUP_NAME = "\u7fa4X"  # 群X
 
@@ -57,7 +58,7 @@ def wait_until(cond, timeout=25.0):
 
 class PunchJoinTest(unittest.TestCase):
     def setUp(self):
-        self.sig = SignalingServer(0)
+        self.sig = SignalingServer(0, secret=SECRET)
         self.sig.start()
         self.cleanup = []
 
@@ -77,7 +78,7 @@ class PunchJoinTest(unittest.TestCase):
         host.initialize_as_host(HOST_NAME, GROUP_NAME, password=PASSWORD)
         host.set_join_id(host.numeric_group_id)
         host.start_as_host()
-        server.enable_signaling("127.0.0.1", self.sig.port)
+        server.enable_signaling("127.0.0.1", self.sig.port, secret=SECRET)
         self.cleanup.append(server.shutdown)
         self.cleanup.append(host.stop)
         return server, host
@@ -89,10 +90,10 @@ class PunchJoinTest(unittest.TestCase):
         member.initialize_as_client("\u6210\u5458B", "", PASSWORD)  # 成员B
         member.set_join_id(host.numeric_group_id)
         if punch_timeout is None:
-            member.confirm_join_via_server("127.0.0.1", self.sig.port)
+            member.confirm_join_via_server("127.0.0.1", self.sig.port, secret=SECRET)
         else:
             member.confirm_join_via_server(
-                "127.0.0.1", self.sig.port, punch_timeout=punch_timeout
+                "127.0.0.1", self.sig.port, punch_timeout=punch_timeout, secret=SECRET
             )
         self.assertTrue(
             wait_until(lambda: member.connection_result is not None),
@@ -158,7 +159,9 @@ class PunchJoinTest(unittest.TestCase):
         self.cleanup.append(member.stop)
         member.initialize_as_client("\u8def\u4eba", "", "wrongpassword")  # 路人
         member.set_join_id(host.numeric_group_id)
-        member.confirm_join_via_server("127.0.0.1", self.sig.port, punch_timeout=0.01)
+        member.confirm_join_via_server(
+            "127.0.0.1", self.sig.port, punch_timeout=0.01, secret=SECRET
+        )
         self.assertTrue(
             wait_until(lambda: member.connection_result is not None),
             "join attempt must finish",
@@ -180,7 +183,9 @@ class PunchJoinTest(unittest.TestCase):
         old_wait = punch_module.MATCH_WAIT
         punch_module.MATCH_WAIT = 3.0
         try:
-            member.confirm_join_via_server("127.0.0.1", self.sig.port, punch_timeout=0.01)
+            member.confirm_join_via_server(
+                "127.0.0.1", self.sig.port, punch_timeout=0.01, secret=SECRET
+            )
             self.assertTrue(
                 wait_until(lambda: member.connection_result is not None, timeout=30.0),
                 "unmatched join must fail, not hang",
@@ -189,6 +194,25 @@ class PunchJoinTest(unittest.TestCase):
             punch_module.MATCH_WAIT = old_wait
         ok, message = member.connection_result
         self.assertFalse(ok, message)
+
+    def test_wrong_secret_never_pairs(self):
+        """A client without the access secret is rejected at the auth gate:
+        the join fails fast with the auth error and the host never sees any
+        pairing (no endpoint disclosure, no relay slot consumed)."""
+        server, host = self._make_host(19663)
+        member = P2PManager(Rec(), port=19664)
+        self.cleanup.append(member.stop)
+        member.initialize_as_client("\u8def\u4eba", "", PASSWORD)  # 路人
+        member.set_join_id(host.numeric_group_id)
+        member.confirm_join_via_server("127.0.0.1", self.sig.port, secret="wrong-secret")
+        self.assertTrue(
+            wait_until(lambda: member.connection_result is not None),
+            "auth failure must surface as a join failure",
+        )
+        ok, message = member.connection_result
+        self.assertFalse(ok, message)
+        self.assertIn("\u8ba4\u8bc1", message)  # 认证
+        self.assertEqual(host.peers, {}, "the host must stay invisible to the client")
 
 
 if __name__ == "__main__":

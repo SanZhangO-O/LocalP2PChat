@@ -12,21 +12,30 @@
      连接变成原始字节管道（中继模式），转发端到端加密的 LocalChat
      协议流 —— 服务器只看到密文。
 
-协议：TCP 上的 UTF-8 JSON 行（\n 结尾），客户端 -> 服务器：
+访问认证（协议 v2）：每条控制连接必须先通过质询-应答认证才允许注册：
 
-  {"type":"hello","proto":1}                      必须是第一条
+  C -> {"type":"hello","proto":2}
+  S -> {"type":"challenge","nonce":"<32字节hex>"}
+  C -> {"type":"auth","proof":"hex(HMAC-SHA256(secret, "lc-sig-auth-v1|" + nonce))"}
+  S -> {"type":"welcome","ip":..,"port":..}     认证失败则回 error 并断开
+
+访问密钥来源（按优先级）：--secret 参数 > 环境变量
+LOCALCHAT_SIGNALING_SECRET > 启动时随机生成并打印一次。没有密钥的客户端
+无法注册、配对或占用中继资源；证明一次性（fresh nonce），密钥永不上线。
+
+认证之后的协议（客户端 -> 服务器）：
+
   {"type":"host","groupId":"12345678",...}        主机 armed 等待成员
   {"type":"member","groupId":"12345678",...}      成员等待匹配
-  （同一条连接可重复发 host/member 注册多个 groupId：role 只取第一次
-    出现的 host 或 member，重复的 (role, groupId) 幂等；旧客户端只发
-    一个 groupId，行为不变。）
+  （同一条连接可重复发 host/member 注册多个 groupId（上限
+    MAX_GROUPS_PER_CONN）：role 只取第一次出现的 host 或 member，重复的
+    (role, groupId) 幂等。）
   {"type":"punch_result","session":..,"ok":bool,"role":"host"|"member"}
   {"type":"relay_request","session":..,"role":..} 单侧打洞失败强制中继
   {"type":"pong"}                                  心跳应答
 
 服务器 -> 客户端：
 
-  {"type":"welcome","ip":..,"port":..}   你的公网映射地址（打洞要用）
   {"type":"ping"}                         控制阶段心跳
   {"type":"matched","session":..,"groupId":..,"peer":{"ip","port","role","id","nick"}}
   {"type":"use_punch"}                    双方（或单方重试后）直连成功
@@ -36,19 +45,25 @@
 匹配成功后双方按角色运行 LocalChat 既有的加密握手（密码绑定的
 ECDH），服务器无法解密任何业务流量；它只互换地址。
 
-运行：  python3 signaling_server.py [端口]     （默认 25000）
+运行：  python3 signaling_server.py [端口] [--secret <访问密钥>]
+        （默认端口 25000）
 """
 
+import hashlib
+import hmac
 import json
 import logging
+import os
+import secrets as pysecrets
 import socket
 import sys
 import threading
 import time
 import uuid
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 DEFAULT_PORT = 25000
+AUTH_MSG_PREFIX = "lc-sig-auth-v1|"
 
 MAX_LINE = 128 * 1024  # must cover the app's 64 KiB line cap (relayed app traffic)
 HELLO_TIMEOUT = 10.0
@@ -65,8 +80,20 @@ MAX_PER_IP = 32
 MAX_GROUP_LEN = 64
 MAX_ID_LEN = 64
 MAX_NICK_LEN = 64
+# One control connection may register at most this many groupIds: a hostile
+# client must not be able to grow the _hosts/_waiting maps without bound on
+# a single connection.
+MAX_GROUPS_PER_CONN = 32
 
 log = logging.getLogger("signaling")
+
+
+def auth_proof(secret: str, nonce: str) -> str:
+    return hmac.new(
+        secret.encode("utf-8"),
+        (AUTH_MSG_PREFIX + nonce).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _valid_group_id(value) -> bool:
@@ -143,9 +170,20 @@ class Session:
 
 
 class SignalingServer:
-    def __init__(self, port: int = DEFAULT_PORT, bind: str = "0.0.0.0"):
+    def __init__(self, port: int = DEFAULT_PORT, bind: str = "0.0.0.0", secret: str = None):
         self.port = port
         self.bind = bind
+        # Access secret: --secret arg > env > autogenerate (logged once).
+        if secret is None:
+            secret = os.environ.get("LOCALCHAT_SIGNALING_SECRET", "") or ""
+        if not secret:
+            secret = pysecrets.token_hex(32)
+            log.warning(
+                "no --secret given: GENERATED an access secret (clients must "
+                "use it to register):\n  %s",
+                secret,
+            )
+        self.secret = secret
         self._sock: socket.socket = None
         self._stop = False
         self._lock = threading.RLock()
@@ -255,12 +293,38 @@ class SignalingServer:
         return None
 
     def _dispatch_hello(self, conn: ClientConn, line: str) -> bool:
+        """Authentication gate: hello(proto) -> challenge -> auth proof ->
+        welcome. Only a client that proves the access secret gets a welcome;
+        everyone else is dropped before they can register, match or relay."""
         try:
             msg = json.loads(line)
         except ValueError:
             return False
         if msg.get("type") != "hello" or msg.get("proto") != PROTOCOL_VERSION:
             conn.send_json({"type": "error", "errorMessage": "protocol mismatch"})
+            return False
+        nonce = pysecrets.token_hex(32)
+        if not conn.send_json({"type": "challenge", "nonce": nonce}):
+            return False
+        conn.sock.settimeout(HELLO_TIMEOUT)
+        proof_line = self._read_line(conn.sock)
+        if proof_line is None:
+            return False
+        try:
+            auth = json.loads(proof_line)
+        except ValueError:
+            return False
+        provided = auth.get("proof") if isinstance(auth, dict) else None
+        if (
+            auth.get("type") != "auth"
+            or not isinstance(provided, str)
+            or not hmac.compare_digest(
+                provided.encode("utf-8"),
+                auth_proof(self.secret, nonce).encode("utf-8"),
+            )
+        ):
+            log.warning("auth failed from %s", conn.ip)
+            conn.send_json({"type": "error", "errorMessage": "authentication failed"})
             return False
         if not conn.send_json(
             {"type": "welcome", "ip": conn.endpoint[0], "port": conn.endpoint[1]}
@@ -292,6 +356,9 @@ class SignalingServer:
             return False
         if conn.role is not None and conn.role != role:
             return True  # one role per connection: host and member never mix
+        if group_id not in conn.groups and len(conn.groups) >= MAX_GROUPS_PER_CONN:
+            conn.send_json({"type": "error", "errorMessage": "too many groups"})
+            return False
         client_id = _clip(msg.get("clientId"), MAX_ID_LEN)
         nick = _clip(msg.get("nick"), MAX_NICK_LEN)
         with self._lock:
@@ -582,13 +649,24 @@ class SignalingServer:
 def main(argv):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     port = DEFAULT_PORT
-    if len(argv) > 1:
+    secret = None
+    args = list(argv[1:])
+    i = 0
+    positional = []
+    while i < len(args):
+        if args[i] == "--secret" and i + 1 < len(args):
+            secret = args[i + 1]
+            i += 2
+            continue
+        positional.append(args[i])
+        i += 1
+    if positional:
         try:
-            port = int(argv[1])
+            port = int(positional[0])
         except ValueError:
-            print(f"invalid port: {argv[1]}", file=sys.stderr)
+            print(f"invalid port: {positional[0]}", file=sys.stderr)
             return 2
-    server = SignalingServer(port)
+    server = SignalingServer(port, secret=secret)
     try:
         server.start()
     except OSError as e:

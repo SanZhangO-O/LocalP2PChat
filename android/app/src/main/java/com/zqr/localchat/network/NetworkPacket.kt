@@ -52,7 +52,11 @@ data class NetworkPacket(
     val sig: String? = null,
     /** file_download request: Base64(HMAC-SHA256(fileKey, "lc-file-dl-v1:"
      *  + fileId)) — proves the downloader knows the per-file key (see
-     *  [FileTransfer.downloadToken]). Null is omitted on the wire; old
-     *  senders tolerate (ignore) the unknown field. */
-    val token: String? = null
+     *  [FileTransfer.downloadToken]). Mandatory on every request. */
+    val token: String? = null,
+    /** Wire-session sequence number: stamped by [Wire.sendPacket] (per
+     *  direction, strictly 1,2,3,...) INSIDE the GCM-protected JSON, so the
+     *  receiver can reject replayed/reordered/injected lines. Never set by
+     *  application code; null is omitted on the wire. */
+    val seq: Long? = null
 )

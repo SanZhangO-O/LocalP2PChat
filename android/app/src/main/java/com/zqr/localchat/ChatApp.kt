@@ -113,13 +113,22 @@ class ChatApp : Application() {
 
         private fun passwordKey(groupId: String) = "group_password_$groupId"
 
+        /** The group password is a join credential: stored Keystore-wrapped
+         *  ("enc1:...", see [com.zqr.localchat.crypto.StoreCipher]) so the
+         *  plaintext never sits in the prefs file. */
         fun savedGroupPassword(ctx: Context, groupId: String): String =
-            ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE).getString(passwordKey(groupId), "") ?: ""
+            com.zqr.localchat.crypto.StoreCipher.unprotect(
+                ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE)
+                    .getString(passwordKey(groupId), "") ?: ""
+            )
 
         fun saveGroupPassword(ctx: Context, groupId: String, password: String) {
             ctx.getSharedPreferences(PREF_NAME, MODE_PRIVATE)
                 .edit()
-                .putString(passwordKey(groupId), password)
+                .putString(
+                    passwordKey(groupId),
+                    com.zqr.localchat.crypto.StoreCipher.protect(password)
+                )
                 .apply()
         }
 

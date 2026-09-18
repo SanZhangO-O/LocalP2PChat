@@ -202,6 +202,8 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # configured, hosted groups are announced there and members on other
         # NAT segments can join by the numeric id alone (punch or relay).
         self._signaling_server: str = ""
+        # Server access secret (challenge-response HMAC; stored encrypted).
+        self._signaling_secret: str = self.store.get_secret("signaling_secret", "")
         self._apply_signaling_setting(
             self.store.get_setting("signaling_server", "") or "", persist=False
         )
@@ -314,9 +316,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             candidates = list(self.group_p2p_map.values())
         for candidate in candidates:
             if not candidate.is_host and candidate.join_id == group_id:
-                return self.store.get_setting(
-                    f"group_password_{candidate.current_group_id}", ""
-                )
+                return self.store.get_group_password(candidate.current_group_id)
         return None
 
     def _on_raw_tray(self, gid: str, sender_name: str, body: str) -> None:
@@ -942,9 +942,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             seen[peer.id] = peer
         # the group password authenticates mesh handshakes: only members who
         # know it may link and read the group's history
-        password = p2p.group_password or self.store.get_setting(
-            f"group_password_{group_id}", ""
-        )
+        password = p2p.group_password or self.store.get_group_password(group_id)
         self.mesh.enter_group(
             group_id, my_peer, list(seen.values()), list(p2p.messages), password
         )
@@ -1370,7 +1368,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         if old is not None:
             self.call_manager.end_if_on(old, "通话已结束")
             old.stop()
-        self.store.set_setting(f"group_password_{group_id}", password)
+        self.store.set_group_password(group_id, password)
         self.group_p2p_map[group_id] = p2p
         # a fresh group has no saved history to replay, so this instance may
         # mirror deletes right away (replay_done holds "the instance whose
@@ -1486,26 +1484,38 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         """The configured signaling/relay server endpoint ('' = off)."""
         return self._signaling_server
 
-    def set_signaling_server(self, text: str) -> bool:
+    @property
+    def signaling_secret(self) -> str:
+        """The server access secret paired with [signaling_server]."""
+        return self._signaling_secret
+
+    def set_signaling_server(self, text: str, secret: str = "") -> bool:
         """Enable/disable cross-NAT joining. Returns False (with a status
         toast) when the endpoint is malformed; the previous setting stays
-        active in that case."""
+        active in that case. [secret] is the deployment's server access
+        secret — required when the server was started with one."""
         text = (text or "").strip()
         if text:
             host, port = parse_server_endpoint(text)
             if host is None:
                 self.status_message.emit("服务器地址无效（格式：IP或域名:端口）")
                 return False
-        self._apply_signaling_setting(text)
+        self._apply_signaling_setting(text, secret=(secret or "").strip())
         self.status_message.emit(
             "已启用中继服务器" if text else "已关闭中继服务器"
         )
         return True
 
-    def _apply_signaling_setting(self, text: str, persist: bool = True) -> None:
+    def _apply_signaling_setting(
+        self, text: str, persist: bool = True, secret: Optional[str] = None
+    ) -> None:
         text = (text or "").strip()
         if persist:
             self.store.set_setting("signaling_server", text)
+        if secret is not None:
+            self._signaling_secret = secret
+            # the access secret is a credential: encrypted at rest
+            self.store.set_secret("signaling_secret", secret)
         self._signaling_server = text
         if not text:
             self.host_server.disable_signaling()
@@ -1514,7 +1524,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         if host is None:
             self.host_server.disable_signaling()
             return
-        self.host_server.enable_signaling(host, port)
+        self.host_server.enable_signaling(host, port, secret=self._signaling_secret)
 
     def join_via_server(
         self,
@@ -1557,7 +1567,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.pending_group_id = None
         p2p.clear_query_state()
         p2p.clear_join_result()
-        p2p.confirm_join_via_server(host, port)
+        p2p.confirm_join_via_server(host, port, secret=self._signaling_secret)
 
     def cancel_join(self) -> None:
         self._stop_pending_p2p()
@@ -1592,7 +1602,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             return
         if meta.is_host:
             nick = meta.my_name or "用户"
-            password = self.store.get_setting(f"group_password_{group_id}", "") or None
+            password = self.store.get_group_password(group_id) or None
             new_p2p = P2PManager(
                 self,
                 port=self.port,
@@ -1643,7 +1653,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         p2p.initialize_as_client(
             sg.my_name or "用户",
             sg.group_name,
-            self.store.get_setting(f"group_password_{group_id}", "") or None,
+            self.store.get_group_password(group_id) or None,
         )
         p2p.set_join_id(join_id)
         self.pending_p2p = p2p
@@ -1902,7 +1912,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.active_is_host = p2p.is_host
         self.active_my_name = p2p.my_name
         self.active_group_password = (
-            self.store.get_setting(f"group_password_{group_id}", "") if p2p.is_host else ""
+            self.store.get_group_password(group_id) if p2p.is_host else ""
         )
         meta = self._find_group(group_id)
         if meta is not None:
@@ -2160,7 +2170,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                     )
                 )
                 if p2p.group_password:
-                    self.store.set_setting(f"group_password_{gid}", p2p.group_password)
+                    self.store.set_group_password(gid, p2p.group_password)
                 if p2p.join_id:
                     self.store.set_setting(f"group_join_id_{gid}", p2p.join_id)
                 self._load_and_replay_messages(gid, p2p)

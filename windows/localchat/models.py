@@ -235,7 +235,10 @@ class ContactRequest:
     """An incoming first-contact / removed-member dial parked in the
     contact-request message box for the user to accept or ignore (Android
     parity). Persisted by the ViewModel; [fromRemoved] marks a request from
-    a member the local user removed."""
+    a member the local user removed. [peer_fingerprint] is the dialer's
+    identity-key fingerprint ("安全码") proven by the secured handshake —
+    shown in the request card so the user can compare it out-of-band
+    against the peer's settings screen before accepting."""
 
     id: str
     name: str
@@ -243,6 +246,7 @@ class ContactRequest:
     port: int
     from_removed: bool = False
     timestamp: int = 0
+    peer_fingerprint: str = ""
 
     def to_dict(self) -> dict:
         d = {
@@ -254,6 +258,8 @@ class ContactRequest:
         }
         if self.from_removed:
             d["fromRemoved"] = True
+        if self.peer_fingerprint:
+            d["peerFingerprint"] = self.peer_fingerprint
         return d
 
     @staticmethod
@@ -265,6 +271,7 @@ class ContactRequest:
             port=int(d.get("port", 0)),
             from_removed=bool(d.get("fromRemoved", False)),
             timestamp=int(d.get("timestamp", 0)),
+            peer_fingerprint=str(d.get("peerFingerprint", "")),
         )
 
 
@@ -356,8 +363,14 @@ class NetworkPacket:
     sig: Optional[str] = None
     # file_download request only: Base64(HMAC-SHA256(fileKey,
     # "lc-file-dl-v1:" + fileId)) — the downloader proves it received the
-    # (encrypted) offer. Optional: omitted by older peers, tolerated here.
+    # (encrypted) offer. MANDATORY on every request: a sender refuses a
+    # request without it.
     token: Optional[str] = None
+    # Wire-session sequence number: stamped by Wire.send_packet (per
+    # direction, strictly 1,2,3,...) INSIDE the GCM-protected JSON, so the
+    # receiver can reject replayed/reordered/injected lines. Never set by
+    # application code.
+    seq: Optional[int] = None
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
@@ -403,6 +416,8 @@ class NetworkPacket:
             d["sig"] = self.sig
         if self.token is not None:
             d["token"] = self.token
+        if self.seq is not None:
+            d["seq"] = self.seq
         return d
 
     def to_json(self) -> str:
@@ -463,6 +478,8 @@ class NetworkPacket:
             pkt.sig = str(d["sig"])
         if d.get("token") is not None:
             pkt.token = str(d["token"])
+        if d.get("seq") is not None:
+            pkt.seq = _strict_int(d["seq"], "seq")
         if pkt_type == "error" and pkt.error_message is None:
             raise ValueError("error packet missing required field: errorMessage")
         if pkt_type == "chat" and pkt.message is None:

@@ -240,16 +240,17 @@ def _serve_file_download(
     """Serve one file-download connection. Handshake (Android parity, see
     FileTransfer.kt):
 
-        receiver -> "file_download" {fileId[, token]}                  (plaintext)
+        receiver -> "file_download" {fileId, token}                   (plaintext)
         sender   -> ENCRYPTED LINE: AES-GCM(fileKey, file_meta JSON)
         sender   -> [4B ctLen][12B nonce][AES-GCM chunk]... [4B zero EOF]
 
     The per-file key travels only inside the (itself encrypted) chat message
     that offered the file, so a passive sniffer sees ciphertext for the meta
     line AND the byte stream, and tampering anywhere trips the GCM tag and
-    aborts the download. An offered token is verified in constant time; a
-    mismatch closes the connection without meta or data. No token (older
-    peer) is still served for compatibility.
+    aborts the download. The token is MANDATORY: base64(HMAC-SHA256(key=
+    fileKey, msg="lc-file-dl-v1:" + fileId)) proves the downloader received
+    the encrypted offer — a request without it (or with a wrong one) is
+    closed without meta or bytes, verified in constant time.
     """
     try:
         sock.settimeout(30)
@@ -263,24 +264,25 @@ def _serve_file_download(
             return
         if req.type != "file_download" or req.file_id != file_id:
             return
-        if req.token is not None:
-            # a token that is present but wrong (including an empty string)
-            # means the client does NOT know the per-file key: refuse without
-            # sending meta or bytes. ABSENT (None) is an older peer and is
-            # still served — Android parity (FileTransfer.kt checks
-            # `providedToken != null`).
-            try:
-                expected = hmac_sha256(
-                    file_key, f"{FILE_DL_TOKEN_PREFIX}{file_id}".encode("ascii")
-                )
-                provided = from_b64(req.token)
-            except Exception:
-                return
-            if not constant_time_equals(provided, expected):
-                logger.warning(
-                    "file download rejected: token mismatch for %s", file_id
-                )
-                return
+        if not req.token:
+            # no token = the requester never received the (encrypted) offer:
+            # refuse without sending meta or bytes
+            logger.warning(
+                "file download rejected: missing token for %s", file_id
+            )
+            return
+        try:
+            expected = hmac_sha256(
+                file_key, f"{FILE_DL_TOKEN_PREFIX}{file_id}".encode("ascii")
+            )
+            provided = from_b64(req.token)
+        except Exception:
+            return
+        if not constant_time_equals(provided, expected):
+            logger.warning(
+                "file download rejected: token mismatch for %s", file_id
+            )
+            return
         meta = NetworkPacket(
             type="file_meta",
             file_info=FileInfo(file_id, os.path.basename(path), file_size, "", 0),
@@ -477,6 +479,28 @@ def _spawn(target, *args) -> None:
     threading.Thread(target=target, args=args, daemon=True).start()
 
 
+def _allow_handshake_bucket(
+    attempts: dict, ip: str, limit: int, window: float, now: float
+) -> bool:
+    """Token-bucket core shared by every TCP listener (HostGroupServer and
+    the legacy per-instance P2PManager server): at most [limit] handshake
+    attempts per source IP per [window] seconds, with dead IPs pruned so the
+    map cannot grow without bound as LAN hosts probe and vanish."""
+    with_attempts = attempts
+    timestamps = with_attempts.setdefault(ip, [])
+    timestamps[:] = [ts for ts in timestamps if now - ts < window]
+    for dead_ip in [
+        key
+        for key, stamps in with_attempts.items()
+        if key != ip and all(now - ts >= window for ts in stamps)
+    ]:
+        del with_attempts[dead_ip]
+    if len(timestamps) >= limit:
+        return False
+    timestamps.append(now)
+    return True
+
+
 class HostGroupServer:
     """Single TCP listener for the whole program.
 
@@ -597,14 +621,20 @@ class HostGroupServer:
 
     # ------------------------------------------------------------- signaling
 
-    def enable_signaling(self, server_host: str, server_port: int) -> None:
+    def enable_signaling(
+        self, server_host: str, server_port: int, secret: str = ""
+    ) -> None:
         """Start announcing every hosted group on the public signaling server
         (punch.py.SignalingHostBridge) so members on other NAT segments can
-        join without this device being reachable directly."""
+        join without this device being reachable directly. [secret] is the
+        deployment's server access secret (challenge-response authenticated;
+        see signaling_server.py)."""
         from .punch import SignalingHostBridge
 
         self.disable_signaling()
-        self._signaling_bridge = SignalingHostBridge(server_host, server_port, self)
+        self._signaling_bridge = SignalingHostBridge(
+            server_host, server_port, self, secret=secret
+        )
         self._signaling_bridge.start()
 
     def disable_signaling(self) -> None:
@@ -663,26 +693,13 @@ class HostGroupServer:
         """Cheap token bucket that stops one LAN host from forcing unbounded
         PBKDF2 handshakes / thread spawns. Legitimate group traffic is far
         below the limit (60 handshakes/minute/IP)."""
-        now = time.monotonic()
-        with self._lock:
-            attempts = self._handshake_attempts.setdefault(ip, [])
-            attempts[:] = [
-                ts for ts in attempts if now - ts < self.HANDSHAKE_RATE_WINDOW
-            ]
-            # also drop IPs whose whole window has expired: they never come
-            # back to be pruned by the filter above, so the map would grow
-            # without bound as LAN hosts probe the listener and vanish
-            for dead_ip in [
-                key
-                for key, stamps in self._handshake_attempts.items()
-                if key != ip
-                and all(now - ts >= self.HANDSHAKE_RATE_WINDOW for ts in stamps)
-            ]:
-                del self._handshake_attempts[dead_ip]
-            if len(attempts) >= self.HANDSHAKE_RATE_LIMIT:
-                return False
-            attempts.append(now)
-            return True
+        return _allow_handshake_bucket(
+            self._handshake_attempts,
+            ip,
+            self.HANDSHAKE_RATE_LIMIT,
+            self.HANDSHAKE_RATE_WINDOW,
+            time.monotonic(),
+        )
 
     def _handle_guarded(self, sock: socket.socket) -> None:
         try:
@@ -994,6 +1011,11 @@ class P2PManager:
     HEARTBEAT_INTERVAL = 15.0
     HEARTBEAT_TIMEOUT = 45.0
 
+    # Listener hardening constants (same values as HostGroupServer).
+    MAX_ACTIVE_CONNECTIONS = 64
+    HANDSHAKE_RATE_LIMIT = 60
+    HANDSHAKE_RATE_WINDOW = 60.0
+
     def __init__(
         self,
         listener: P2PListener,
@@ -1074,6 +1096,14 @@ class P2PManager:
         # naming messages deleted while members were away (the ViewModel
         # backs it with the deleted_messages table). None omits the field.
         self.deleted_ids_provider = None
+        # Listener hardening (parity with HostGroupServer): concurrent
+        # handlers are capped and handshakes are rate-limited per source IP,
+        # because every accepted connection runs a PBKDF2 handshake that a
+        # hostile host would otherwise use as a CPU DoS. Reachable only via
+        # the per-instance listener (tests); production always registers on
+        # the shared HostGroupServer.
+        self._active_handlers = 0
+        self._handshake_attempts: Dict[str, list] = {}
 
     @property
     def current_group_id(self) -> str:
@@ -1276,13 +1306,15 @@ class P2PManager:
         server_host: str,
         server_port: int,
         punch_timeout: float = PUNCH_TIMEOUT,
+        secret: str = "",
     ) -> None:
         """Join through the public signaling server (punch.py): punch a
         direct hole to the host (TCP simultaneous open) or fall back to an
         encrypted server relay. The group is identified by its numeric join
-        id — no host address needed. The host display name is learned with
-        a keep-open query on the SAME channel, then the regular secured
-        join handshake runs on it."""
+        id — no host address needed. [secret] authenticates this client to
+        the server. The host display name is learned with a keep-open query
+        on the SAME channel, then the regular secured join handshake runs on
+        it."""
         if self.is_joining:
             return
         self._begin_join()
@@ -1299,6 +1331,7 @@ class P2PManager:
                     self.my_id,
                     self.my_name,
                     punch_timeout=punch_timeout,
+                    secret=secret,
                 )
                 sock.settimeout(15)
                 reader = self._server_path_query(sock)
@@ -2196,7 +2229,7 @@ class P2PManager:
             return
         while not self._stop_event.is_set():
             try:
-                client, _ = srv.accept()
+                client, addr = srv.accept()
             except socket.timeout:
                 continue
             except OSError:
@@ -2205,7 +2238,34 @@ class P2PManager:
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
-            self._spawn(lambda c=client: self._handle_incoming(c))
+            ip = addr[0] if addr else ""
+            with self._lock:
+                rate_ok = (
+                    not ip
+                    or _allow_handshake_bucket(
+                        self._handshake_attempts,
+                        ip,
+                        self.HANDSHAKE_RATE_LIMIT,
+                        self.HANDSHAKE_RATE_WINDOW,
+                        time.monotonic(),
+                    )
+                )
+                if rate_ok and self._active_handlers < self.MAX_ACTIVE_CONNECTIONS:
+                    self._active_handlers += 1
+                    admitted = True
+                else:
+                    admitted = False
+            if not admitted:
+                self._safe_close(client)
+                continue
+            self._spawn(self._handle_incoming_guarded, client)
+
+    def _handle_incoming_guarded(self, sock: socket.socket) -> None:
+        try:
+            self._handle_incoming(sock)
+        finally:
+            with self._lock:
+                self._active_handlers = max(0, self._active_handlers - 1)
 
     def _handle_incoming(self, sock: socket.socket) -> None:
         try:
@@ -2634,12 +2694,17 @@ class DirectChatManager:
             except Exception:
                 pass
 
-    def record_contact_request(self, peer: Peer, from_removed: bool) -> None:
+    def record_contact_request(
+        self, peer: Peer, from_removed: bool, peer_fingerprint: str = ""
+    ) -> None:
         """Park an incoming request in the message box. Deduped by device id
         AND by endpoint (a placeholder-era peer re-requesting from a new
         address must not stack two rows); only a NEW entry raises the
         user-facing event, so a peer's presence sweep re-dialing every
-        minute cannot toast in a loop."""
+        minute cannot toast in a loop. [peer_fingerprint] is the dialer's
+        identity-key 安全码 proven by the secured handshake — surfaced in
+        the request card so the user can verify it out-of-band before
+        accepting (first-contact MITM mitigation)."""
         entry = ContactRequest(
             id=peer.id,
             name=peer.name,
@@ -2647,6 +2712,7 @@ class DirectChatManager:
             port=peer.port,
             from_removed=from_removed,
             timestamp=int(time.time() * 1000),
+            peer_fingerprint=peer_fingerprint,
         )
 
         def same_slot(other: ContactRequest) -> bool:
@@ -3012,7 +3078,12 @@ class DirectChatManager:
                 for c in self._contacts.values()
             )
         if removed or not known:
-            self.record_contact_request(peer, from_removed=removed)
+            fingerprint = (
+                DeviceIdentity.peer_fingerprint(peer_ident) if peer_ident else ""
+            )
+            self.record_contact_request(
+                peer, from_removed=removed, peer_fingerprint=fingerprint
+            )
             try:
                 wire.send_packet(
                     NetworkPacket(type=Protocol.DIRECT_PENDING)

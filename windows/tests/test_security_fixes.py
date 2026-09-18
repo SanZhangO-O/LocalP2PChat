@@ -1,16 +1,21 @@
 """Regression tests for the security/robustness fixes:
 
-1. SecureWire replay guard: a line replayed WITHIN one connection must abort
-   the wire (per-session ECDH keys already make cross-session replay fail).
-3. file_download token: the downloader always attaches
-   base64(HMAC-SHA256(fileKey, "lc-file-dl-v1:" + fileId)); the sender
-   verifies an offered token in constant time and serves NOTHING on mismatch
-   (no token = legacy peer, still served). models.py tolerates the field.
+1. SecureWire anti-replay: a line replayed WITHIN one connection must abort
+   the wire (per-session ECDH keys already make cross-session replay fail),
+   and the per-direction packet sequence ("seq", stamped inside the
+   GCM-protected JSON) rejects replayed/reordered/injected lines even after
+   the nonce LRU evicted them; a relay hop restamps seq on its own wire.
+3. file_download token: MANDATORY on every request — the downloader always
+   attaches base64(HMAC-SHA256(fileKey, "lc-file-dl-v1:" + fileId)); the
+   sender verifies it in constant time and serves NOTHING on mismatch or
+   absence. models.py tolerates the field.
 4. Download progress + cancel: progress(received, total) fires per chunk; a
    cancel Event aborts with "下载已取消" and removes the .part file.
 6. numeric_group_id_of iterates UTF-16 code units (Kotlin ch.code parity):
    fixed vector for an astral-char name; BMP names unchanged.
 8. accept_contact_request dials the peer immediately (no 60s sweep wait).
+9. Contact requests carry the dialer's identity fingerprint (安全码).
+10. Group passwords / chat bodies are encrypted at rest (secretbox).
 
 Chinese literals are \\uXXXX escapes so the file stays pure-ASCII on disk.
 """
@@ -93,27 +98,74 @@ class WireReplayTest(unittest.TestCase):
         self.assertIsNotNone(receiver.recv_packet())
         self.assertIsNotNone(receiver.recv_packet())
 
-    def test_nonce_cache_is_lru_bounded(self):
-        """Old nonces fall off the LRU: after the cache fills and drains, a
-        re-delivered OLD line is no longer remembered (bounded memory,
-        documented 4096 capacity)."""
+    def test_replayed_line_rejected_even_after_window(self):
+        """The seq guard closes the old LRU-eviction hole: a replayed OLD
+        line (nonce long evicted from the cache) is still rejected because
+        its sequence number is not the exact next one."""
         old_cap = NONCE_CACHE_SIZE
         try:
             import localchat.securewire as sw
 
             sw.NONCE_CACHE_SIZE = 8
             sent = self._lines(12)
-            # replay line 0 AFTER 9 newer lines were consumed: evicted
-            lines = [sent[i] for i in range(1, 10)] + [sent[0]]
+            # consume lines 0..9 (seq 1..10): line 0's nonce was evicted from
+            # the 8-entry cache long before the replay arrives
+            lines = [sent[i] for i in range(0, 10)] + [sent[0]]
             receiver = Wire(lambda: lines.pop(0) if lines else None, None)
             receiver.activate(self.KEY)
-            for _ in range(9):
+            for _ in range(10):
                 self.assertIsNotNone(receiver.recv_packet())
-            self.assertIsNotNone(receiver.recv_packet())
+            with self.assertRaises(WireException):
+                receiver.recv_packet()
         finally:
             import localchat.securewire as sw
 
             sw.NONCE_CACHE_SIZE = old_cap
+
+    def _raw_line(self, payload: str) -> str:
+        from localchat.crypto import aes_gcm_encrypt
+
+        return to_b64(aes_gcm_encrypt(self.KEY, payload.encode("utf-8")))
+
+    def test_missing_seq_rejected(self):
+        """An attacker-crafted line (valid GCM under a stolen key scenario,
+        or any non-compliant peer) without the sequence field is rejected."""
+        lines = [self._raw_line('{"type":"ping"}')]
+        receiver = Wire(lambda: lines.pop(0) if lines else None, None)
+        receiver.activate(self.KEY)
+        with self.assertRaises(WireException):
+            receiver.recv_packet()
+
+    def test_out_of_order_seq_rejected(self):
+        """Skipped/reordered sequences (1 then 3) never validate: only the
+        exact next number is legal."""
+        lines = [
+            self._raw_line('{"type":"ping","seq":1}'),
+            self._raw_line('{"type":"ping","seq":3}'),
+        ]
+        receiver = Wire(lambda: lines.pop(0) if lines else None, None)
+        receiver.activate(self.KEY)
+        self.assertIsNotNone(receiver.recv_packet())
+        with self.assertRaises(WireException):
+            receiver.recv_packet()
+
+    def test_relay_restamps_seq_per_wire(self):
+        """A host relays the SAME packet object to several member wires; each
+        outgoing wire stamps its own 1,2,3,... sequence, so every receiver
+        sees a strictly increasing stream (no false replay positives from
+        the forwarded packet's original seq)."""
+        out_a, out_b = [], []
+        sender_a = Wire(None, out_a.append)
+        sender_b = Wire(None, out_b.append)
+        sender_a.activate(self.KEY)
+        sender_b.activate(self.KEY)
+        shared = NetworkPacket(type="ping")
+        sender_a.send_packet(shared)  # stamped seq=1 on wire A
+        sender_b.send_packet(shared)  # stamped seq=1 on wire B
+        for lines in (out_a, out_b):
+            receiver = Wire(lambda lines=lines: lines.pop(0) if lines else None, None)
+            receiver.activate(self.KEY)
+            self.assertIsNotNone(receiver.recv_packet())
 
     def test_raw_io_forbidden_after_activate(self):
         """send_raw/recv_raw were handshake-phase only; after activate() they
@@ -303,13 +355,12 @@ class FileDownloadTokenTest(unittest.TestCase):
             bytes(buf), b"", "an empty token must be refused, not served"
         )
 
-    def test_absent_token_still_served_for_legacy_peers(self):
-        """The compatibility path stays: a request with NO token field is an
-        older peer and must still download."""
-        from localchat.crypto import aes_gcm_decrypt, from_b64
-        from localchat.network import _read_raw_line, _recv_exact
+    def test_absent_token_rejected(self):
+        """A request with NO token field is refused: the token proves the
+        downloader received the ENCRYPTED offer, so a requester that knows
+        only the (sniffable) request format gets nothing."""
+        from localchat.network import _read_raw_line
 
-        key = self.file_key
         sock = socket.create_connection(("127.0.0.1", self.port), timeout=6)
         try:
             sock.sendall(
@@ -318,27 +369,21 @@ class FileDownloadTokenTest(unittest.TestCase):
                     + "\n"
                 ).encode("utf-8")
             )
-            line = _read_raw_line(sock)
-            self.assertIsNotNone(line, "a legacy request must still get its meta line")
-            meta = NetworkPacket.from_json(
-                aes_gcm_decrypt(key, from_b64(line)).decode("utf-8")
+            sock.settimeout(2)
+            buf = bytearray()
+            try:
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+            except socket.timeout:
+                pass
+            self.assertEqual(
+                bytes(buf), b"", "a token-less request must be answered with silence"
             )
-            self.assertEqual(meta.type, "file_meta")
-            received = bytearray()
-            while True:
-                header = _recv_exact(sock, 4)
-                if header is None:
-                    break
-                n = int.from_bytes(header, "big")
-                if n == 0:
-                    break
-                frame = _recv_exact(sock, n)
-                if frame is None:
-                    break
-                received.extend(aes_gcm_decrypt(key, frame))
         finally:
             sock.close()
-        self.assertEqual(bytes(received), self.PAYLOAD)
 
     def test_download_with_progress_and_success(self):
         """The happy path end-to-end: token accepted, file complete, progress
@@ -573,6 +618,105 @@ class AcceptRequestImmediateDialTest(unittest.TestCase):
                 lambda: any(m.content == "hi" for m in self.b.messages_for(A_ID))
             ),
             "the accepted session carries traffic",
+        )
+
+
+class ContactRequestFingerprintTest(unittest.TestCase):
+    """Item 9: a parked request carries the dialer's 安全码 so the user can
+    compare it out-of-band before accepting (first-contact MITM check)."""
+
+    def test_record_persists_fingerprint_and_roundtrips(self):
+        from localchat.models import ContactRequest
+
+        mgr = DirectChatManager()
+        try:
+            mgr.record_contact_request(
+                Peer(B_ID, NAME_B, "192.168.1.9", 9999),
+                from_removed=False,
+                peer_fingerprint="ABCDEF0123456789",
+            )
+            req = next(r for r in mgr.contact_requests() if r.id == B_ID)
+            self.assertEqual(req.peer_fingerprint, "ABCDEF0123456789")
+            # persistence roundtrip keeps the fingerprint
+            restored = ContactRequest.from_dict(req.to_dict())
+            self.assertEqual(restored.peer_fingerprint, "ABCDEF0123456789")
+        finally:
+            mgr.shutdown()
+
+    def test_fingerprint_optional(self):
+        from localchat.models import ContactRequest
+
+        legacy = ContactRequest.from_dict(
+            {"id": "x", "name": "n", "ip": "1.2.3.4", "port": 1}
+        )
+        self.assertEqual(legacy.peer_fingerprint, "")
+        self.assertNotIn("peerFingerprint", legacy.to_dict())
+
+
+class SecretAtRestTest(unittest.TestCase):
+    """Item 10: group passwords and chat bodies are stored ENCRYPTED in the
+    database and read back transparently."""
+
+    def setUp(self):
+        import localchat.storage as storage_module
+        from localchat.storage import ChatStore
+
+        self.storage_module = storage_module
+        self.tmp = tempfile.mkdtemp(prefix="lc_secret_")
+        self.store = ChatStore(os.path.join(self.tmp, "chat.db"))
+        # saved_messages carries a FK onto saved_groups: create the parent
+        self.store.upsert_group(
+            self.storage_module.SavedGroup(
+                group_id="g1", group_name="G", is_host=True, created_at=1
+            )
+        )
+
+    def tearDown(self):
+        self.store.close()
+        for name in os.listdir(self.tmp):
+            try:
+                os.remove(os.path.join(self.tmp, name))
+            except OSError:
+                pass
+        os.rmdir(self.tmp)
+
+    def test_group_password_roundtrip_and_ciphertext_at_rest(self):
+        raw = self.storage_module.secretbox  # module present
+        self.store.set_group_password("g1", "s3cret-pw")
+        self.assertEqual(self.store.get_group_password("g1"), "s3cret-pw")
+        row = self.store._conn.execute(
+            "SELECT value FROM settings WHERE key = 'group_password_g1'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertNotEqual(row["value"], "s3cret-pw")
+        self.assertTrue(row["value"].startswith("enc1:"))
+
+    def test_message_content_encrypted_at_rest(self):
+        from localchat.storage import SavedMessage
+
+        self.store.insert_messages(
+            [SavedMessage("m1", "g1", "秘密消息", 1, "s", "S", True)]
+        )
+        msgs = self.store.get_messages_for_group("g1")
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0].content, "秘密消息")
+        row = self.store._conn.execute(
+            "SELECT content FROM saved_messages WHERE id = 'm1'"
+        ).fetchone()
+        self.assertNotEqual(row["content"], "秘密消息")
+        self.assertTrue(row["content"].startswith("enc1:"))
+
+    def test_plaintext_rows_still_readable(self):
+        """A value written without the encryption layer (or one whose key was
+        lost) must not crash readers: unprotect passes plaintext through and
+        degrades undecryptable ciphertext to ''."""
+        self.assertEqual(
+            self.storage_module.secretbox.unprotect(self.tmp, "plain text"),
+            "plain text",
+        )
+        self.assertEqual(
+            self.storage_module.secretbox.unprotect(self.tmp, "enc1:bmd4"),
+            "",
         )
 
 

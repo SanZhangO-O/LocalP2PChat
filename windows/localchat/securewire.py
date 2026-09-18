@@ -38,6 +38,7 @@ treated as a possible MITM and rejected. Users can additionally compare the
 short fingerprints ("安全码") shown in the settings screen.
 """
 
+import copy as copy_module
 import ctypes
 import json
 import logging
@@ -163,8 +164,17 @@ class Wire:
         self._write_line = write_line
         self._key: Optional[bytes] = None
         self._lock = threading.Lock()
+        # Monotonic per-direction packet sequence numbers, carried INSIDE the
+        # GCM-protected packet JSON ("seq"): the receiver requires exactly
+        # recv_seq + 1, so ANY replayed, reordered or injected encrypted line
+        # fails — there is no eviction window a replay could slip through
+        # (TCP ordering plus the send lock make 1,2,3,... the only legal
+        # stream). Relay hops re-stamp on their own outgoing wire.
+        self._send_seq = 0
+        self._recv_seq = 0
         # Seen packet nonces of THIS connection (LRU): a repeated nonce is a
         # replayed line and aborts the connection like a decrypt failure.
+        # Defense in depth next to the seq guard; also bounds nonce reuse.
         self._seen_nonces: "OrderedDict[bytes, bool]" = OrderedDict()
         self._nonce_lock = threading.Lock()
 
@@ -183,10 +193,16 @@ class Wire:
         key = self._key
         if key is None:
             raise WireException("wire not secured yet")
-        line = to_b64(aes_gcm_encrypt(key, packet.to_json().encode("utf-8")))
-        if len(line) > MAX_LINE_LENGTH:
-            raise WireException("encrypted line exceeds cap")
         with self._lock:
+            # stamp under the write lock on a SHALLOW COPY: seq order == wire
+            # order, and the caller's packet object stays untouched (seq is
+            # a wire-layer detail and must not leak into application state)
+            self._send_seq += 1
+            stamped = copy_module.copy(packet)
+            stamped.seq = self._send_seq
+            line = to_b64(aes_gcm_encrypt(key, stamped.to_json().encode("utf-8")))
+            if len(line) > MAX_LINE_LENGTH:
+                raise WireException("encrypted line exceeds cap")
             self._write_line(line)
 
     def recv_packet(self) -> Optional[NetworkPacket]:
@@ -197,9 +213,20 @@ class Wire:
         if text is None:
             return None
         try:
-            return NetworkPacket.from_json(text)
+            packet = NetworkPacket.from_json(text)
         except Exception as e:
             raise WireException("malformed packet JSON") from e
+        # session-sequence guard: only the exact next packet of THIS stream
+        # is legal — a replayed, reordered or attacker-injected line fails
+        # here even after the nonce LRU forgot its nonce
+        expected = self._recv_seq + 1
+        if packet.seq != expected:
+            raise WireException(
+                f"packet sequence violation (got {packet.seq}, want {expected}; "
+                "replayed, reordered or injected)"
+            )
+        self._recv_seq = packet.seq
+        return packet
 
     def recv_packet_text(self) -> Optional[str]:
         """Decrypted JSON text of the next packet line WITHOUT parsing — lets
@@ -238,15 +265,24 @@ class Wire:
     def send_raw_encrypted(self, json_str: str) -> None:
         """Send an arbitrary JSON string inside the encrypted envelope — used
         by tests to inject Android-style payloads a NetworkPacket cannot
-        represent (unknown keys, extra fields). Same framing and locking as
-        send_packet."""
+        represent (unknown keys, extra fields). Same framing, locking and
+        seq-stamping as send_packet."""
         key = self._key
         if key is None:
             raise WireException("wire not secured yet")
-        line = to_b64(aes_gcm_encrypt(key, json_str.encode("utf-8")))
-        if len(line) > MAX_LINE_LENGTH:
-            raise WireException("encrypted line exceeds cap")
+        try:
+            payload = json.loads(json_str)
+            if not isinstance(payload, dict):
+                raise ValueError
+        except Exception as e:
+            raise WireException("raw payload must be a JSON object") from e
         with self._lock:
+            self._send_seq += 1
+            payload["seq"] = self._send_seq
+            blob = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            line = to_b64(aes_gcm_encrypt(key, blob.encode("utf-8")))
+            if len(line) > MAX_LINE_LENGTH:
+                raise WireException("encrypted line exceeds cap")
             self._write_line(line)
 
     # ---- handshake-phase plaintext IO (hard-forbidden once activate() ran) ----
