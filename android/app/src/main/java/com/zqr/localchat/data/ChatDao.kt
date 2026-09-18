@@ -145,4 +145,36 @@ interface ChatDao {
      *  are impossible, but REPLACE keeps the move idempotent). */
     @Query("UPDATE OR REPLACE call_logs SET conversationKey = :toKey WHERE conversationKey = :fromKey")
     suspend fun moveCallLogs(fromKey: String, toKey: String)
+
+    /**
+     * Search prefilter over the columns that are plaintext at rest (sender
+     * name, file relative path, folder name), optionally restricted to one
+     * conversation ([groupId] null = every conversation). [pattern] is a LIKE
+     * pattern with `%`/`_`/`\` already escaped by
+     * [com.zqr.localchat.data.MessageSearch].
+     *
+     * Message bodies are encrypted at rest (StoreCipher, "enc1:..."), so a
+     * LIKE on `content` would silently match nothing — the body pass runs over
+     * [searchScopeRows] with the decrypted text instead.
+     */
+    @Query(
+        "SELECT * FROM saved_messages WHERE (:groupId IS NULL OR groupId = :groupId) AND " +
+            "(senderName LIKE :pattern ESCAPE '\\' OR relativePath LIKE :pattern ESCAPE '\\' " +
+            "OR folderName LIKE :pattern ESCAPE '\\') ORDER BY timestamp DESC LIMIT :limit"
+    )
+    suspend fun searchByNameColumns(
+        groupId: String?,
+        pattern: String,
+        limit: Int
+    ): List<SavedChatMessage>
+
+    /**
+     * Every row of one conversation (all conversations when [groupId] is null),
+     * newest first: the body pass of the search decrypts and matches in code.
+     */
+    @Query(
+        "SELECT * FROM saved_messages WHERE (:groupId IS NULL OR groupId = :groupId) " +
+            "ORDER BY timestamp DESC"
+    )
+    suspend fun searchScopeRows(groupId: String?): List<SavedChatMessage>
 }

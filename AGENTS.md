@@ -120,3 +120,13 @@ cd android; .\gradlew.bat testDebugUnitTest
 - 启动长驻进程（模拟器）时输出重定向到日志文件，不要用管道截断。
 - GitHub 推送依赖本机代理 `socks5://127.0.0.1:1081`（见 `git config` 的
   `http.https://github.com.proxy`）；代理未启动时直连会被重置。
+
+## 9. 本地功能与存储
+
+- 消息正文与「最后一条预览」是加密静态存储的（`enc1:` 前缀）：搜索/过滤**不能**对 `content`
+  列直接做 SQL `LIKE`（对密文恒不匹配，且不报错）；只查静态明文列
+  （`senderName`/`relativePath`/`folderName`）或用解密后的值匹配，`%`/`_`/`\` 要转义为字面量。
+  详见 `docs/LESSONS.md`，回归测试：`windows/tests/test_functional.py::MessageSearchStoreTest`、
+  Android `MessageSearchTest`。
+- 本地 UI 功能（消息搜索、表情面板、Android 通知快捷回复）不涉及协议改动，两端各自实现、
+  无互通要求；全量测试前先结束重负载构建，避免时序假失败（见 `docs/LESSONS.md`）。

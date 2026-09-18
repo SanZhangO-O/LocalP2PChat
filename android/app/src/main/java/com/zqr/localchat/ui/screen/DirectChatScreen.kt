@@ -15,18 +15,23 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.EmojiEmotions
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Reply
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.zqr.localchat.data.CallLogEntity
@@ -36,6 +41,8 @@ import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.data.replyPreviewText
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.viewmodel.ChatViewModel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -86,23 +93,74 @@ fun DirectChatScreen(
     onOpenFile: (String) -> Unit = {},
     /** The local user typed in the draft: refresh our typing indicator
      *  (the ViewModel throttles and auto-stops it). */
-    onTyping: () -> Unit = {}
+    onTyping: () -> Unit = {},
+    /** A search-result jump: scroll to this message and flash-highlight it,
+     *  then call [onRevealHandled] (once). */
+    revealMessageId: String? = null,
+    onRevealHandled: () -> Unit = {}
 ) {
     val context = LocalContext.current
-    var input by remember { mutableStateOf("") }
+    var input by rememberSaveable(stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(""))
+    }
     var pendingDelete by remember { mutableStateOf<ChatMessage?>(null) }
     var pendingFolderDelete by remember { mutableStateOf<FolderGroup?>(null) }
     // Message being quoted by the next send (null = plain message).
     var replyTarget by remember { mutableStateOf<ChatMessage?>(null) }
-    val tooLong = input.length > P2PManager.MAX_CONTENT_LENGTH
+    var searchActive by rememberSaveable { mutableStateOf(false) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var highlightId by remember { mutableStateOf<String?>(null) }
+    var revealConsumed by remember(revealMessageId) { mutableStateOf(false) }
+    var emojiPickerOpen by remember { mutableStateOf(false) }
+    var recentEmoji by remember { mutableStateOf(RecentEmoji.load(context)) }
+    val tooLong = input.text.length > P2PManager.MAX_CONTENT_LENGTH
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     // Folder grouping + call-log merge is O(n log n): compute once per
     // message-list change instead of on every recomposition
     val messageItems = remember(messages, callLogs) { buildDirectMessageItems(messages, callLogs) }
 
+    // in-conversation search over the loaded list (newest first)
+    val searchResults = remember(searchQuery, messageItems) {
+        val kw = searchQuery.trim()
+        if (kw.isEmpty()) emptyList()
+        else messages
+            .filter { it.content.contains(kw, ignoreCase = true) || it.senderName.contains(kw, ignoreCase = true) }
+            .sortedByDescending { it.timestamp }
+            .take(50)
+    }
+
+    /** Scroll to a message and flash-highlight it; false when it is not in
+     *  the list (yet). */
+    fun revealInList(messageId: String): Boolean {
+        val index = messageItems.indexOfFirst { it.matchesMessageId(messageId) }
+        if (index < 0) return false
+        scope.launch { listState.animateScrollToItem(index) }
+        highlightId = messageId
+        return true
+    }
+
+    // external search-result jump (retried while the history is still loading)
+    LaunchedEffect(revealMessageId, messageItems.size) {
+        val target = revealMessageId ?: return@LaunchedEffect
+        if (revealConsumed) return@LaunchedEffect
+        if (revealInList(target)) {
+            revealConsumed = true
+            onRevealHandled()
+        }
+    }
+    LaunchedEffect(highlightId) {
+        if (highlightId != null) {
+            delay(1800)
+            highlightId = null
+        }
+    }
+
     LaunchedEffect(messageItems.size) {
-        if (messageItems.isNotEmpty()) listState.scrollToItem(messageItems.size - 1)
+        // a pending search jump owns the scroll position
+        if (messageItems.isNotEmpty() && !(revealMessageId != null && !revealConsumed)) {
+            listState.scrollToItem(messageItems.size - 1)
+        }
     }
 
     // a different member never inherits the previous chat's quote target
@@ -132,6 +190,14 @@ fun DirectChatScreen(
                     }
                 },
                 actions = {
+                    IconButton(
+                        onClick = {
+                            searchActive = !searchActive
+                            if (!searchActive) searchQuery = ""
+                        }
+                    ) {
+                        Icon(Icons.Filled.Search, contentDescription = "搜索消息")
+                    }
                     IconButton(onClick = onCall) {
                         Icon(
                             Icons.Filled.Videocam,
@@ -150,6 +216,7 @@ fun DirectChatScreen(
             )
         }
     ) { padding ->
+        Box(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -197,6 +264,8 @@ fun DirectChatScreen(
                             }
                         }
                     ) { item ->
+                        val highlighted = highlightId != null && item.matchesMessageId(highlightId!!)
+                        HighlightWrapper(highlighted) {
                         when (item) {
                             is MessageItem.Call -> {
                                 // local call log: system-style line, click = redial
@@ -251,6 +320,7 @@ fun DirectChatScreen(
                                 }
                             }
                         }
+                        }
                     }
                 }
             }
@@ -299,6 +369,13 @@ fun DirectChatScreen(
                     )
                 }
                 Spacer(modifier = Modifier.width(4.dp))
+                IconButton(onClick = { emojiPickerOpen = true }) {
+                    Icon(
+                        Icons.Filled.EmojiEmotions,
+                        contentDescription = "表情",
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
                 OutlinedTextField(
                     value = input,
                     onValueChange = {
@@ -318,21 +395,58 @@ fun DirectChatScreen(
                 Spacer(modifier = Modifier.width(8.dp))
                 FilledIconButton(
                     onClick = {
-                        if (input.isNotBlank() && !tooLong) {
-                            if (onSend(input, replyTarget)) {
-                                input = ""
+                        if (input.text.isNotBlank() && !tooLong) {
+                            if (onSend(input.text, replyTarget)) {
+                                input = TextFieldValue("")
                                 replyTarget = null
                             } else {
                                 Toast.makeText(context, "发送失败", Toast.LENGTH_SHORT).show()
                             }
                         }
                     },
-                    enabled = input.isNotBlank() && !tooLong
+                    enabled = input.text.isNotBlank() && !tooLong
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
                 }
             }
         }
+        if (searchActive) {
+            ChatSearchOverlay(
+                query = searchQuery,
+                onQueryChange = { searchQuery = it },
+                results = searchResults,
+                onPick = { message ->
+                    searchActive = false
+                    searchQuery = ""
+                    revealInList(message.id)
+                },
+                onClose = {
+                    searchActive = false
+                    searchQuery = ""
+                },
+                // the Box spans the whole scaffold body: keep the overlay
+                // below the app bar
+                modifier = Modifier.padding(top = padding.calculateTopPadding())
+            )
+        }
+        }
+    }
+
+    if (emojiPickerOpen) {
+        EmojiPickerDialog(
+            recent = recentEmoji,
+            onPick = { emoji ->
+                val (text, caret) = EmojiText.insert(
+                    input.text,
+                    input.selection.start,
+                    input.selection.end,
+                    emoji
+                )
+                input = TextFieldValue(text, TextRange(caret))
+                recentEmoji = RecentEmoji.record(context, emoji)
+            },
+            onDismiss = { emojiPickerOpen = false }
+        )
     }
 
     pendingDelete?.let { msg ->

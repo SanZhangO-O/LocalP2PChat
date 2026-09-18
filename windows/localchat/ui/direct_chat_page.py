@@ -11,7 +11,7 @@ import os
 import sys
 import time
 
-from PyQt6.QtCore import QSize, QUrl, Qt
+from PyQt6.QtCore import QSize, QTimer, QUrl, Qt
 from PyQt6.QtGui import QDesktopServices, QIcon, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -48,6 +48,7 @@ from .chat_page import (
     file_offer_expired,
     iter_message_rows,
 )
+from .emoji_panel import EmojiPanel
 from .theme import PRIMARY, TEXT_SUBTLE
 from .widgets import (
     DroppableTextEdit,
@@ -78,6 +79,10 @@ class DirectChatPage(QWidget):
         self._file_states: dict = {}
         # folderId -> (status, detail) for folder cards
         self._folder_states: dict = {}
+        # a search jump whose message is not in the list yet: retried on the
+        # next refresh
+        self._pending_reveal = None
+        self._emoji_panel = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -114,22 +119,25 @@ class DirectChatPage(QWidget):
         self.model = QStandardItemModel(self)
         self.list_view = QListView()
         self.list_view.setModel(self.model)
-        self.list_view.setItemDelegate(
-            MessageDelegate(
-                self.list_view,
-                on_file_click=self._download_file,
-                file_states=self._file_states,
-                media_resolver=self._media_path,
-                on_media_open=self._open_media,
-                folder_states=self._folder_states,
-                on_folder_click=self._download_folder,
-                on_folder_open=self._open_folder,
-                # direct chats show 已读/未读 on own bubbles
-                show_read_state=True,
-                on_call_click=self._call_back,
-                parent=self,
-            )
+        self.delegate = MessageDelegate(
+            self.list_view,
+            on_file_click=self._download_file,
+            file_states=self._file_states,
+            media_resolver=self._media_path,
+            on_media_open=self._open_media,
+            folder_states=self._folder_states,
+            on_folder_click=self._download_folder,
+            on_folder_open=self._open_folder,
+            # direct chats show 已读/未读 on own bubbles
+            show_read_state=True,
+            on_call_click=self._call_back,
+            parent=self,
         )
+        self.list_view.setItemDelegate(self.delegate)
+        self._reveal_timer = QTimer(self)
+        self._reveal_timer.setSingleShot(True)
+        self._reveal_timer.setInterval(1800)
+        self._reveal_timer.timeout.connect(self._clear_highlight)
         self.list_view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.list_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list_view.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
@@ -206,6 +214,13 @@ class DirectChatPage(QWidget):
         self.file_btn.clicked.connect(self._pick_file)
         input_row.addWidget(self.file_btn, alignment=Qt.AlignmentFlag.AlignBottom)
 
+        self.emoji_btn = QPushButton("😀")
+        self.emoji_btn.setObjectName("ghost")
+        self.emoji_btn.setFixedSize(40, 40)
+        self.emoji_btn.setToolTip("表情")
+        self.emoji_btn.clicked.connect(self._toggle_emoji_panel)
+        input_row.addWidget(self.emoji_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+
         self.input_edit = DirectChatInput(self._send, self._send_files)
         input_row.addWidget(self.input_edit, 1)
         self.send_btn = QPushButton("发送")
@@ -242,6 +257,7 @@ class DirectChatPage(QWidget):
         self._file_states.clear()
         self._folder_states.clear()
         self._clear_reply()
+        self._pending_reveal = None
         # use the real member id returned by the handshake so messages and the
         # session line up (a manually added contact starts with a placeholder)
         peer_id = self.vm.open_direct_chat(contact)
@@ -369,7 +385,68 @@ class DirectChatPage(QWidget):
             else:
                 item.setData(payload, MSG_ROLE)
             self.model.appendRow(item)
+        if self._pending_reveal is not None and self.reveal_message(self._pending_reveal):
+            return
         self.list_view.scrollToBottom()
+
+    # ------------------------------------------------- search-result reveal
+
+    def reveal_message(self, message_id: str) -> bool:
+        """Scroll to [message_id] and flash-highlight its row (search jump).
+        Returns False and remembers the target while the message is not in
+        the list yet, so the next refresh retries."""
+        row = self._find_row(message_id)
+        if row is None:
+            self._pending_reveal = message_id
+            return False
+        self._pending_reveal = None
+        self.list_view.scrollTo(
+            self.model.index(row, 0),
+            QAbstractItemView.ScrollHint.PositionAtCenter,
+        )
+        self.delegate.highlight_id = message_id
+        self.list_view.viewport().update()
+        self._reveal_timer.start()
+        return True
+
+    def _find_row(self, message_id: str):
+        for row in range(self.model.rowCount()):
+            payload = self.model.item(row).data(MSG_ROLE)
+            if payload is None:
+                continue
+            if getattr(payload, "id", None) == message_id:
+                return row
+            entries = getattr(payload, "entries", None)
+            if entries and any(getattr(e, "id", None) == message_id for e in entries):
+                return row
+        return None
+
+    def _clear_highlight(self):
+        if self.delegate.highlight_id is None:
+            return
+        self.delegate.highlight_id = None
+        self.list_view.viewport().update()
+
+    # ----------------------------------------------------------- emoji
+
+    def _toggle_emoji_panel(self):
+        if self._emoji_panel is None:
+            self._emoji_panel = EmojiPanel(self.vm.store)
+            self._emoji_panel.emoji_picked.connect(self._insert_emoji)
+        if self._emoji_panel.isVisible():
+            self._emoji_panel.hide()
+            return
+        panel = self._emoji_panel
+        panel.adjustSize()
+        top = self.emoji_btn.mapToGlobal(self.emoji_btn.rect().topLeft())
+        panel.move(top.x(), max(0, top.y() - panel.height() - 4))
+        panel.show()
+
+    def _insert_emoji(self, emoji: str):
+        # insertPlainText inserts at the cursor and replaces a selection, just
+        # like typing (QTextEdit has no insert())
+        self.input_edit.insertPlainText(emoji)
+        self.input_edit.setFocus()
 
     def _send(self):
         peer_id = self._peer_id

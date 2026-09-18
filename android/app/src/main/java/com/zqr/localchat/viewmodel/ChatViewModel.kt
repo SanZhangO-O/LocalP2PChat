@@ -17,9 +17,11 @@ import android.net.Uri
 import android.os.Build
 import android.provider.DocumentsContract
 import android.util.Log
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
+import androidx.core.app.RemoteInput
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Lifecycle
@@ -30,6 +32,7 @@ import androidx.lifecycle.viewModelScope
 import com.zqr.localchat.ChatApp
 import com.zqr.localchat.MainActivity
 import com.zqr.localchat.NotificationDismissReceiver
+import com.zqr.localchat.NotificationReplyReceiver
 import com.zqr.localchat.call.CallManager
 import com.zqr.localchat.crypto.Crypto
 import com.zqr.localchat.crypto.StoreCipher
@@ -44,6 +47,7 @@ import com.zqr.localchat.data.DeletedMessage
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.data.MAX_FOLDER_FILES
+import com.zqr.localchat.data.MessageSearch
 import com.zqr.localchat.data.Peer
 import com.zqr.localchat.data.SavedChatMessage
 import com.zqr.localchat.data.SavedGroup
@@ -273,6 +277,85 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     /** Live message list of one direct chat (seeded with history on open). */
     fun directMessages(peerId: String): Flow<List<ChatMessage>> =
         DirectChatManager.messagesFor(peerId)
+
+    // -------------------------------------------------------------- search
+
+    /** One global-search hit: the message plus the conversation it lives in. */
+    data class SearchHit(
+        val message: ChatMessage,
+        val conversationId: String,
+        val conversationName: String,
+        val isDirect: Boolean
+    )
+
+    /** One range-selector entry for the search screen ("全部" is added by the
+     *  UI as a null id). */
+    data class SearchScope(val id: String, val name: String)
+
+    /** Range-selector entries: every known group, then every direct contact. */
+    fun searchScopes(): List<SearchScope> {
+        val scopes = ArrayList<SearchScope>()
+        val seen = HashSet<String>()
+        _groups.value.forEach { g ->
+            if (seen.add(g.groupId)) scopes.add(SearchScope(g.groupId, "群聊：${g.groupName}"))
+        }
+        DirectChatManager.contacts.value.values.forEach { c ->
+            if (seen.add(c.id)) scopes.add(SearchScope("direct:${c.id}", "成员：${c.name}"))
+        }
+        return scopes
+    }
+
+    /**
+     * Keyword search over persisted group + direct-chat history, newest match
+     * first. Message bodies are encrypted at rest, so the DAO's name-column
+     * prefilter is combined with a body pass over the decrypted scope rows
+     * ([MessageSearch]). Conversation display names are resolved here so the
+     * search UI only renders.
+     */
+    suspend fun searchHistory(
+        keyword: String,
+        scopeGroupId: String? = null
+    ): List<SearchHit> {
+        val kw = keyword.trim()
+        if (kw.isEmpty()) return emptyList()
+        val rows = runCatching {
+            val nameHits = chatDao.searchByNameColumns(
+                scopeGroupId, MessageSearch.likePattern(kw), MessageSearch.MAX_RESULTS
+            )
+            val bodyHits = chatDao.searchScopeRows(scopeGroupId).filter { row ->
+                MessageSearch.matches(row, StoreCipher.unprotect(row.content), kw)
+            }
+            MessageSearch.merge(nameHits, bodyHits)
+        }.getOrElse { emptyList() }
+        return rows.map { toSearchHit(it) }
+    }
+
+    private suspend fun toSearchHit(row: SavedChatMessage): SearchHit {
+        val plain = row.withPlainContent()
+        val isDirect = plain.groupId.startsWith("direct:")
+        val name = if (isDirect) {
+            val peerId = plain.groupId.removePrefix("direct:")
+            DirectChatManager.contacts.value[peerId]?.name ?: peerId
+        } else {
+            _groups.value.find { it.groupId == plain.groupId }?.groupName
+                ?: runCatching { chatDao.getGroup(plain.groupId)?.groupName }.getOrNull()
+                ?: plain.groupId
+        }
+        return SearchHit(
+            message = ChatMessage(
+                id = plain.id,
+                content = plain.content,
+                timestamp = plain.timestamp,
+                senderId = plain.senderId,
+                senderName = plain.senderName,
+                isFromMe = plain.isFromMe,
+                fileInfo = restoredFileInfo(plain)
+            ),
+            conversationId = plain.groupId,
+            conversationName = name,
+            isDirect = isDirect
+        )
+    }
 
     /** Transient direct-chat events surfaced as toasts. */
     val directEvents: SharedFlow<String> = DirectChatManager.events
@@ -985,6 +1068,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val currentIds = msgs.map { it.id }.toSet()
                 val removed = persisted.filter { it !in currentIds }
                 val newOnes = msgs.filter { it.id !in persisted }
+                // background direct messages post a notification too (Android
+                // parity with the Windows tray): it carries the same
+                // quick-reply action as a group notification, keyed by
+                // "direct:<peerId>"
+                val incomingNew = newOnes.filter { !it.isFromMe }
+                if (!isAppForeground.value && incomingNew.isNotEmpty()) {
+                    notifyNewMessages(
+                        "$DIRECT_PREFIX$peerId",
+                        DirectChatManager.contacts.value[peerId]?.name ?: peerId,
+                        incomingNew.map { NotifEntry(it.senderName, it.content, it.timestamp) }
+                    )
+                }
                 // pending -> delivered flips (outbox flush) are plain updates
                 val flagChanges = msgs.filter { m ->
                     m.isFromMe && pendingMap.containsKey(m.id) && pendingMap[m.id] != m.pending
@@ -1403,6 +1498,53 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         const val ACTION_NOTIF_DISMISSED = "com.zqr.localchat.NOTIF_DISMISSED"
         const val EXTRA_DISMISSED_GROUP_ID = "com.zqr.localchat.DISMISSED_GROUP_ID"
 
+        /** Notification quick reply: the reply BroadcastReceiver reuses the
+         *  ViewModel's send paths through [tryDeliverQuickReply]. */
+        const val ACTION_NOTIF_REPLY = "com.zqr.localchat.NOTIF_REPLY"
+        const val EXTRA_REPLY_CONVERSATION_ID = "com.zqr.localchat.REPLY_CONVERSATION_ID"
+        const val REMOTE_INPUT_QUICK_REPLY = "com.zqr.localchat.QUICK_REPLY"
+
+        /** Conversation key prefix of a 1:1 chat ("direct:<peerId>"), shared
+         *  with the persisted message table's synthetic group id. */
+        private const val DIRECT_PREFIX = "direct:"
+
+        /**
+         * Quick-reply sink installed by the live ViewModel instance. The
+         * reply BroadcastReceiver runs outside the ViewModel lifecycle, so —
+         * like the other process-wide hooks (P2PManager.onPeerDeletedIds …) —
+         * this companion hook routes its text back into the real send paths.
+         * Null while no ViewModel is alive.
+         */
+        @Volatile
+        private var quickReplySink: ((String, String) -> Unit)? = null
+
+        fun setQuickReplySink(sink: ((String, String) -> Unit)?) {
+            quickReplySink = sink
+        }
+
+        /**
+         * Deliver a text typed in a notification's RemoteInput action to the
+         * conversation it came from. Returns false when nothing could deliver
+         * it: with a live ViewModel the send always runs (offline direct sends
+         * queue, exactly like the UI), without one only a 1:1 reply can go out
+         * through the process-wide DirectChatManager — a group needs the
+         * ViewModel's live P2PManager.
+         */
+        fun tryDeliverQuickReply(conversationId: String, text: String): Boolean {
+            if (conversationId.isBlank() || text.isBlank()) return false
+            quickReplySink?.let { sink ->
+                sink(conversationId, text)
+                return true
+            }
+            return if (conversationId.startsWith(DIRECT_PREFIX)) {
+                DirectChatManager.sendMessage(
+                    conversationId.removePrefix(DIRECT_PREFIX), text
+                )
+            } else {
+                false
+            }
+        }
+
         /** Process-wide mirror of the current group names (kept in sync with
          *  [groups] in init): the setup screen reads it to confirm before a
          *  same-name creation silently replaces the old group instance. */
@@ -1455,8 +1597,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         /** Reconcile the grouped summary with the log: posted only while two
-         *  or more groups still have unread notifications (a single child
-         *  stands alone), cancelled otherwise. */
+         *  or more conversations still have unread notifications (a single
+         *  child stands alone), cancelled otherwise. */
         private fun refreshMessageSummary(context: Context) {
             if (!notificationsPermissionGranted(context)) return
             ensureMessageChannel(context)
@@ -1486,7 +1628,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 .setGroupSummary(true)
                 .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
                 .setContentTitle("LocalChat")
-                .setContentText("${notificationLog.size} 个群聊共 $total 条新消息")
+                .setContentText("${notificationLog.size} 个会话共 $total 条新消息")
                 .setCategory(NotificationCompat.CATEGORY_MESSAGE)
                 .setAutoCancel(true)
                 .setContentIntent(contentPendingIntent)
@@ -2068,6 +2210,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 saveDirectContactRequests(requests)
             }
         }
+        // Notification quick reply: while this ViewModel is alive, route the
+        // reply receiver's text into the normal send paths (see
+        // tryDeliverQuickReply / handleQuickReply).
+        setQuickReplySink { conversationId, text -> handleQuickReply(conversationId, text) }
 
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : LifecycleEventObserver {
             override fun onStateChanged(source: LifecycleOwner, event: Lifecycle.Event) {
@@ -3303,6 +3449,30 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // ------------------------------------------------ message notifications
 
+    /**
+     * A text typed in a notification's quick-reply action: send it through the
+     * same path the chat UI uses (group relay / direct session, offline direct
+     * sends queue as pending), then clear the conversation's unread state and
+     * dismiss its notification — exactly like opening the chat. A failed group
+     * reply (no live connection) surfaces a toast instead of dropping the
+     * text silently.
+     */
+    private fun handleQuickReply(conversationId: String, text: String) {
+        if (text.isBlank()) return
+        val ok = if (conversationId.startsWith(DIRECT_PREFIX)) {
+            sendDirectMessage(conversationId.removePrefix(DIRECT_PREFIX), text)
+        } else {
+            sendMessageToGroup(conversationId, text)
+        }
+        if (ok) {
+            clearUnread(conversationId)
+        } else {
+            Toast.makeText(
+                getApplication(), "回复未发送：会话未连接", Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
     private fun notifyNewMessages(groupId: String, groupName: String, incoming: List<NotifEntry>) {
         if (incoming.isEmpty()) return
         val context = getApplication<Application>()
@@ -3323,12 +3493,38 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // posted intent overwrite every other group's deep-link extra
         val openIntent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            putExtra(MainActivity.EXTRA_OPEN_GROUP_ID, groupId)
+            if (groupId.startsWith(DIRECT_PREFIX)) {
+                putExtra(MainActivity.EXTRA_OPEN_DIRECT_ID, groupId.removePrefix(DIRECT_PREFIX))
+            } else {
+                putExtra(MainActivity.EXTRA_OPEN_GROUP_ID, groupId)
+            }
         }
         val contentPendingIntent = PendingIntent.getActivity(
             context, groupId.hashCode(), openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        // quick reply: the RemoteInput result is delivered to the reply
+        // receiver (MUTABLE pending intent, the system fills in the text),
+        // which routes it back through tryDeliverQuickReply -> the live
+        // ViewModel's normal send path
+        val replyIntent = Intent(context, NotificationReplyReceiver::class.java).apply {
+            action = ACTION_NOTIF_REPLY
+            putExtra(EXTRA_REPLY_CONVERSATION_ID, groupId)
+        }
+        val replyPendingIntent = PendingIntent.getBroadcast(
+            context, groupId.hashCode(), replyIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or
+                (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    PendingIntent.FLAG_MUTABLE
+                } else {
+                    0
+                })
+        )
+        val replyAction = NotificationCompat.Action.Builder(
+            android.R.drawable.ic_menu_send, "回复", replyPendingIntent
+        ).addRemoteInput(
+            RemoteInput.Builder(REMOTE_INPUT_QUICK_REPLY).setLabel("回复 $groupName").build()
+        ).build()
         val deleteIntent = Intent(context, NotificationDismissReceiver::class.java).apply {
             action = ACTION_NOTIF_DISMISSED
             putExtra(EXTRA_DISMISSED_GROUP_ID, groupId)
@@ -3348,6 +3544,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             .setWhen(log.last().time)
             .setAutoCancel(true)
             .setContentIntent(contentPendingIntent)
+            .addAction(replyAction)
             // swiping the bubble away must drop its log entry too, or the
             // group's next message resurrects dismissed bubbles and the
             // summary keeps stale counts
@@ -3393,6 +3590,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         DirectChatManager.onChatMigrated = null
         DirectChatManager.onCallSignal = null
         DirectChatManager.onRemovedMarksChanged = null
+        // drop the quick-reply hook: a cleared ViewModel must never be invoked
+        // by the reply receiver (a stale sink would send on dead managers)
+        setQuickReplySink(null)
         runCatching {
             networkCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
         }

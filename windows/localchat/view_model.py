@@ -762,6 +762,61 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         """Last message of a direct chat, for the home-page preview."""
         return self._direct_last.get(peer_id)
 
+    def search_history(
+        self, keyword: str, scope_group_id: Optional[str] = None
+    ) -> List[dict]:
+        """Keyword search over group + direct-chat history (newest match
+        first, see ChatStore.search_messages). Resolves each hit's
+        conversation display name so the search page can list
+        会话名 + 发送者 + 摘要 + 时间 without touching the network.
+
+        Each result dict carries: message (SavedMessage), conversation_id
+        (group id or "direct:<peerId>"), conversation (display name) and
+        is_direct."""
+        hits = self.store.search_messages(keyword, scope_group_id)
+        contacts = {c.id: c for c in self.direct_contacts_list()}
+        groups = {g.group_id: g for g in self.groups}
+        results = []
+        for m in hits:
+            gid = m.group_id
+            is_direct = gid.startswith("direct:")
+            if is_direct:
+                peer_id = gid[len("direct:"):]
+                contact = contacts.get(peer_id)
+                name = contact.name if contact is not None else peer_id
+            else:
+                meta = groups.get(gid)
+                if meta is not None:
+                    name = meta.group_name
+                else:
+                    saved = self.store.get_group(gid)
+                    name = saved.group_name if saved is not None else gid
+            results.append(
+                {
+                    "message": m,
+                    "conversation_id": gid,
+                    "conversation": name,
+                    "is_direct": is_direct,
+                }
+            )
+        return results
+
+    def search_scopes(self) -> List[dict]:
+        """Scope entries for the search page's range selector: every known
+        conversation (groups first, then direct contacts), each as
+        {"id": <group_id or "direct:<peerId>">, "name": <display>}.
+        The implicit first entry 全部 is prepended by the UI."""
+        scopes = [
+            {"id": g.group_id, "name": f"群聊：{g.group_name}"} for g in self.groups
+        ]
+        seen = set()
+        for c in self.direct_contacts_list():
+            if c.id in seen:
+                continue
+            seen.add(c.id)
+            scopes.append({"id": f"direct:{c.id}", "name": f"成员：{c.name}"})
+        return scopes
+
     def open_direct_chat(self, contact: Peer) -> Optional[str]:
         """Open a 1:1 chat with a member WITHOUT requiring the peer to be
         online: persisted history loads immediately, messages sent while

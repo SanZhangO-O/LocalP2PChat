@@ -42,6 +42,7 @@ import com.zqr.localchat.ui.screen.DirectChatScreen
 import com.zqr.localchat.ui.screen.GroupListScreen
 import com.zqr.localchat.ui.screen.MemberListScreen
 import com.zqr.localchat.ui.screen.PeerListScreen
+import com.zqr.localchat.ui.screen.SearchScreen
 import com.zqr.localchat.ui.screen.SetupScreen
 import com.zqr.localchat.ui.screen.SettingsScreen
 import com.zqr.localchat.ui.theme.LocalChatTheme
@@ -50,7 +51,7 @@ import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 
-enum class Screen { GroupList, Setup, GroupLobby, Chat, MemberList, DirectChat, Settings }
+enum class Screen { GroupList, Setup, GroupLobby, Chat, MemberList, DirectChat, Settings, Search }
 
 class MainActivity : ComponentActivity() {
 
@@ -58,12 +59,15 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_OPEN_GROUP_ID = "com.zqr.localchat.OPEN_GROUP_ID"
         /** Missed-call notification deep link: the peer whose 1:1 chat to open. */
         const val EXTRA_OPEN_DIRECT_PEER_ID = "com.zqr.localchat.OPEN_DIRECT_PEER_ID"
+        const val EXTRA_OPEN_DIRECT_ID = "com.zqr.localchat.OPEN_DIRECT_ID"
     }
 
     // notification tap deep link: the group to jump straight into (null = none)
     private val openGroupId = mutableStateOf<String?>(null)
     // missed-call notification tap: the direct-chat peer to jump into
     private val openDirectPeerId = mutableStateOf<String?>(null)
+    // notification tap deep link: the direct chat's peer id (null = none)
+    private val openDirectId = mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -74,13 +78,15 @@ class MainActivity : ComponentActivity() {
         if (savedInstanceState == null) {
             openGroupId.value = intent?.getStringExtra(EXTRA_OPEN_GROUP_ID)
             openDirectPeerId.value = intent?.getStringExtra(EXTRA_OPEN_DIRECT_PEER_ID)
+            openDirectId.value = intent?.getStringExtra(EXTRA_OPEN_DIRECT_ID)
         }
         enableEdgeToEdge()
         setContent {
             LocalChatTheme {
                 LocalChatApp(
                     openGroupId = openGroupId,
-                    openDirectPeerId = openDirectPeerId
+                    openDirectPeerId = openDirectPeerId,
+                    openDirectId = openDirectId
                 )
             }
         }
@@ -91,6 +97,7 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         intent.getStringExtra(EXTRA_OPEN_GROUP_ID)?.let { openGroupId.value = it }
         intent.getStringExtra(EXTRA_OPEN_DIRECT_PEER_ID)?.let { openDirectPeerId.value = it }
+        intent.getStringExtra(EXTRA_OPEN_DIRECT_ID)?.let { openDirectId.value = it }
     }
 }
 
@@ -98,7 +105,8 @@ class MainActivity : ComponentActivity() {
 fun LocalChatApp(
     viewModel: ChatViewModel = viewModel(),
     openGroupId: MutableState<String?> = remember { mutableStateOf<String?>(null) },
-    openDirectPeerId: MutableState<String?> = remember { mutableStateOf<String?>(null) }
+    openDirectPeerId: MutableState<String?> = remember { mutableStateOf<String?>(null) },
+    openDirectId: MutableState<String?> = remember { mutableStateOf<String?>(null) }
 ) {
     val context = LocalContext.current
     val mediaVersion by viewModel.mediaVersion.collectAsState()
@@ -109,6 +117,9 @@ fun LocalChatApp(
     var activeDirectPeerId by remember { mutableStateOf<String?>(null) }
     // where the settings screen was opened from, so back returns there
     var settingsFrom by remember { mutableStateOf<String?>(null) }
+    // a search-result jump: (conversationKey, messageId) the chat screen must
+    // scroll to and highlight once it is up; cleared when handled
+    var revealTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
 
     BackHandler(enabled = currentScreen != Screen.MemberList) {
         currentScreenName = when (currentScreen) {
@@ -118,6 +129,7 @@ fun LocalChatApp(
             Screen.GroupList -> Screen.MemberList.name
             Screen.DirectChat -> Screen.MemberList.name
             Screen.Settings -> settingsFrom ?: Screen.MemberList.name
+            Screen.Search -> Screen.MemberList.name
             Screen.MemberList -> Screen.MemberList.name
         }
         if (currentScreen == Screen.Settings) settingsFrom = null
@@ -481,6 +493,23 @@ fun LocalChatApp(
                 requireLocalNetworkPermission {
                     viewModel.openDirectChat(contact)
                     activeDirectPeerId = contact.id
+                }
+            }
+
+        // notification tap on a 1:1 chat: open it once the contact is known
+        // (a cold start loads the contact list asynchronously)
+        snapshotFlow { openDirectId.value }
+            .filterNotNull()
+            .collect { peerId ->
+                openDirectId.value = null
+                val found = withTimeoutOrNull(5000) {
+                    snapshotFlow { directContacts.any { it.id == peerId } }.first { it }
+                } ?: false
+                if (!found) return@collect
+                val contact = directContacts.find { it.id == peerId } ?: return@collect
+                requireLocalNetworkPermission {
+                    viewModel.openDirectChat(contact)
+                    activeDirectPeerId = peerId
                     currentScreenName = Screen.DirectChat.name
                 }
             }
@@ -536,6 +565,7 @@ fun LocalChatApp(
                     settingsFrom = Screen.MemberList.name
                     currentScreenName = Screen.Settings.name
                 },
+                onOpenSearch = { currentScreenName = Screen.Search.name },
                 onOpenChat = { contact ->
                     requireLocalNetworkPermission {
                         // open the chat right away — persisted history is
@@ -657,11 +687,40 @@ fun LocalChatApp(
                     },
                     resolveMedia = { fileInfo -> viewModel.localMediaPath(fileInfo) },
                     mediaVersion = mediaVersion,
-                    onOpenFile = { uriString -> openDownloadedFile(context, uriString) }
+                    onOpenFile = { uriString -> openDownloadedFile(context, uriString) },
+                    revealMessageId = revealTarget
+                        ?.takeIf { it.first == "direct:$peerId" }?.second,
+                    onRevealHandled = { revealTarget = null }
                 )
             } else {
                 LaunchedEffect(Unit) { currentScreenName = Screen.MemberList.name }
             }
+        }
+        Screen.Search -> {
+            SearchScreen(
+                viewModel = viewModel,
+                onOpenResult = { conversationId, messageId ->
+                    // remember the jump target: the chat screen scrolls to it
+                    // and highlights the message, then clears it
+                    revealTarget = conversationId to messageId
+                    if (conversationId.startsWith("direct:")) {
+                        val peerId = conversationId.removePrefix("direct:")
+                        val contact = directContacts.find { it.id == peerId }
+                        if (contact != null) {
+                            requireLocalNetworkPermission {
+                                viewModel.openDirectChat(contact)
+                                activeDirectPeerId = peerId
+                                currentScreenName = Screen.DirectChat.name
+                            }
+                        }
+                    } else {
+                        viewModel.switchToGroup(conversationId)
+                        viewModel.clearUnread(conversationId)
+                        currentScreenName = Screen.Chat.name
+                    }
+                },
+                onBack = { currentScreenName = Screen.MemberList.name }
+            )
         }
         Screen.Setup -> {
             SetupScreen(
@@ -793,6 +852,9 @@ fun LocalChatApp(
                 resolveMedia = { fileInfo -> viewModel.localMediaPath(fileInfo) },
                 mediaVersion = mediaVersion,
                 onOpenFile = { uriString -> openDownloadedFile(context, uriString) },
+                revealMessageId = revealTarget
+                    ?.takeIf { it.first == activeGroupId }?.second,
+                onRevealHandled = { revealTarget = null },
                 onBack = {
                     currentScreenName = Screen.GroupLobby.name
                 }

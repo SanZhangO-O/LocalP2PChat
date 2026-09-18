@@ -1,7 +1,7 @@
 import os
 import sys
 
-from PyQt6.QtCore import QEvent, QPointF, QRect, QRectF, QSize, Qt, QUrl
+from PyQt6.QtCore import QEvent, QPointF, QRect, QRectF, QSize, Qt, QTimer, QUrl
 from PyQt6.QtGui import (
     QColor,
     QDesktopServices,
@@ -43,6 +43,7 @@ from ..models import (
     sanitize_file_name,
 )
 from ..view_model import ChatViewModel
+from .emoji_panel import EmojiPanel
 from .theme import (
     BUBBLE_MINE,
     BUBBLE_NAME,
@@ -290,6 +291,9 @@ class MessageDelegate(QStyledItemDelegate):
         # CallLogEntry -> redial with the same media kind (audio/video).
         self.on_call_click = on_call_click
         self._pixmaps: dict = {}
+        # Message id currently flashed after a search jump (None = no
+        # highlight); set by the chat page, cleared by its timer.
+        self.highlight_id = None
 
     # ------------------------------------------------------------- media
 
@@ -441,6 +445,30 @@ class MessageDelegate(QStyledItemDelegate):
         return super().editorEvent(event, model, option, index)
 
     def paint(self, painter: QPainter, option, index) -> None:
+        self._paint_row(painter, option, index)
+        if self.highlight_id is not None:
+            msg = index.data(MSG_ROLE)
+            if msg is not None and self._row_matches_highlight(msg):
+                self._paint_highlight(painter, option)
+
+    def _row_matches_highlight(self, msg) -> bool:
+        """True when this row is the message a search jump revealed. A folder
+        card counts when any of its entries is the target."""
+        if isinstance(msg, FolderGroup):
+            return any(entry.id == self.highlight_id for entry in msg.entries)
+        return getattr(msg, "id", None) == self.highlight_id
+
+    def _paint_highlight(self, painter: QPainter, option) -> None:
+        """Translucent ring over the row currently revealed by a search jump;
+        drawn after the bubble so it stays visible."""
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(PRIMARY), 2))
+        painter.setBrush(QColor(103, 80, 164, 36))
+        painter.drawRoundedRect(option.rect.adjusted(3, 1, -3, -1), 10, 10)
+        painter.restore()
+
+    def _paint_row(self, painter: QPainter, option, index) -> None:
         header_text = index.data(HEADER_ROLE)
         if header_text is not None:
             self._paint_header(painter, option, header_text)
@@ -927,6 +955,10 @@ class ChatPage(QWidget):
         self._folder_states: dict = {}
         # The message being replied to (None when not replying).
         self._reply_target = None
+        # a search jump whose message is not in the list yet (the history may
+        # still be replaying): re-attempted on the next rebuild
+        self._pending_reveal = None
+        self._emoji_panel = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -956,19 +988,22 @@ class ChatPage(QWidget):
         self.model = QStandardItemModel(self)
         self.list_view = QListView()
         self.list_view.setModel(self.model)
-        self.list_view.setItemDelegate(
-            MessageDelegate(
-                self.list_view,
-                on_file_click=self._download_file,
-                file_states=self._file_states,
-                media_resolver=self._media_path,
-                on_media_open=self._open_media,
-                folder_states=self._folder_states,
-                on_folder_click=self._download_folder,
-                on_folder_open=self._open_folder,
-                parent=self,
-            )
+        self.delegate = MessageDelegate(
+            self.list_view,
+            on_file_click=self._download_file,
+            file_states=self._file_states,
+            media_resolver=self._media_path,
+            on_media_open=self._open_media,
+            folder_states=self._folder_states,
+            on_folder_click=self._download_folder,
+            on_folder_open=self._open_folder,
+            parent=self,
         )
+        self.list_view.setItemDelegate(self.delegate)
+        self._reveal_timer = QTimer(self)
+        self._reveal_timer.setSingleShot(True)
+        self._reveal_timer.setInterval(1800)
+        self._reveal_timer.timeout.connect(self._clear_highlight)
         self.list_view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.list_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list_view.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
@@ -1026,6 +1061,12 @@ class ChatPage(QWidget):
         self.file_btn.setToolTip("发送文件")
         self.file_btn.clicked.connect(self._pick_file)
         input_row.addWidget(self.file_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        self.emoji_btn = QPushButton("😀")
+        self.emoji_btn.setObjectName("ghost")
+        self.emoji_btn.setFixedSize(40, 40)
+        self.emoji_btn.setToolTip("表情")
+        self.emoji_btn.clicked.connect(self._toggle_emoji_panel)
+        input_row.addWidget(self.emoji_btn, alignment=Qt.AlignmentFlag.AlignBottom)
         self.input_edit = ChatInput(self._send_input, self._send_files)
         input_row.addWidget(self.input_edit, 1)
         self.send_btn = QPushButton("发送")
@@ -1060,6 +1101,9 @@ class ChatPage(QWidget):
         self._file_states.clear()
         self._folder_states.clear()
         self._clear_reply()
+        # a jump target belongs to the conversation it was requested from
+        self._pending_reveal = None
+        self._clear_highlight()
         self._stick_to_bottom = True
         self._rebuild()
         self._refresh_typing()
@@ -1119,8 +1163,71 @@ class ChatPage(QWidget):
                 item.setData(payload, MSG_ROLE)
             self.model.appendRow(item)
         self._building = False
+        if self._pending_reveal is not None and self.reveal_message(self._pending_reveal):
+            return
         if self._stick_to_bottom and msgs:
             self.list_view.scrollToBottom()
+
+    # ------------------------------------------------- search-result reveal
+
+    def reveal_message(self, message_id: str) -> bool:
+        """Scroll to [message_id] and flash-highlight its row. Returns False
+        and remembers the target when the message is not in the list yet (an
+        offline client group replays its history asynchronously), so the next
+        rebuild retries."""
+        row = self._find_row(message_id)
+        if row is None:
+            self._pending_reveal = message_id
+            return False
+        self._pending_reveal = None
+        self.list_view.scrollTo(
+            self.model.index(row, 0),
+            QAbstractItemView.ScrollHint.PositionAtCenter,
+        )
+        self.delegate.highlight_id = message_id
+        self.list_view.viewport().update()
+        self._reveal_timer.start()
+        return True
+
+    def _find_row(self, message_id: str):
+        for row in range(self.model.rowCount()):
+            payload = self.model.item(row).data(MSG_ROLE)
+            if payload is None:
+                continue
+            if getattr(payload, "id", None) == message_id:
+                return row
+            entries = getattr(payload, "entries", None)
+            if entries and any(getattr(e, "id", None) == message_id for e in entries):
+                return row
+        return None
+
+    def _clear_highlight(self):
+        if self.delegate.highlight_id is None:
+            return
+        self.delegate.highlight_id = None
+        self.list_view.viewport().update()
+
+    # ----------------------------------------------------------- emoji
+
+    def _toggle_emoji_panel(self):
+        if self._emoji_panel is None:
+            self._emoji_panel = EmojiPanel(self.vm.store)
+            self._emoji_panel.emoji_picked.connect(self._insert_emoji)
+        if self._emoji_panel.isVisible():
+            self._emoji_panel.hide()
+            return
+        panel = self._emoji_panel
+        panel.adjustSize()
+        top = self.emoji_btn.mapToGlobal(self.emoji_btn.rect().topLeft())
+        panel.move(top.x(), max(0, top.y() - panel.height() - 4))
+        panel.show()
+
+    def _insert_emoji(self, emoji: str):
+        # insertPlainText inserts at the cursor and replaces a selection, just
+        # like typing (QTextEdit has no insert())
+        self.input_edit.insertPlainText(emoji)
+        self.input_edit.setFocus()
+
 
     def _on_scroll(self, value):
         if self._building:
