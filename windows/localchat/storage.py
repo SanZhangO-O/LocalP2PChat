@@ -536,6 +536,92 @@ class ChatStore:
             ).fetchall()
         return [r["msg_id"] for r in rows]
 
+    @staticmethod
+    def escape_like(keyword: str) -> str:
+        r"""Escape SQL LIKE wildcards in [keyword] (and the escape char itself)
+        so the result is a literal-substring pattern: "a%b_c" -> "a\%b\_c".
+        Pair with ``LIKE ? ESCAPE '\'``."""
+        return (
+            keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+
+    def search_messages(
+        self, keyword: str, group_id: Optional[str] = None, limit: int = 200
+    ) -> List[SavedMessage]:
+        """Keyword search over persisted history, newest match first.
+
+        Message bodies (and only they) are encrypted at rest (secretbox), so
+        SQL LIKE prefilters the plaintext-at-rest columns (sender name, file
+        path, folder name); the body pass decrypts the scope's rows and
+        matches in Python — a plain LIKE on the ciphertext column would
+        silently match nothing. Direct chats live under "direct:<peerId>"
+        group keys, so one query covers group and 1:1 history.
+        """
+        kw = (keyword or "").strip()
+        if not kw:
+            return []
+        like = f"%{self.escape_like(kw)}%"
+        clauses = [
+            "("
+            "senderName LIKE ? ESCAPE '\\'"
+            " OR relativePath LIKE ? ESCAPE '\\'"
+            " OR folderName LIKE ? ESCAPE '\\'"
+            ")",
+        ]
+        params: List = [like, like, like]
+        if group_id is not None:
+            clauses.append("groupId = ?")
+            params.append(group_id)
+        body_sql = "SELECT * FROM saved_messages"
+        if group_id is not None:
+            body_sql += " WHERE groupId = ?"
+        with self._lock:
+            sql = (
+                "SELECT * FROM saved_messages WHERE "
+                + " AND ".join(clauses)
+                + f" ORDER BY timestamp DESC LIMIT {int(limit)}"
+            )
+            rows = list(self._conn.execute(sql, params).fetchall())
+            # body pass: (groupId, id, content) of the whole scope, newest
+            # first — deduped against the name-column matches
+            body_rows = self._conn.execute(
+                body_sql + " ORDER BY timestamp DESC",
+                [group_id] if group_id is not None else [],
+            ).fetchall()
+        found = {(r["groupId"], r["id"]) for r in rows}
+        for r in body_rows:
+            key = (r["groupId"], r["id"])
+            if key in found:
+                continue
+            if kw in self._dec(self._raw_content(r)):
+                rows.append(r)
+        rows.sort(key=lambda r: r["timestamp"], reverse=True)
+        return [self._row_to_message(r) for r in rows[:limit]]
+
+    def _raw_content(self, row) -> str:
+        return row["content"]
+
+    def _row_to_message(self, r) -> SavedMessage:
+        keys = r.keys()
+        return SavedMessage(
+            id=r["id"],
+            group_id=r["groupId"],
+            content=self._dec(r["content"]),
+            timestamp=r["timestamp"],
+            sender_id=r["senderId"],
+            sender_name=r["senderName"],
+            is_from_me=bool(r["isFromMe"]),
+            file_size=r["fileSize"] if "fileSize" in keys else 0,
+            download_host=r["downloadHost"] if "downloadHost" in keys else "",
+            download_port=r["downloadPort"] if "downloadPort" in keys else 0,
+            kind=r["kind"] if "kind" in keys else FILE_KIND_FILE,
+            folder_id=r["folderId"] if "folderId" in keys else "",
+            folder_name=r["folderName"] if "folderName" in keys else "",
+            relative_path=r["relativePath"] if "relativePath" in keys else "",
+            folder_total=r["folderTotal"] if "folderTotal" in keys else 0,
+            pending=bool(r["pending"]) if "pending" in keys else False,
+        )
+
     def get_setting(self, key: str, default: str = "") -> str:
         with self._lock:
             row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()

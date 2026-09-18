@@ -132,12 +132,20 @@ class ContactRow(QFrame):
 
 
 class MemberListPage(QWidget):
-    def __init__(self, vm: ChatViewModel, on_open_groups, on_open_settings, on_open_chat):
+    def __init__(
+        self,
+        vm: ChatViewModel,
+        on_open_groups,
+        on_open_settings,
+        on_open_chat,
+        on_open_search=None,
+    ):
         super().__init__()
         self.vm = vm
         self.on_open_groups = on_open_groups
         self.on_open_settings = on_open_settings
         self.on_open_chat = on_open_chat
+        self.on_open_search = on_open_search
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -150,6 +158,12 @@ class MemberListPage(QWidget):
         title.setStyleSheet("font-size: 16px; font-weight: 700;")
         header_layout.addWidget(title)
         header_layout.addStretch()
+        if self.on_open_search is not None:
+            self.search_btn = QPushButton("搜索")
+            self.search_btn.setObjectName("ghost")
+            self.search_btn.setToolTip("搜索消息（群聊与私聊记录）")
+            self.search_btn.clicked.connect(self.on_open_search)
+            header_layout.addWidget(self.search_btn)
         self.settings_btn = QPushButton("设置")
         self.settings_btn.setObjectName("ghost")
         self.settings_btn.clicked.connect(self.on_open_settings)

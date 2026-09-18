@@ -9,6 +9,7 @@ from .direct_chat_page import DirectChatPage
 from .group_list_page import GroupListPage
 from .group_lobby_page import GroupLobbyPage
 from .member_list_page import MemberListPage
+from .search_page import SearchPage
 from .setup_page import SetupPage
 from .settings_page import SettingsPage
 from .theme import ON_PRIMARY, PRIMARY
@@ -21,6 +22,7 @@ PAGE_CHAT = 3
 PAGE_MEMBERS = 4
 PAGE_DIRECT = 5
 PAGE_SETTINGS = 6
+PAGE_SEARCH = 7
 
 
 def app_icon_pixmap(size: int = 64) -> QPixmap:
@@ -71,9 +73,11 @@ class MainWindow(QMainWindow):
             on_open_groups=self._go_groups,
             on_open_settings=self._go_settings,
             on_open_chat=self._go_direct,
+            on_open_search=self._go_search,
         )
         self.pages[PAGE_DIRECT] = DirectChatPage(vm, self._go_members)
         self.pages[PAGE_SETTINGS] = SettingsPage(vm, self._back_from_settings)
+        self.pages[PAGE_SEARCH] = SearchPage(vm, self._open_search_result, self._back_from_search)
         for page in self.pages.values():
             self.stack.addWidget(page)
 
@@ -247,6 +251,43 @@ class MainWindow(QMainWindow):
     def _go_direct(self, contact):
         self.pages[PAGE_DIRECT].open_chat(contact)
         self.stack.setCurrentIndex(PAGE_DIRECT)
+
+    def _go_search(self):
+        self._search_from = self.stack.currentIndex()
+        self.pages[PAGE_SEARCH].refresh()
+        self.stack.setCurrentIndex(PAGE_SEARCH)
+        self.pages[PAGE_SEARCH].focus_keyword()
+
+    def _back_from_search(self):
+        self.stack.setCurrentIndex(getattr(self, "_search_from", PAGE_MEMBERS))
+
+    def _open_search_result(self, hit):
+        """Open the conversation a search hit belongs to and ask its chat page
+        to scroll to and highlight that message (group id = a real group,
+        "direct:<peerId>" = a 1:1 chat)."""
+        msg = hit.get("message")
+        if msg is None:
+            return
+        if hit.get("is_direct"):
+            peer_id = hit["conversation_id"][len("direct:"):]
+            contact = next(
+                (c for c in self.vm.direct_contacts_list() if c.id == peer_id), None
+            )
+            if contact is None:
+                self.toast.show_message("该成员已不在成员列表中")
+                return
+            self._go_direct(contact)
+            self.pages[PAGE_DIRECT].reveal_message(msg.id)
+        else:
+            gid = hit["conversation_id"]
+            if not any(g.group_id == gid for g in self.vm.groups_list()):
+                # the group was removed after this history was left behind:
+                # switching would silently keep the PREVIOUS active group
+                self.toast.show_message("该群组已不在列表中")
+                return
+            self.vm.switch_to_group(gid)
+            self._go_chat()
+            self.pages[PAGE_CHAT].reveal_message(msg.id)
 
     def _go_settings(self):
         self._settings_from = self.stack.currentIndex()

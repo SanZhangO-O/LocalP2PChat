@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import QApplication, QPushButton
 import localchat.network as network_module
 from localchat.models import Peer
 from localchat.network import P2PListener, P2PManager
-from localchat.storage import ChatStore, SavedGroup
+from localchat.storage import ChatStore, SavedGroup, SavedMessage
 from localchat.view_model import ChatViewModel
 
 HOST_NAME = "\u6d4b\u8bd5\u4e3b\u673a"  # \\u6d4b\\u8bd5\\u4e3b\\u673a
@@ -412,6 +412,126 @@ class TombstoneStoreTest(unittest.TestCase):
             # deleting the group clears its tombstones too
             store.delete_group("g2")
             self.assertEqual(store.get_deleted_ids("g2"), [])
+        finally:
+            store.close()
+
+
+class MessageSearchStoreTest(unittest.TestCase):
+    """ChatStore.search_messages: keyword search over group + direct history.
+    Bodies are encrypted at rest, so the storage layer must still find them
+    (the LIKE prefilter alone cannot see the ciphertext) while LIKE wildcards
+    in the keyword stay literal."""
+
+    def _store_with_messages(self, name):
+        store = ChatStore(_fresh_db(name))
+        for gid, gname in (
+            ("g1", "\u529e\u516c\u5ba4"),
+            ("g2", "\u4f1a\u8bae\u5ba4"),
+            ("direct:peer-1", "\u5c0f\u674e"),
+        ):
+            store.upsert_group(SavedGroup(group_id=gid, group_name=gname, is_host=True))
+        store.insert_messages(
+            [
+                SavedMessage(
+                    "m1", "g1", "\u4f60\u597d\uff0c\u4eca\u5929\u5f00\u4f1a",
+                    1000, "u1", "\u5f20\u4e09", False,
+                ),
+                SavedMessage(
+                    "m2", "g1", "\u8fdb\u5ea6 100%\uff0c\u5df2\u5b8c\u6210",
+                    2000, "me", "\u6211", True,
+                ),
+                SavedMessage(
+                    "m3", "g2", "\u4f1a\u8bae\u5ba4\u7684\u65b0\u6d88\u606f",
+                    3000, "u2", "\u674e\u56db", False,
+                ),
+                SavedMessage(
+                    "m4", "g1", "report_final.pdf", 4000, "u1", "\u5f20\u4e09",
+                    False, file_size=2048, download_host="10.0.0.1",
+                    download_port=9000, kind="file",
+                ),
+                SavedMessage(
+                    "m5", "direct:peer-1", "\u4f60\u597d\u5440", 5000, "p1",
+                    "\u5c0f\u674e", False,
+                ),
+            ]
+        )
+        return store
+
+    def test_content_search_across_groups_and_direct(self):
+        store = self._store_with_messages("lc_search_all.db")
+        try:
+            hits = store.search_messages("\u4f60\u597d")
+            ids = [m.id for m in hits]
+            self.assertEqual(ids, ["m5", "m1"], "newest match first")
+            self.assertEqual(hits[0].group_id, "direct:peer-1")
+            # scope filter: only the requested conversation
+            self.assertEqual(
+                [m.id for m in store.search_messages("\u4f60\u597d", "g1")], ["m1"]
+            )
+            self.assertEqual(
+                [m.id for m in store.search_messages("\u4f60\u597d", "g2")], []
+            )
+        finally:
+            store.close()
+
+    def test_sender_name_column_matches(self):
+        store = self._store_with_messages("lc_search_sender.db")
+        try:
+            hits = store.search_messages("\u674e\u56db")
+            self.assertEqual([m.id for m in hits], ["m3"])
+            self.assertEqual(hits[0].sender_name, "\u674e\u56db")
+        finally:
+            store.close()
+
+    def test_file_name_search(self):
+        store = self._store_with_messages("lc_search_file.db")
+        try:
+            hits = store.search_messages("report_final")
+            self.assertEqual([m.id for m in hits], ["m4"])
+            self.assertEqual(hits[0].file_size, 2048)
+        finally:
+            store.close()
+
+    def test_like_wildcards_are_literal(self):
+        store = ChatStore(_fresh_db("lc_search_escape.db"))
+        try:
+            store.upsert_group(SavedGroup(group_id="g1", group_name="g", is_host=True))
+            store.insert_messages(
+                [
+                    SavedMessage("a", "g1", "abc", 1000, "u", "u", False),
+                    SavedMessage("b", "g1", "a_c", 2000, "u", "u", False),
+                    SavedMessage("c", "g1", "100% done", 3000, "u", "u", False),
+                ]
+            )
+            # "_" must not act as a single-char wildcard
+            self.assertEqual([m.id for m in store.search_messages("a_c")], ["b"])
+            # "%" must not act as a multi-char wildcard ...
+            self.assertEqual(
+                [m.id for m in store.search_messages("100%")], ["c"]
+            )
+            # ... and a bare "%" only matches a literal percent sign
+            self.assertEqual([m.id for m in store.search_messages("%")], ["c"])
+            # a bare "_" only matches a literal underscore
+            self.assertEqual([m.id for m in store.search_messages("_")], ["b"])
+            # backslash is escaped too (it is the LIKE escape character)
+            store.insert_messages(
+                [SavedMessage("d", "g1", "a\\b", 4000, "u", "u", False)]
+            )
+            self.assertEqual([m.id for m in store.search_messages("a\\b")], ["d"])
+        finally:
+            store.close()
+
+    def test_empty_keyword_and_limit(self):
+        store = self._store_with_messages("lc_search_limit.db")
+        try:
+            self.assertEqual(store.search_messages(""), [])
+            self.assertEqual(store.search_messages("   "), [])
+            limited = store.search_messages("\u4f60\u597d", limit=1)
+            self.assertEqual(len(limited), 1)
+            self.assertEqual(limited[0].id, "m5")
+            self.assertEqual(
+                store.escape_like("a%b_c\\d"), "a\\%b\\_c\\\\d"
+            )
         finally:
             store.close()
 
@@ -1908,6 +2028,220 @@ class ViewModelFlowTest(unittest.TestCase):
         buttons["\u5ffd\u7565"].click()
         self.assertEqual(calls, [("accept", "dev-42"), ("ignore", "dev-42")])
         page.deleteLater()
+
+    def test_search_history_resolves_conversation_names(self):
+        """VM.search_history covers group AND direct history and resolves the
+        conversation display name each hit belongs to (the search page shows
+        会话名 + 发送者 + 摘要 + 时间)."""
+        network_module.TCP_PORT = 10052
+        vm = make_vm(_fresh_db("lc_search_vm.db"))
+        self._vms = [vm]
+        vm.create_group("\u4e3b\u673a", "\u529e\u516c\u5ba4")
+        gid = vm.active_group_id
+        vm.direct.add_contact(Peer("peer-1", "\u5c0f\u674e", "127.0.0.1", 9))
+        vm.store.upsert_group(
+            SavedGroup(group_id="direct:peer-1", group_name="\u5c0f\u674e", is_host=False)
+        )
+        vm.store.insert_messages(
+            [
+                SavedMessage(
+                    "s1", gid, "\u5468\u4f1a\u7eaa\u8981", 1000, "u1",
+                    "\u5f20\u4e09", False,
+                ),
+                SavedMessage(
+                    "s2", "direct:peer-1", "\u4f60\u597d\uff0c\u5468\u4f1a\u89c1", 2000,
+                    "peer-1", "\u5c0f\u674e", False,
+                ),
+            ]
+        )
+        hits = vm.search_history("\u5468\u4f1a")
+        self.assertEqual(
+            [h["message"].id for h in hits], ["s2", "s1"], "newest match first"
+        )
+        by_id = {h["message"].id: h for h in hits}
+        self.assertEqual(by_id["s1"]["conversation"], "\u529e\u516c\u5ba4")
+        self.assertFalse(by_id["s1"]["is_direct"])
+        self.assertEqual(by_id["s2"]["conversation"], "\u5c0f\u674e")
+        self.assertTrue(by_id["s2"]["is_direct"])
+        self.assertEqual(by_id["s2"]["conversation_id"], "direct:peer-1")
+
+        # scope filter restricts to one conversation
+        scoped = vm.search_history("\u5468\u4f1a", gid)
+        self.assertEqual([h["message"].id for h in scoped], ["s1"])
+
+        # the range selector sees both conversations
+        ids = [s["id"] for s in vm.search_scopes()]
+        self.assertIn(gid, ids)
+        self.assertIn("direct:peer-1", ids)
+
+    def test_search_page_click_opens_conversation_and_highlights(self):
+        """Real UI path: member page 搜索 button -> search page -> clicking a
+        result opens the chat and flashes the message (delegate.highlight_id)."""
+        from localchat.models import ChatMessage
+        from localchat.ui.chat_page import MSG_ROLE
+        from localchat.ui.main_window import PAGE_CHAT, PAGE_MEMBERS, PAGE_SEARCH, MainWindow
+        from localchat.ui.search_page import message_preview
+        from PyQt6.QtCore import Qt
+
+        network_module.TCP_PORT = 10053
+        vm = make_vm(_fresh_db("lc_search_ui.db"))
+        self._vms = [vm]
+        vm.create_group("\u4e3b\u673a", "\u529e\u516c\u5ba4")
+        gid = vm.active_group_id
+        target = ChatMessage(
+            "jump-1", "\u627e\u5230\u6211\u4e86", 1700000000000,
+            "u1", "\u5f20\u4e09",
+        )
+        vm.group_p2p_map[gid].messages.append(target)
+        vm.store.insert_message(
+            SavedMessage(
+                "jump-1", gid, "\u627e\u5230\u6211\u4e86", 1700000000000,
+                "u1", "\u5f20\u4e09", False,
+            )
+        )
+
+        win = MainWindow(vm)
+        # UI wiring: the 搜索 entry lives on the member page header
+        self.assertTrue(hasattr(win.pages[PAGE_MEMBERS], "search_btn"))
+        win.pages[PAGE_MEMBERS].search_btn.click()
+        self.pump()
+        self.assertEqual(win.stack.currentIndex(), PAGE_SEARCH)
+        page = win.pages[PAGE_SEARCH]
+
+        page.keyword_edit.setText("\u627e\u5230\u6211")
+        page._run_search()
+        self.pump()
+        self.assertEqual(page.results.count(), 1, "the hit must be listed")
+        card_text = message_preview(
+            page.results.item(0).data(Qt.ItemDataRole.UserRole)["message"]
+        )
+        self.assertEqual(card_text, "\u627e\u5230\u6211\u4e86")
+
+        # click through the real signal path
+        page.results.itemClicked.emit(page.results.item(0))
+        self.pump()
+        self.assertEqual(win.stack.currentIndex(), PAGE_CHAT)
+        self.assertEqual(win.pages[PAGE_CHAT].delegate.highlight_id, "jump-1")
+        # the highlighted row really is the target message
+        rows = [
+            win.pages[PAGE_CHAT].model.item(i).data(MSG_ROLE)
+            for i in range(win.pages[PAGE_CHAT].model.rowCount())
+        ]
+        self.assertIn("jump-1", [getattr(r, "id", None) for r in rows])
+        win.close()
+
+    def test_direct_search_result_opens_direct_chat(self):
+        """A "direct:<peer>" hit navigates to the 1:1 page and highlights."""
+        from localchat.models import ChatMessage
+        from localchat.ui.main_window import PAGE_DIRECT, MainWindow
+
+        network_module.TCP_PORT = 10054
+        vm = make_vm(_fresh_db("lc_search_direct.db"))
+        self._vms = [vm]
+        contact = Peer("peer-7", "\u5c0f\u738b", "127.0.0.1", 9)
+        vm.direct.add_contact(contact)
+        vm.store.upsert_group(
+            SavedGroup(group_id="direct:peer-7", group_name="\u5c0f\u738b", is_host=False)
+        )
+        vm.store.insert_message(
+            SavedMessage(
+                "d-1", "direct:peer-7", "\u79c1\u804a\u5173\u952e\u8bcd", 1700000001000,
+                "peer-7", "\u5c0f\u738b", False,
+            )
+        )
+        # seed the live list so the direct page renders the message
+        vm.direct.seed_messages(
+            "peer-7",
+            [
+                ChatMessage(
+                    "d-1", "\u79c1\u804a\u5173\u952e\u8bcd", 1700000001000,
+                    "peer-7", "\u5c0f\u738b",
+                )
+            ],
+        )
+        win = MainWindow(vm)
+        hits = vm.search_history("\u5173\u952e\u8bcd")
+        self.assertEqual(len(hits), 1)
+        self.assertTrue(hits[0]["is_direct"])
+        win._open_search_result(hits[0])
+        self.pump()
+        self.assertEqual(win.stack.currentIndex(), PAGE_DIRECT)
+        self.assertEqual(win.pages[PAGE_DIRECT].delegate.highlight_id, "d-1")
+        win.close()
+
+    def test_emoji_recents_persist_and_insert_at_cursor(self):
+        """Emoji: inserting lands at the cursor; the 24 most recent picks are
+        persisted (newest first, deduped, capped) and survive a reload."""
+        from localchat.ui.chat_page import ChatPage
+        from localchat.ui.emoji_panel import (
+            RECENT_CAP,
+            EmojiPanel,
+            load_recent,
+            record_recent,
+        )
+
+        network_module.TCP_PORT = 10055
+        vm = make_vm(_fresh_db("lc_emoji.db"))
+        self._vms = [vm]
+        vm.create_group("\u4e3b\u673a", "\u8868\u60c5\u6d4b\u8bd5")
+        page = ChatPage(vm, lambda: None)
+
+        page.input_edit.setPlainText("ab")
+        cursor = page.input_edit.textCursor()
+        cursor.setPosition(1)
+        page.input_edit.setTextCursor(cursor)
+        page._insert_emoji("\U0001f600")
+        self.assertEqual(page.input_edit.toPlainText(), "a\U0001f600b")
+
+        # real UI path: the emoji button toggles the popup panel
+        page._toggle_emoji_panel()
+        self.assertIsNotNone(page._emoji_panel)
+        self.assertTrue(page._emoji_panel.isVisible())
+        page._toggle_emoji_panel()
+        self.assertFalse(page._emoji_panel.isVisible())
+        # picking through the panel inserts at the cursor (right after the
+        # first emoji, before "b")
+        page._emoji_panel._pick("\U0001f44d")
+        self.assertEqual(page.input_edit.toPlainText(), "a\U0001f600\U0001f44db")
+
+        for i in range(RECENT_CAP + 2):
+            record_recent(vm.store, chr(0x1F600 + i))
+        recent = load_recent(vm.store)
+        self.assertEqual(len(recent), RECENT_CAP)
+        self.assertEqual(recent[0], chr(0x1F600 + RECENT_CAP + 1))
+
+        # re-picking an old emoji moves it to the front without growing
+        oldest = recent[-1]
+        record_recent(vm.store, oldest)
+        after = load_recent(vm.store)
+        self.assertEqual(after[0], oldest)
+        self.assertEqual(len(after), RECENT_CAP)
+
+        # a fresh panel round-trips the persisted recents and records picks
+        panel = EmojiPanel(vm.store)
+        picked = []
+        panel.emoji_picked.connect(lambda e: picked.append(e))
+        panel._pick("\U0001f44d")
+        self.assertEqual(picked, ["\U0001f44d"])
+        self.assertEqual(load_recent(vm.store)[0], "\U0001f44d")
+        panel.deleteLater()
+        page.deleteLater()
+
+    def test_emoji_recent_survives_new_store_instance(self):
+        """The recents list is persisted in the settings table, so a restart
+        (new ChatStore on the same file) still shows it."""
+        from localchat.ui.emoji_panel import load_recent, record_recent
+
+        db = _fresh_db("lc_emoji_persist.db")
+        store = ChatStore(db)
+        record_recent(store, "\U0001f642")
+        record_recent(store, "\U0001f602")
+        store.close()
+        reopened = ChatStore(db)
+        try:
+            self.assertEqual(load_recent(reopened), ["\U0001f602", "\U0001f642"])
+        finally:
+            reopened.close()
 
 
 if __name__ == "__main__":
