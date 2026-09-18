@@ -1329,9 +1329,10 @@ class P2PManager(
         out: OutputStream,
         onProgress: (Long, Long) -> Unit = { _, _ -> },
         cancelled: () -> Boolean = { false },
-        sockHolder: MutableList<java.net.Socket>? = null
+        sockHolder: MutableList<java.net.Socket>? = null,
+        offset: Long = 0L
     ): FileTransfer.DownloadResult =
-        FileTransfer.download(fileInfo, out, onProgress, cancelled, sockHolder)
+        FileTransfer.download(fileInfo, out, onProgress, cancelled, sockHolder, offset)
 
     private fun broadcastToClients(packet: NetworkPacket, exclude: String? = null) {
         for ((id, conn) in connectedClients) {

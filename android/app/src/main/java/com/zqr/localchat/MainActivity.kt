@@ -562,9 +562,13 @@ fun LocalChatApp(
                         launchFilePicker(peerId, FileKind.VIDEO, arrayOf("video/*"))
                     },
                     onDownloadFile = { fileInfo ->
-                        pendingDownload = fileInfo
-                        pendingDownloadIsDirect = true
-                        fileSaverLauncher.launch(fileInfo.fileName)
+                        // a paused download resumes into its stored target;
+                        // only a fresh download opens the save dialog
+                        if (!viewModel.resumeFile(fileInfo, isDirect = true)) {
+                            pendingDownload = fileInfo
+                            pendingDownloadIsDirect = true
+                            fileSaverLauncher.launch(fileInfo.fileName)
+                        }
                     },
                     onPickFolder = {
                         pendingFolderSendChat = peerId
@@ -572,8 +576,16 @@ fun LocalChatApp(
                     },
                     folderDownloadStates = folderDownloadStates,
                     onDownloadFolder = { folderId ->
-                        pendingFolderDownload = folderId to peerId
-                        folderSaverLauncher.launch(null)
+                        // paused save: reuse the remembered destination tree
+                        val resumeTarget = viewModel.folderResumeTarget(folderId)
+                        if (resumeTarget != null) {
+                            viewModel.downloadDirectFolder(
+                                peerId, folderId, android.net.Uri.parse(resumeTarget)
+                            )
+                        } else {
+                            pendingFolderDownload = folderId to peerId
+                            folderSaverLauncher.launch(null)
+                        }
                     },
                     onDeleteFolder = { group ->
                         group.entries.forEach {
@@ -683,8 +695,12 @@ fun LocalChatApp(
                     launchFilePicker(null, FileKind.VIDEO, arrayOf("video/*"))
                 },
                 onDownloadFile = { fileInfo ->
-                    pendingDownload = fileInfo
-                    fileSaverLauncher.launch(fileInfo.fileName)
+                    // a paused download resumes into its stored target; only a
+                    // fresh download opens the save dialog
+                    if (!viewModel.resumeFile(fileInfo, isDirect = false)) {
+                        pendingDownload = fileInfo
+                        fileSaverLauncher.launch(fileInfo.fileName)
+                    }
                 },
                 onPickFolder = {
                     pendingFolderSendChat = null
@@ -692,8 +708,14 @@ fun LocalChatApp(
                 },
                 folderDownloadStates = folderDownloadStates,
                 onDownloadFolder = { folderId ->
-                    pendingFolderDownload = folderId to null
-                    folderSaverLauncher.launch(null)
+                    // paused save: reuse the remembered destination tree
+                    val resumeTarget = viewModel.folderResumeTarget(folderId)
+                    if (resumeTarget != null) {
+                        viewModel.downloadFolder(folderId, android.net.Uri.parse(resumeTarget))
+                    } else {
+                        pendingFolderDownload = folderId to null
+                        folderSaverLauncher.launch(null)
+                    }
                 },
                 onDeleteFolder = { group ->
                     group.entries.forEach { viewModel.deleteMessage(it.id) }

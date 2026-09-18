@@ -1274,9 +1274,10 @@ object DirectChatManager {
         out: OutputStream,
         onProgress: (Long, Long) -> Unit = { _, _ -> },
         cancelled: () -> Boolean = { false },
-        sockHolder: MutableList<java.net.Socket>? = null
+        sockHolder: MutableList<java.net.Socket>? = null,
+        offset: Long = 0L
     ): FileTransfer.DownloadResult =
-        FileTransfer.download(fileInfo, out, onProgress, cancelled, sockHolder)
+        FileTransfer.download(fileInfo, out, onProgress, cancelled, sockHolder, offset)
 
     /** Delete a message in a direct chat: the sender broadcasts it, everyone
      *  (including the sender) removes it locally. A still-queued (pending)

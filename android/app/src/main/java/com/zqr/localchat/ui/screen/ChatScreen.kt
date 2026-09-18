@@ -731,6 +731,28 @@ private fun formatFileSize(size: Long): String {
     return "$size B"
 }
 
+/** Live transfer detail line of a downloading card: 已传/总大小 · 速度 ·
+ *  剩余时间 (Windows parity: format_transfer_detail). */
+private fun formatTransferDetail(state: ChatViewModel.DownloadState.Downloading): String {
+    val text = StringBuilder(formatFileSize(state.received))
+    if (state.total > 0) {
+        text.append("/").append(formatFileSize(state.total))
+    }
+    if (state.speedBps > 0) {
+        text.append(" · ").append(formatFileSize(state.speedBps)).append("/s")
+    }
+    if (state.etaSeconds >= 0) {
+        val seconds = state.etaSeconds
+        text.append(" · 剩余 ")
+        if (seconds < 60) {
+            text.append(maxOf(1L, seconds)).append(" 秒")
+        } else {
+            text.append(seconds / 60).append(" 分 ").append(seconds % 60).append(" 秒")
+        }
+    }
+    return text.toString()
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun FileMessageBubble(
@@ -758,11 +780,14 @@ internal fun FileMessageBubble(
     val scope = rememberCoroutineScope()
 
     // an offer without a download address expired with its sender's previous
-    // session (the short-lived download server is gone)
-    val expired = fileInfo.downloadHost.isBlank()
+    // session (the short-lived download server is gone); a paused download is
+    // different — its address/key live in the persisted resume entry
+    val paused = state is ChatViewModel.DownloadState.Paused
+    val expired = fileInfo.downloadHost.isBlank() && !paused
     val downloading = state is ChatViewModel.DownloadState.Downloading && !isFromMe
     val statusText = when (state) {
         is ChatViewModel.DownloadState.Downloading -> "下载中 ${state.percent}%"
+        is ChatViewModel.DownloadState.Paused -> "已暂停 ${state.percent}%（点击续传）"
         is ChatViewModel.DownloadState.Done -> "已保存"
         is ChatViewModel.DownloadState.Failed -> state.message
         else -> when {
@@ -772,10 +797,11 @@ internal fun FileMessageBubble(
         }
     }
     // While a download is running the bubble tap CANCELS it (when the screen
-    // wired a cancel handler); otherwise the tap (re)starts the download.
+    // wired a cancel handler); otherwise the tap (re)starts or resumes it.
     val clickable = !expired && !isFromMe && when {
         downloading -> onCancel != null
-        else -> state == null || state is ChatViewModel.DownloadState.Failed
+        else -> state == null || state is ChatViewModel.DownloadState.Failed ||
+            state is ChatViewModel.DownloadState.Paused
     }
 
     Column(
@@ -821,7 +847,13 @@ internal fun FileMessageBubble(
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = formatFileSize(fileInfo.fileSize),
+                        // live 已传/总大小 · 速度 · 剩余时间 while downloading
+                        // (falls back to the plain size otherwise)
+                        text = if (state is ChatViewModel.DownloadState.Downloading) {
+                            formatTransferDetail(state)
+                        } else {
+                            formatFileSize(fileInfo.fileSize)
+                        },
                         color = textColor.copy(alpha = 0.7f),
                         fontSize = 11.sp
                     )
@@ -839,7 +871,7 @@ internal fun FileMessageBubble(
             ) {
                 if (!isFromMe && !expired) {
                     DropdownMenuItem(
-                        text = { Text("下载") },
+                        text = { Text(if (paused) "续传" else "下载") },
                         onClick = {
                             showMenu = false
                             onDownload()
@@ -907,8 +939,11 @@ internal fun FolderMessageBubble(
     onLongPress: () -> Unit = {}
 ) {
     val isFromMe = group.isFromMe
-    val expired = group.expired
     val downloading = state?.downloading == true && !isFromMe
+    // a paused folder keeps per-entry staging files: its resume entries carry
+    // the addresses even when the restored offers were blanked (已过期)
+    val paused = state?.paused == true && !isFromMe
+    val expired = group.expired && !paused
     val alignment = if (isFromMe) Alignment.End else Alignment.Start
     val bgColor = if (isFromMe)
         MaterialTheme.colorScheme.primary
@@ -923,6 +958,7 @@ internal fun FolderMessageBubble(
         isFromMe -> "已发送"
         expired -> "已过期"
         downloading -> "保存中 ${state?.done ?: 0}/${state?.total ?: group.total}"
+        paused -> "已暂停 ${state?.done ?: 0}/${state?.total ?: group.total}（点击续传）"
         state != null && state.message.isNotEmpty() -> state.message
         state != null && !state.downloading && state.savedPath.isNotEmpty() -> "已保存"
         else -> "点击保存"
@@ -1066,11 +1102,14 @@ internal fun MediaMessageBubble(
     val scope = rememberCoroutineScope()
 
     // an offer without a download address expired with its sender's previous
-    // session (the short-lived download server is gone)
-    val expired = fileInfo.downloadHost.isBlank()
+    // session (the short-lived download server is gone); a paused media
+    // download resumes from its staging entry
+    val paused = state is ChatViewModel.DownloadState.Paused
+    val expired = fileInfo.downloadHost.isBlank() && !paused
     val downloading = state is ChatViewModel.DownloadState.Downloading
     val statusText = when (state) {
-        is ChatViewModel.DownloadState.Downloading -> "下载中..."
+        is ChatViewModel.DownloadState.Downloading -> "下载中 ${state.percent}%"
+        is ChatViewModel.DownloadState.Paused -> "已暂停 ${state.percent}%（点击续传）"
         is ChatViewModel.DownloadState.Failed -> state.message
         else -> when {
             localPath != null -> if (isVideo) "点击播放" else "点击查看"
