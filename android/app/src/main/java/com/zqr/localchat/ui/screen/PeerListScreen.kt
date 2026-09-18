@@ -50,7 +50,8 @@ fun PeerListScreen(
     onLeave: () -> Unit,
     onBack: () -> Unit,
     onOpenChat: () -> Unit,
-    onCallPeer: (String) -> Unit = {}
+    onCallPeer: (String) -> Unit = {},
+    onCallAudioPeer: (String) -> Unit = {}
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     val clipboard = LocalClipboard.current
@@ -363,6 +364,9 @@ fun PeerListScreen(
                             peer = entry.value,
                             onCall = {
                                 if (!connectionLost) onCallPeer(entry.value.id)
+                            },
+                            onCallAudio = {
+                                if (!connectionLost) onCallAudioPeer(entry.value.id)
                             }
                         )
                     }
@@ -399,7 +403,8 @@ fun PeerListScreen(
 private fun PeerItem(
     peer: com.zqr.localchat.data.Peer,
     isSelf: Boolean = false,
-    onCall: (() -> Unit)? = null
+    onCall: (() -> Unit)? = null,
+    onCallAudio: (() -> Unit)? = null
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -456,6 +461,15 @@ private fun PeerItem(
                     }
                 }
                 Text(text = peer.ipAddress, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (!isSelf && onCallAudio != null) {
+                IconButton(onClick = onCallAudio) {
+                    Icon(
+                        Icons.Filled.Phone,
+                        contentDescription = "语音通话",
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
             if (!isSelf && onCall != null) {
                 IconButton(onClick = onCall) {

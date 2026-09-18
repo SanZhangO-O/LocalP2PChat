@@ -29,6 +29,9 @@ import androidx.lifecycle.LifecycleOwner
 import com.zqr.localchat.ChatApp
 import com.zqr.localchat.crypto.Crypto
 import com.zqr.localchat.data.CallInfo
+import com.zqr.localchat.data.CallDirection
+import com.zqr.localchat.data.CallMedia
+import com.zqr.localchat.data.CallResult
 import com.zqr.localchat.data.Peer
 import com.zqr.localchat.network.Handshake
 import com.zqr.localchat.network.DeviceIdentity
@@ -81,6 +84,10 @@ object CallManager {
     private const val CH_VIDEO = 0
     private const val CH_AUDIO = 1
 
+    /** Call media kinds (CallInfo.media): voice-only never opens the camera. */
+    const val MEDIA_AUDIO = CallMedia.AUDIO
+    const val MEDIA_VIDEO = CallMedia.VIDEO
+
     const val AUDIO_SAMPLE_RATE = 16000
     private const val AUDIO_CHUNK = 640 // 20ms of PCM16 mono
     private const val MEDIA_READ_TIMEOUT_MS = 15_000
@@ -123,16 +130,43 @@ object CallManager {
 
     sealed class CallState {
         data object Idle : CallState()
-        data class Outgoing(val peerId: String, val peerName: String, val callId: String) : CallState()
+        data class Outgoing(
+            val peerId: String,
+            val peerName: String,
+            val callId: String,
+            val media: String = CallMedia.VIDEO
+        ) : CallState()
+
         data class Incoming(
             val callId: String,
             val callerId: String,
             val callerName: String,
-            val mediaPort: Int
+            val mediaPort: Int,
+            val media: String = CallMedia.VIDEO
         ) : CallState()
 
-        data class Active(val peerId: String, val peerName: String, val callId: String) : CallState()
+        data class Active(
+            val peerId: String,
+            val peerName: String,
+            val callId: String,
+            val media: String = CallMedia.VIDEO
+        ) : CallState()
     }
+
+    /** One finished call's local log record (never sent over the wire): the
+     *  ViewModel persists it and (for a missed incoming call) posts a
+     *  click-to-open notification. Mirrors the Windows call_finished payload. */
+    data class FinishedCall(
+        val callId: String,
+        val peerId: String,
+        val peerName: String,
+        val role: String,
+        val direction: String,
+        val media: String,
+        val result: String,
+        val startedAt: Long,
+        val duration: Long
+    )
 
     private val _state = MutableStateFlow<CallState>(CallState.Idle)
     val state: StateFlow<CallState> = _state.asStateFlow()
@@ -159,6 +193,10 @@ object CallManager {
     private val _events = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val events: SharedFlow<String> = _events.asSharedFlow()
 
+    /** One record per finished call, for the local call log (never synced). */
+    private val _finishedCalls = MutableSharedFlow<FinishedCall>(extraBufferCapacity = 16)
+    val finishedCalls: SharedFlow<FinishedCall> = _finishedCalls.asSharedFlow()
+
     private val lock = Any()
     /** Where call signaling goes out (group relay or direct session). */
     private var channel: CallChannel? = null
@@ -174,6 +212,15 @@ object CallManager {
     private var callId = ""
     private var role = "" // "caller" | "callee"
     private var mediaPort = 0
+    /** "audio" | "video": set on start/offer; an audio call never starts the
+     *  camera and ignores inbound video frames (both ends agree via offer). */
+    @Volatile
+    private var currentMedia = MEDIA_VIDEO
+    /** Local call-log bookkeeping: start time, when media went active (0 while
+     *  ringing) and the outcome recorded by the ending path. */
+    private var callStartedAt = 0L
+    private var connectedAt = 0L
+    private var endResult = ""
     private var mediaServer: ServerSocket? = null
     private var mediaSocket: Socket? = null
     /** Session key negotiated by the media handshake; every frame is
@@ -286,7 +333,15 @@ object CallManager {
             peerName = call.callerName
             peerIp = callerIp ?: ""
             mediaPort = call.mediaPort
-            _state.value = CallState.Incoming(call.callId, call.callerId, call.callerName, call.mediaPort)
+            // Both ends agree on the media kind from the offer: an audio offer
+            // never opens the camera on either side.
+            currentMedia = if (call.media == MEDIA_AUDIO) MEDIA_AUDIO else MEDIA_VIDEO
+            callStartedAt = System.currentTimeMillis()
+            connectedAt = 0L
+            endResult = ""
+            _state.value = CallState.Incoming(
+                call.callId, call.callerId, call.callerName, call.mediaPort, currentMedia
+            )
         }
     }
 
@@ -303,7 +358,8 @@ object CallManager {
                 ?: return
             if (curCallId != call.callId) return
             if (cur is CallState.Outgoing) {
-                _state.value = CallState.Active(cur.peerId, cur.peerName, cur.callId)
+                if (connectedAt == 0L) connectedAt = System.currentTimeMillis()
+                _state.value = CallState.Active(cur.peerId, cur.peerName, cur.callId, currentMedia)
             } else if (cur !is CallState.Active) {
                 return
             }
@@ -317,6 +373,7 @@ object CallManager {
             if (call.callerId != myCallerId) return
             val cur = _state.value
             if (cur !is CallState.Outgoing || cur.callId != call.callId) return
+            endResult = CallResult.REJECTED
             reset()
         }
         _events.tryEmit("对方拒绝了通话")
@@ -328,6 +385,7 @@ object CallManager {
             if (call.callerId != myCallerId) return
             val cur = _state.value
             if (cur !is CallState.Outgoing || cur.callId != call.callId) return
+            endResult = CallResult.FAILED
             reset()
         }
         _events.tryEmit("通话建立失败，无法连接到对方")
@@ -347,6 +405,13 @@ object CallManager {
                 ?: return
             if (curCallId != call.callId) return
             ringing = cur is CallState.Incoming || cur is CallState.Outgoing
+            if (ringing) {
+                // the peer cancelled: our side never answered. On the callee
+                // that is a missed call; on the caller a cancelled one.
+                endResult = if (role == "callee") CallResult.MISSED else CallResult.CANCELLED
+            } else {
+                endResult = CallResult.ANSWERED
+            }
             srv = mediaServer
             sock = mediaSocket
             reset()
@@ -360,23 +425,26 @@ object CallManager {
 
     /** Start a call with a member of the active GROUP (signaling via the
      *  group's P2PManager relay). */
-    fun startCall(p2p: P2PManager, peer: Peer) =
+    fun startCall(p2p: P2PManager, peer: Peer, media: String = MEDIA_VIDEO) =
         startCall(
             peer,
             CallChannel { pid, pkt -> p2p.sendTargeted(pid, pkt) },
             p2p,
             p2p.myIdValue,
-            p2p.myNameValue
+            p2p.myNameValue,
+            media
         )
 
     /** Start a call over an arbitrary signaling channel (group relay or
-     *  direct session). [callerId]/[callerName] are OUR identity. */
+     *  direct session). [callerId]/[callerName] are OUR identity. [media] is
+     *  "video" (default) or "audio" (no camera capture on either side). */
     fun startCall(
         peer: Peer,
         channel: CallChannel,
         identity: Any,
         callerId: String,
-        callerName: String
+        callerName: String,
+        media: String = MEDIA_VIDEO
     ) {
         synchronized(lock) {
             if (_state.value !is CallState.Idle) {
@@ -402,10 +470,14 @@ object CallManager {
             peerIp = peer.ipAddress
             callId = UUID.randomUUID().toString()
             role = "caller"
+            currentMedia = if (media == MEDIA_AUDIO) MEDIA_AUDIO else MEDIA_VIDEO
+            callStartedAt = System.currentTimeMillis()
+            connectedAt = 0L
+            endResult = ""
             mediaPort = server.localPort
             mediaServer = server
             running = true
-            _state.value = CallState.Outgoing(peer.id, peer.name, callId)
+            _state.value = CallState.Outgoing(peer.id, peer.name, callId, currentMedia)
             val offer = NetworkPacket(
                 type = "call_offer",
                 call = CallInfo(
@@ -413,7 +485,9 @@ object CallManager {
                     callerId = callerId,
                     callerName = callerName,
                     calleeId = peer.id,
-                    mediaPort = mediaPort
+                    mediaPort = mediaPort,
+                    // omitted for video so the bytes stay as before
+                    media = if (currentMedia == MEDIA_AUDIO) MEDIA_AUDIO else null
                 )
             )
             channel.send(peer.id, offer)
@@ -485,7 +559,8 @@ object CallManager {
                         mediaSocket = s
                         mediaKey = wire.sessionKey
                         running = true
-                        _state.value = CallState.Active(cur.callerId, cur.callerName, cur.callId)
+                        if (connectedAt == 0L) connectedAt = System.currentTimeMillis()
+                        _state.value = CallState.Active(cur.callerId, cur.callerName, cur.callId, currentMedia)
                     }
                 }
                 if (!handoff) {
@@ -561,6 +636,8 @@ object CallManager {
     fun rejectCall() {
         synchronized(lock) {
             if (_state.value !is CallState.Incoming) return
+            // the user actively declined an incoming call
+            endResult = CallResult.REJECTED
             sendCallPacket("call_reject", callId)
             reset()
         }
@@ -570,7 +647,16 @@ object CallManager {
         val srv: ServerSocket?
         val sock: Socket?
         synchronized(lock) {
-            if (_state.value is CallState.Idle) return
+            val cur = _state.value
+            if (cur is CallState.Idle) return
+            endResult = when (cur) {
+                is CallState.Outgoing -> CallResult.CANCELLED // cancelled while ringing
+                is CallState.Active -> CallResult.ANSWERED
+                // UI only offers accept/reject for incoming; a hangup there
+                // means the call was never answered
+                is CallState.Incoming -> CallResult.MISSED
+                else -> CallResult.FAILED
+            }
             sendCallPacket("call_hangup", callId)
             srv = mediaServer
             sock = mediaSocket
@@ -701,7 +787,8 @@ object CallManager {
                 val cur = _state.value
                 if (cur is CallState.Outgoing && cur.callId == currentCallId) {
                     mediaSocket = sock
-                    _state.value = CallState.Active(cur.peerId, cur.peerName, cur.callId)
+                    if (connectedAt == 0L) connectedAt = System.currentTimeMillis()
+                    _state.value = CallState.Active(cur.peerId, cur.peerName, cur.callId, currentMedia)
                     activate = true
                 } else {
                     activate = false
@@ -722,6 +809,8 @@ object CallManager {
             // hang up the current one (Windows _on_ring_timeout callId filter).
             val timedOut: Boolean = synchronized(lock) {
                 if (_state.value is CallState.Outgoing && liveCallId() == currentCallId) {
+                    // nobody answered before the ring timeout
+                    endResult = CallResult.MISSED
                     sendCallPacket("call_hangup", currentCallId)
                     reset()
                     true
@@ -765,6 +854,11 @@ object CallManager {
             // never tear down the current call (parity with the Windows
             // _on_media_ended/_on_connect_failed callId filter).
             if (scopeCallId != null && liveCallId() != scopeCallId) return
+            if (endResult.isEmpty()) {
+                // generic teardown (media died / signaling lost): answered if
+                // media had gone active, otherwise a failed connection
+                endResult = if (connectedAt > 0L) CallResult.ANSWERED else CallResult.FAILED
+            }
             srv = mediaServer
             sock = mediaSocket
             reset()
@@ -775,6 +869,29 @@ object CallManager {
     }
 
     private fun reset() {
+        // Emit one finished-call record per call (id non-empty) BEFORE the
+        // fields are cleared: this is the single teardown point every ending
+        // path funnels through (Windows call_finished parity).
+        if (callId.isNotEmpty()) {
+            val endedAt = System.currentTimeMillis()
+            val result = endResult.ifEmpty {
+                if (connectedAt > 0L) CallResult.ANSWERED else CallResult.FAILED
+            }
+            _finishedCalls.tryEmit(
+                FinishedCall(
+                    callId = callId,
+                    peerId = peerId,
+                    peerName = peerName,
+                    role = role,
+                    direction = if (role == "caller") CallDirection.OUTGOING
+                    else CallDirection.INCOMING,
+                    media = currentMedia,
+                    result = result,
+                    startedAt = if (callStartedAt > 0L) callStartedAt else endedAt,
+                    duration = if (connectedAt > 0L) (endedAt - connectedAt) / 1000L else 0L
+                )
+            )
+        }
         channel = null
         identity = null
         myCallerId = ""
@@ -789,8 +906,13 @@ object CallManager {
         mediaSocket = null
         mediaKey = null
         running = false
+        currentMedia = MEDIA_VIDEO
+        callStartedAt = 0L
+        connectedAt = 0L
+        endResult = ""
         audioTxQueue.clear()
         pendingVideo = null
+        lastMediaSentAt = 0L
         _state.value = CallState.Idle
         _remoteVideo.value = null
         _localVideo.value = null
@@ -814,7 +936,8 @@ object CallManager {
         synchronized(lock) {
             if (!running || _state.value !is CallState.Active) return
             val ctx = ChatApp.instance
-            if (videoEngine == null) {
+            // Audio-only calls never open the camera on either side.
+            if (videoEngine == null && currentMedia != MEDIA_AUDIO) {
                 videoEngine = VideoEngine(
                     ctx,
                     lifecycleOwner,
@@ -877,7 +1000,9 @@ object CallManager {
      * whenever no frame has been sent for 3 seconds (camera failed to bind,
      * mic unavailable, video muted with a dead camera, ...) send a black
      * frame, so the remote side never hits its read timeout and the call
-     * never drops with "no signal".
+     * never drops with "no signal". An audio-only call has no video, so it
+     * pushes one silent PCM chunk to the audio queue instead (the sender
+     * thread stays the only socket writer).
      */
     private fun startVideoWatchdog() {
         if (watchdogThread?.isAlive == true) return
@@ -887,7 +1012,13 @@ object CallManager {
                     Thread.sleep(2000)
                     if (!running) break
                     if (System.currentTimeMillis() - lastMediaSentAt > 3000) {
-                        pendingVideo = blackJpeg
+                        if (currentMedia == MEDIA_AUDIO) {
+                            while (!audioTxQueue.offer(ByteArray(AUDIO_CHUNK))) {
+                                audioTxQueue.poll()
+                            }
+                        } else {
+                            pendingVideo = blackJpeg
+                        }
                     }
                 }
             } catch (e: InterruptedException) {
@@ -1047,6 +1178,9 @@ object CallManager {
                         break
                     }
                     if (channel == CH_VIDEO) {
+                        // audio-only calls carry no video: never decode a
+                        // frame on a call that never announced video
+                        if (currentMedia == MEDIA_AUDIO) continue
                         val bmp = decodeVideoFrame(payload)
                         if (bmp != null) _remoteVideo.value = bmp
                     } else if (channel == CH_AUDIO) {

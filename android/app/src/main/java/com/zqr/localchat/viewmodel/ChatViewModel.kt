@@ -33,6 +33,10 @@ import com.zqr.localchat.NotificationDismissReceiver
 import com.zqr.localchat.call.CallManager
 import com.zqr.localchat.crypto.Crypto
 import com.zqr.localchat.crypto.StoreCipher
+import com.zqr.localchat.data.CallDirection
+import com.zqr.localchat.data.CallLogEntity
+import com.zqr.localchat.data.CallMedia
+import com.zqr.localchat.data.CallResult
 import com.zqr.localchat.data.ChatDao
 import com.zqr.localchat.data.ChatDatabase
 import com.zqr.localchat.data.ChatMessage
@@ -266,11 +270,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val directEvents: SharedFlow<String> = DirectChatManager.events
 
     /**
-     * Start a video call with a direct-chat member. Signaling rides the 1:1
-     * session socket; when the session is not alive it is pulled up first
+     * Start a video/audio call with a direct-chat member. Signaling rides the
+     * 1:1 session socket; when the session is not alive it is pulled up first
      * (the other side auto-accepts) and the call is offered right after.
+     * [media] is "video" (default) or "audio".
      */
-    fun startDirectCall(peerId: String) {
+    fun startDirectCall(peerId: String, media: String = CallMedia.VIDEO) {
         val contact = DirectChatManager.contacts.value[peerId] ?: return
         val peer = Peer(contact.id, contact.name, contact.ip, contact.port)
         if (peer.ipAddress.isBlank()) return
@@ -278,7 +283,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (DirectChatManager.isChatAlive(peerId)) {
             CallManager.startCall(
                 peer, channel, DirectChatManager,
-                DirectChatManager.myIdValue, DirectChatManager.myNameValue
+                DirectChatManager.myIdValue, DirectChatManager.myNameValue, media
             )
         } else {
             // connect first; the handshake reveals the member's REAL id, which
@@ -290,7 +295,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     CallManager.startCall(
                         Peer(target.id, target.name, target.ip, target.port),
                         channel, DirectChatManager,
-                        DirectChatManager.myIdValue, DirectChatManager.myNameValue
+                        DirectChatManager.myIdValue, DirectChatManager.myNameValue, media
                     )
                 }
             }
@@ -729,6 +734,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // rows first, then the placeholder group row: its CASCADE
                 // delete must not wipe the rows being moved
                 chatDao.moveMessages("direct:$fromId", toKey)
+                chatDao.moveCallLogs("direct:$fromId", toKey)
                 chatDao.deleteGroup("direct:$fromId")
             }
         }
@@ -1138,6 +1144,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      *  screens). */
     companion object {
         private const val CHANNEL_MESSAGES = "localchat_messages"
+        /** Call-log history kept per conversation (newest kept, oldest
+         *  trimmed) — Windows ChatStore.CALL_LOG_CAP parity. */
+        private const val CALL_LOG_CAP = 200
         private val activeDownloads = ConcurrentHashMap<String, DownloadHandle>()
 
         /** Active folder downloads keyed by folderId, so the UI can cancel a
@@ -1677,6 +1686,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // screen can detect a same-name re-creation without extra wiring.
         viewModelScope.launch {
             _groups.collect { list -> savedGroupNames.value = list.map { it.groupName } }
+        }
+
+        // Every finished call is persisted to the local call log; a missed
+        // incoming call additionally posts a click-to-open notification.
+        viewModelScope.launch {
+            CallManager.finishedCalls.collect { call -> handleFinishedCall(call) }
         }
 
         // Group mesh: messages arriving over member-to-member links (host
@@ -2607,14 +2622,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val callUsingFrontCamera: StateFlow<Boolean> = CallManager.usingFrontCamera
     val callEvents: SharedFlow<String> = CallManager.events
 
-    /** Start a video call with a member of the active group. */
-    fun startCall(peerId: String) {
+    /** Start a video/audio call with a member of the active group. */
+    fun startCall(peerId: String, media: String = CallMedia.VIDEO) {
         val gid = _activeGroupId.value ?: return
         val p2p = groupP2pMap[gid] ?: return
         if (p2p.connectionLost.value) return
         val peer = p2p.peers.value[peerId] ?: return
-        CallManager.startCall(p2p, peer)
+        CallManager.startCall(p2p, peer, media)
     }
+
+    /** Local call history of one 1:1 conversation (oldest first), for the
+     *  system-style rows interleaved into the chat flow. */
+    fun callLogsFor(peerId: String): Flow<List<CallLogEntity>> =
+        chatDao.callLogsFor("direct:$peerId")
 
     fun acceptCall() = CallManager.acceptCall()
 
@@ -2627,6 +2647,66 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun setCallVideoMuted(muted: Boolean) = CallManager.setVideoMuted(muted)
 
     fun switchCallCamera() = CallManager.switchCamera()
+
+    /**
+     * Persist one finished call to the local call log (Room, never synced)
+     * and post a clickable notification for a missed incoming call. The call
+     * log row lives under the 1:1 conversation with the other participant,
+     * where the chat UI interleaves it as a system-style line.
+     */
+    private suspend fun handleFinishedCall(call: CallManager.FinishedCall) {
+        if (call.peerId.isBlank()) return
+        val key = "direct:${call.peerId}"
+        runCatching {
+            val logId = call.callId.ifBlank { java.util.UUID.randomUUID().toString() }
+            chatDao.insertCallLog(
+                CallLogEntity(
+                    id = logId,
+                    conversationKey = key,
+                    peerId = call.peerId,
+                    peerName = call.peerName,
+                    direction = call.direction,
+                    result = call.result,
+                    media = call.media,
+                    startTime = call.startedAt,
+                    duration = call.duration
+                )
+            )
+            chatDao.trimCallLogs(key, CALL_LOG_CAP)
+        }.onFailure { Log.w("ChatViewModel", "failed to persist call log", it) }
+        if (call.result == CallResult.MISSED && call.direction == CallDirection.INCOMING) {
+            notifyMissedCall(call)
+        }
+    }
+
+    /** Missed incoming call: a high-priority, click-to-open notification that
+     *  jumps straight into the 1:1 chat with the caller. */
+    private fun notifyMissedCall(call: CallManager.FinishedCall) {
+        val context = getApplication<Application>()
+        if (!notificationsPermissionGranted(context)) return
+        ensureMessageChannel(context)
+        val kind = if (call.media == CallMedia.AUDIO) "语音通话" else "视频通话"
+        val caller = call.peerName.ifBlank { call.peerId }
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra(MainActivity.EXTRA_OPEN_DIRECT_PEER_ID, call.peerId)
+        }
+        val contentPendingIntent = PendingIntent.getActivity(
+            context, ("missed:" + call.peerId).hashCode(), openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+            .setSmallIcon(android.R.drawable.stat_notify_missed_call)
+            .setContentTitle("未接来电")
+            .setContentText("$caller 的${kind}未接听")
+            .setCategory(NotificationCompat.CATEGORY_MISSED_CALL)
+            .setAutoCancel(true)
+            .setWhen(call.startedAt)
+            .setContentIntent(contentPendingIntent)
+            .build()
+        NotificationManagerCompat.from(context)
+            .notify(("missed:" + call.peerId).hashCode(), notification)
+    }
 
     private fun startMonitoringGroup(groupId: String, p2p: P2PManager) {
         monitoringJobs.remove(groupId)?.forEach { it.cancel() }

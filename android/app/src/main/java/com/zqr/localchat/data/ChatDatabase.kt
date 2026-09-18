@@ -8,8 +8,8 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-    entities = [SavedGroup::class, SavedChatMessage::class, DeletedMessage::class],
-    version = 4,
+    entities = [SavedGroup::class, SavedChatMessage::class, DeletedMessage::class, CallLogEntity::class],
+    version = 5,
     exportSchema = false
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -89,6 +89,28 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v4 -> v5: add the local call-log table (call history). CREATE TABLE +
+         * index only — no existing data is touched, history survives.
+         */
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `call_logs` (" +
+                        "`id` TEXT NOT NULL, `conversationKey` TEXT NOT NULL, " +
+                        "`peerId` TEXT NOT NULL, `peerName` TEXT NOT NULL, " +
+                        "`direction` TEXT NOT NULL, `result` TEXT NOT NULL, " +
+                        "`media` TEXT NOT NULL DEFAULT 'video', " +
+                        "`startTime` INTEGER NOT NULL, `duration` INTEGER NOT NULL DEFAULT 0, " +
+                        "PRIMARY KEY(`id`))"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_call_logs_conversationKey` " +
+                        "ON `call_logs` (`conversationKey`)"
+                )
+            }
+        }
+
         @Volatile
         private var INSTANCE: ChatDatabase? = null
 
@@ -99,7 +121,7 @@ abstract class ChatDatabase : RoomDatabase() {
                     ChatDatabase::class.java,
                     "localchat_database"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                     .build()
                 INSTANCE = instance
                 instance

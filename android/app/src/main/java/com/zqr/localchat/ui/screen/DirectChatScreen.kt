@@ -16,6 +16,7 @@ import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -25,6 +26,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.zqr.localchat.data.CallLogEntity
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
@@ -46,12 +48,18 @@ fun DirectChatScreen(
     contactIp: String,
     connected: Boolean,
     messages: List<ChatMessage>,
+    /** Local call history of this conversation, interleaved as system rows. */
+    callLogs: List<CallLogEntity> = emptyList(),
     downloadStates: Map<String, ChatViewModel.DownloadState> = emptyMap(),
     onBack: () -> Unit,
     onSend: (String) -> Boolean,
     onDelete: (ChatMessage) -> Unit,
     onCopy: (String) -> Unit,
     onCall: () -> Unit = {},
+    /** Start a voice-only call with this contact. */
+    onCallAudio: () -> Unit = {},
+    /** Clicking a call-log line redials with that entry's media kind. */
+    onCallBack: (String) -> Unit = {},
     onPickFile: () -> Unit = {},
     onPickImage: () -> Unit = {},
     onPickVideo: () -> Unit = {},
@@ -77,12 +85,12 @@ fun DirectChatScreen(
     val tooLong = input.length > P2PManager.MAX_CONTENT_LENGTH
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
-    // Folder grouping + sorting is O(n log n): compute once per message-list
-    // change instead of on every recomposition
-    val messageItems = remember(messages) { buildMessageItems(messages) }
+    // Folder grouping + call-log merge is O(n log n): compute once per
+    // message-list change instead of on every recomposition
+    val messageItems = remember(messages, callLogs) { buildDirectMessageItems(messages, callLogs) }
 
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
+    LaunchedEffect(messageItems.size) {
+        if (messageItems.isNotEmpty()) listState.scrollToItem(messageItems.size - 1)
     }
 
     Scaffold(
@@ -112,6 +120,13 @@ fun DirectChatScreen(
                             tint = MaterialTheme.colorScheme.onSurface
                         )
                     }
+                    IconButton(onClick = onCallAudio) {
+                        Icon(
+                            Icons.Filled.Phone,
+                            contentDescription = "语音通话",
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
                 }
             )
         }
@@ -135,7 +150,7 @@ fun DirectChatScreen(
                         .padding(horizontal = 16.dp, vertical = 4.dp)
                 )
             }
-            if (messages.isEmpty()) {
+            if (messageItems.isEmpty()) {
                 Box(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     contentAlignment = Alignment.Center
@@ -159,10 +174,18 @@ fun DirectChatScreen(
                             when (item) {
                                 is MessageItem.Folder -> "folder:${item.group.folderId}"
                                 is MessageItem.Msg -> item.message.id
+                                is MessageItem.Call -> "call:${item.log.id}"
                             }
                         }
                     ) { item ->
                         when (item) {
+                            is MessageItem.Call -> {
+                                // local call log: system-style line, click = redial
+                                CallLogLine(
+                                    log = item.log,
+                                    onClick = { onCallBack(item.log.media) }
+                                )
+                            }
                             is MessageItem.Folder -> {
                                 val group = item.group
                                 FolderMessageBubble(

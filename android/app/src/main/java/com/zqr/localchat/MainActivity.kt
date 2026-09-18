@@ -55,10 +55,14 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_OPEN_GROUP_ID = "com.zqr.localchat.OPEN_GROUP_ID"
+        /** Missed-call notification deep link: the peer whose 1:1 chat to open. */
+        const val EXTRA_OPEN_DIRECT_PEER_ID = "com.zqr.localchat.OPEN_DIRECT_PEER_ID"
     }
 
     // notification tap deep link: the group to jump straight into (null = none)
     private val openGroupId = mutableStateOf<String?>(null)
+    // missed-call notification tap: the direct-chat peer to jump into
+    private val openDirectPeerId = mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -68,11 +72,15 @@ class MainActivity : ComponentActivity() {
         // rememberSaveable — re-reading here would re-navigate on rotation
         if (savedInstanceState == null) {
             openGroupId.value = intent?.getStringExtra(EXTRA_OPEN_GROUP_ID)
+            openDirectPeerId.value = intent?.getStringExtra(EXTRA_OPEN_DIRECT_PEER_ID)
         }
         enableEdgeToEdge()
         setContent {
             LocalChatTheme {
-                LocalChatApp(openGroupId = openGroupId)
+                LocalChatApp(
+                    openGroupId = openGroupId,
+                    openDirectPeerId = openDirectPeerId
+                )
             }
         }
     }
@@ -81,13 +89,15 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         intent.getStringExtra(EXTRA_OPEN_GROUP_ID)?.let { openGroupId.value = it }
+        intent.getStringExtra(EXTRA_OPEN_DIRECT_PEER_ID)?.let { openDirectPeerId.value = it }
     }
 }
 
 @Composable
 fun LocalChatApp(
     viewModel: ChatViewModel = viewModel(),
-    openGroupId: MutableState<String?> = remember { mutableStateOf<String?>(null) }
+    openGroupId: MutableState<String?> = remember { mutableStateOf<String?>(null) },
+    openDirectPeerId: MutableState<String?> = remember { mutableStateOf<String?>(null) }
 ) {
     val context = LocalContext.current
     val mediaVersion by viewModel.mediaVersion.collectAsState()
@@ -238,6 +248,7 @@ fun LocalChatApp(
 
     var pendingCallAction by remember { mutableStateOf<(() -> Unit)?>(null) }
     var callRequestInFlight by remember { mutableStateOf(false) }
+    var callRequestAudioOnly by remember { mutableStateOf(false) }
     val callPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
@@ -245,14 +256,20 @@ fun LocalChatApp(
         if (grants.values.all { it }) {
             pendingCallAction?.invoke()
         } else {
-            Toast.makeText(context, "需要摄像头和麦克风权限才能进行视频通话", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                context,
+                if (callRequestAudioOnly) "需要麦克风权限才能进行语音通话"
+                else "需要摄像头和麦克风权限才能进行视频通话",
+                Toast.LENGTH_SHORT
+            ).show()
         }
         pendingCallAction = null
     }
 
-    fun requireCallPermission(action: () -> Unit) {
+    fun requireCallPermission(audioOnly: Boolean = false, action: () -> Unit) {
         val needed = buildList {
-            add(Manifest.permission.CAMERA)
+            // a voice-only call needs the microphone but never the camera
+            if (!audioOnly) add(Manifest.permission.CAMERA)
             add(Manifest.permission.RECORD_AUDIO)
         }.filter {
             ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
@@ -263,6 +280,7 @@ fun LocalChatApp(
             // a permission prompt is already open; do not overwrite its action
             return
         } else {
+            callRequestAudioOnly = audioOnly
             pendingCallAction = action
             callRequestInFlight = true
             callPermissionLauncher.launch(needed.toTypedArray())
@@ -438,6 +456,26 @@ fun LocalChatApp(
             }
     }
 
+    LaunchedEffect(Unit) {
+        // missed-call notification tap: jump straight into that 1:1 chat. On a
+        // cold start the persisted contacts load asynchronously, so wait for
+        // the peer to appear (timeout = drop a link to a removed contact).
+        snapshotFlow { openDirectPeerId.value }
+            .filterNotNull()
+            .collect { pid ->
+                openDirectPeerId.value = null
+                val contact = withTimeoutOrNull(5000) {
+                    snapshotFlow { directContacts.find { it.id == pid } }.first { it != null }
+                }
+                if (contact == null) return@collect
+                requireLocalNetworkPermission {
+                    viewModel.openDirectChat(contact)
+                    activeDirectPeerId = contact.id
+                    currentScreenName = Screen.DirectChat.name
+                }
+            }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
     when (currentScreen) {
         Screen.GroupList -> {
@@ -524,11 +562,14 @@ fun LocalChatApp(
                 }
                 val directMessages by viewModel.directMessages(peerId)
                     .collectAsState(initial = emptyList())
+                val callLogs by viewModel.callLogsFor(peerId)
+                    .collectAsState(initial = emptyList())
                 DirectChatScreen(
                     contactName = contact?.name ?: peerId,
                     contactIp = contact?.let { "${it.ip}:${it.port}" } ?: "",
                     connected = peerId in directAliveSessions,
                     messages = directMessages,
+                    callLogs = callLogs,
                     downloadStates = downloadStates,
                     onBack = {
                         // keep the session alive (presence re-establishes
@@ -550,6 +591,16 @@ fun LocalChatApp(
                     onCall = {
                         requireCallPermission {
                             viewModel.startDirectCall(peerId)
+                        }
+                    },
+                    onCallAudio = {
+                        requireCallPermission(audioOnly = true) {
+                            viewModel.startDirectCall(peerId, CallManager.MEDIA_AUDIO)
+                        }
+                    },
+                    onCallBack = { media ->
+                        requireCallPermission(audioOnly = media == CallManager.MEDIA_AUDIO) {
+                            viewModel.startDirectCall(peerId, media)
                         }
                     },
                     onPickFile = {
@@ -659,6 +710,11 @@ fun LocalChatApp(
                     requireCallPermission {
                         viewModel.startCall(peerId)
                     }
+                },
+                onCallAudioPeer = { peerId ->
+                    requireCallPermission(audioOnly = true) {
+                        viewModel.startCall(peerId, CallManager.MEDIA_AUDIO)
+                    }
                 }
             )
         }
@@ -743,14 +799,20 @@ fun LocalChatApp(
     }
 
     (callState as? CallManager.CallState.Incoming)?.let { incoming ->
+        val incomingAudio = incoming.media == CallManager.MEDIA_AUDIO
         AlertDialog(
             onDismissRequest = { viewModel.rejectCall() },
-            title = { Text("📹 视频通话邀请") },
-            text = { Text("${incoming.callerName} 邀请你进行视频通话") },
+            title = { Text(if (incomingAudio) "🎙 语音通话邀请" else "📹 视频通话邀请") },
+            text = {
+                Text(
+                    "${incoming.callerName} 邀请你进行" +
+                        (if (incomingAudio) "语音通话" else "视频通话")
+                )
+            },
             confirmButton = {
                 TextButton(
                     onClick = {
-                        requireCallPermission { viewModel.acceptCall() }
+                        requireCallPermission(audioOnly = incomingAudio) { viewModel.acceptCall() }
                     }
                 ) {
                     Text("接听", color = androidx.compose.ui.graphics.Color(0xFF2E7D32))

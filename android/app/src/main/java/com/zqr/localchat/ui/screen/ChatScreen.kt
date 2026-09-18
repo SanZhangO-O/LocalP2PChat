@@ -8,6 +8,7 @@ import android.widget.Toast
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -50,6 +51,10 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.zqr.localchat.data.CallDirection
+import com.zqr.localchat.data.CallLogEntity
+import com.zqr.localchat.data.CallMedia
+import com.zqr.localchat.data.CallResult
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
@@ -88,6 +93,10 @@ internal sealed class MessageItem {
     }
     data class Folder(val group: FolderGroup) : MessageItem() {
         override val timestamp: Long get() = group.timestamp
+    }
+    /** A local call-log line (system style, never a bubble, never deletable). */
+    data class Call(val log: CallLogEntity) : MessageItem() {
+        override val timestamp: Long get() = log.startTime
     }
 }
 
@@ -134,6 +143,43 @@ internal fun buildMessageItems(messages: List<ChatMessage>): List<MessageItem> {
         }
     }
     return items
+}
+
+/** Display text of one call-log line ("未接来电", "视频通话 02:31", ...).
+ *  Audio is called out explicitly; video is the implicit default. Mirrors the
+ *  Windows call_log_text. */
+internal fun callLogText(log: CallLogEntity): String {
+    val base = when (log.result) {
+        CallResult.ANSWERED -> {
+            val seconds = log.duration.coerceAtLeast(0L)
+            val mm = seconds / 60
+            val ss = seconds % 60
+            val hh = mm / 60
+            val dur = if (hh > 0) "%d:%02d:%02d".format(hh, mm % 60, ss)
+            else "%02d:%02d".format(mm, ss)
+            "${if (log.media == CallMedia.AUDIO) "语音" else "视频"}通话 $dur"
+        }
+        CallResult.MISSED -> if (log.direction == CallDirection.INCOMING) "未接来电" else "对方未接听"
+        CallResult.REJECTED -> if (log.direction == CallDirection.INCOMING) "已拒绝" else "对方已拒绝"
+        CallResult.CANCELLED -> "已取消"
+        else -> "通话未接通"
+    }
+    return if (log.media == CallMedia.AUDIO && log.result != CallResult.ANSWERED) "$base（语音）" else base
+}
+
+/**
+ * Conversation rows of a direct chat: the message flow with the local
+ * call-log lines interleaved by time (stable sort keeps message order for
+ * equal timestamps). Call logs are local-only and never part of the message
+ * protocol, so they are merged at render time.
+ */
+internal fun buildDirectMessageItems(
+    messages: List<ChatMessage>,
+    callLogs: List<CallLogEntity>
+): List<MessageItem> {
+    val items = buildMessageItems(messages)
+    if (callLogs.isEmpty()) return items
+    return (items + callLogs.map { MessageItem.Call(it) }).sortedBy { it.timestamp }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -386,6 +432,7 @@ fun ChatScreen(
                     when (item) {
                         is MessageItem.Folder -> "folder:${item.group.folderId}"
                         is MessageItem.Msg -> item.message.id
+                        is MessageItem.Call -> "call:${item.log.id}"
                     }
                 }) { index, item ->
                     val prev = items.getOrNull(index - 1)
@@ -393,6 +440,10 @@ fun ChatScreen(
                         DateHeader(timestamp = item.timestamp)
                     }
                     when (item) {
+                        is MessageItem.Call -> {
+                            // local call log: a system-style line, never a bubble
+                            CallLogLine(log = item.log, onClick = {})
+                        }
                         is MessageItem.Folder -> {
                             val group = item.group
                             FolderMessageBubble(
@@ -1298,3 +1349,32 @@ private fun MediaPlaceholderCard(
         )
     }
 }
+
+/**
+ * One local call-log row rendered as a centered system-style line (no bubble,
+ * never deletable/forwardable). Clicking it redials with the same media kind.
+ */
+@Composable
+internal fun CallLogLine(log: CallLogEntity, onClick: () -> Unit) {
+    val missed = log.result == CallResult.MISSED && log.direction == CallDirection.INCOMING
+    val color = if (missed) MaterialTheme.colorScheme.error
+    else MaterialTheme.colorScheme.onSurfaceVariant
+    Box(
+        modifier = Modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = "${callLogText(log)}  ${timeText(log.startTime)}",
+            fontSize = 12.sp,
+            color = color,
+            modifier = Modifier
+                .clip(RoundedCornerShape(10.dp))
+                .clickable(onClick = onClick)
+                .padding(horizontal = 10.dp, vertical = 4.dp)
+        )
+    }
+}
+
+private fun timeText(timestamp: Long): String =
+    java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+        .format(java.util.Date(timestamp))
