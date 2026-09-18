@@ -266,7 +266,8 @@ object GroupMeshManager {
 
     /** Tell every linked member that [peer] joined the group, so each one
      *  links up with it (used when a member sponsors a join). */
-    fun announcePeer(groupId: String, peer: Peer) {        val state = groups[groupId] ?: return
+    fun announcePeer(groupId: String, peer: Peer) {
+        val state = groups[groupId] ?: return
         addPeer(groupId, peer)
         val packet = NetworkPacket(type = "mesh_announce", groupId = groupId, peer = peer)
         val links = state.links.values.toList()

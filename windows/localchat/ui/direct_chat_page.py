@@ -250,6 +250,7 @@ class DirectChatPage(QWidget):
         self.vm.folder_download_finished.connect(self._on_folder_download_finished)
         self.vm.folder_send_finished.connect(self._on_folder_send_finished)
         self.vm.folder_send_truncated.connect(self._on_folder_send_truncated)
+
     def open_chat(self, contact: Peer) -> None:
         self._contact = contact
         self.title_label.setText(contact.name)
