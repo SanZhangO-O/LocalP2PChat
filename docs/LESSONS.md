@@ -33,3 +33,20 @@
 - 验证: 同一提交下静置后 `python -m pytest tests -q` → `218 passed`；单独重跑失败用例 → 21 passed。
 - 防再犯: 全量套件成片失败时，先单独重跑失败用例再判断是否回归；不要把一个运行里成片的网络超时
   当成功能破坏。
+
+### 续报（同日，五分支合并验证）：负载源不止 Gradle 构建
+
+- 补充现象: 机器上同时有 Android 模拟器（qemu-system-x86_64，约 2.3GB 常驻、CPU 6000s+）和
+  两个 Gradle 守护进程（各约 2GB）时，同一提交连续三次全量跑分别失败
+  `test_functional::test_folder_offer_grouping_and_download`、
+  `test_functional::test_group_page_shows_typing_names`、
+  `test_group_admin::test_owner_kick_removes_member_everywhere`
+  与 `test_punch::test_join_via_server_wrong_password_rejected`（失败集合每次不同）；
+  期间还偶发一次 `CALL ERROR: Exceptions caught in Qt event loop: TypeError: () missing 1
+  required positional argument: 'key'`，无论装 `sys.excepthook` / `threading.excepthook` /
+  `qInstallMessageHandler` 都抓不到堆栈，且目标用例随运行漂移，未定位到任何代码路径。
+- 结论: 与上一条同因（负载型时序假失败 + 偶发 Qt 层噪音），非功能回归；单独重跑（含 kick/punch）
+  全部通过，`testDebugUnitTest` 与 `assembleDebug` 均成功。
+- 防再犯: 全量验证前确认没有模拟器/Gradle 守护进程在跑（`Get-Process` 看
+  qemu/java），必要时先停掉再跑；出现 `CALL ERROR ... TypeError` 时先隔离重跑，
+  不要据此改代码。
