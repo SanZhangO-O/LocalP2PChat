@@ -34,6 +34,7 @@ import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.data.MAX_FOLDER_FILES
 import com.zqr.localchat.data.detectMediaKind
+import com.zqr.localchat.data.replyPreviewText
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.ui.screen.CallOverlay
 import com.zqr.localchat.ui.screen.ChatScreen
@@ -230,6 +231,8 @@ fun LocalChatApp(
     val directLastMessages by viewModel.directLastMessages.collectAsState()
     val directAliveSessions by viewModel.directAliveSessions.collectAsState()
     val directContactRequests by viewModel.directContactRequests.collectAsState()
+    val directTypingPeers by viewModel.directTypingPeers.collectAsState()
+    val groupTyping by viewModel.groupTyping.collectAsState()
 
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(lifecycleOwner) {
@@ -530,13 +533,24 @@ fun LocalChatApp(
                     connected = peerId in directAliveSessions,
                     messages = directMessages,
                     downloadStates = downloadStates,
+                    peerTyping = peerId in directTypingPeers,
                     onBack = {
                         // keep the session alive (presence re-establishes
                         // anyway; closing only causes offline flicker)
+                        viewModel.endDirectTyping(peerId)
                         activeDirectPeerId = null
                         currentScreenName = Screen.MemberList.name
                     },
-                    onSend = { content -> viewModel.sendDirectMessage(peerId, content) },
+                    onSend = { content, reply ->
+                        viewModel.sendDirectMessage(
+                            peerId,
+                            content,
+                            reply?.id,
+                            reply?.replyPreviewText(),
+                            reply?.senderName
+                        )
+                    },
+                    onTyping = { viewModel.notifyDirectTyping(peerId) },
                     onDelete = { msg ->
                         viewModel.deleteDirectMessage(peerId, msg.id, msg.senderId)
                     },
@@ -670,7 +684,16 @@ fun LocalChatApp(
                 groups = groups,
                 connectionLost = activeConnectionLost,
                 downloadStates = downloadStates,
-                onSendMessage = viewModel::sendMessage,
+                typingNames = groupTyping[activeGroupId]?.values?.toList() ?: emptyList(),
+                onSendMessage = { content, reply ->
+                    viewModel.sendMessage(
+                        content,
+                        reply?.id,
+                        reply?.replyPreviewText(),
+                        reply?.senderName
+                    )
+                },
+                onTyping = { viewModel.notifyGroupTyping() },
                 onForward = viewModel::sendMessageToGroup,
                 onDelete = viewModel::deleteMessage,
                 onPickFile = {

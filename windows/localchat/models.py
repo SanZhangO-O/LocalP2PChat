@@ -6,6 +6,10 @@ from typing import Optional, List
 MAX_CONTENT_LENGTH = 5000
 MAX_LINE_LENGTH = 64 * 1024
 TCP_PORT = 9999
+# Reply/quote previews travel inside the wire reply fields: cap the copied
+# snippet so one huge quoted message cannot bloat every reply packet
+# (Android parity: Models.MAX_REPLY_PREVIEW).
+MAX_REPLY_PREVIEW = 120
 
 
 def _strict_int(value, field: str) -> int:
@@ -234,10 +238,24 @@ class ChatMessage:
     sender_name: str
     is_from_me: bool = False
     file_info: Optional[FileInfo] = None
+    # Reply/quote (optional, omitted from the wire when unset so a plain
+    # message stays byte-identical): reply_to is the quoted message's id,
+    # reply_preview a short snippet of its content and reply_sender the
+    # original sender's display name. All three are self-contained so the
+    # receiver can render the quote even when the referenced message is not
+    # in its local history (Android parity: ChatMessage.replyTo/replyPreview/
+    # replySender).
+    reply_to: Optional[str] = None
+    reply_preview: Optional[str] = None
+    reply_sender: Optional[str] = None
     # Local-only delivery state (like is_from_me, never sent over the wire):
     # true while an offline-sent message still waits in the direct chat
     # outbox for the peer to come online (Android parity).
     pending: bool = False
+    # Local-only read state for OWN direct-chat messages: flipped when the
+    # peer's read_receipt covers this message. Never sent over the wire;
+    # group chats do not track per-reader receipts.
+    read: bool = False
 
     def to_dict(self) -> dict:
         d = {
@@ -249,6 +267,12 @@ class ChatMessage:
         }
         if self.file_info is not None:
             d["fileInfo"] = self.file_info.to_dict()
+        if self.reply_to is not None:
+            d["replyTo"] = self.reply_to
+            if self.reply_preview is not None:
+                d["replyPreview"] = self.reply_preview
+            if self.reply_sender is not None:
+                d["replySender"] = self.reply_sender
         return d
 
     @staticmethod
@@ -260,6 +284,13 @@ class ChatMessage:
         file_info = None
         if d.get("fileInfo") is not None:
             file_info = FileInfo.from_dict(d["fileInfo"])
+        reply_to = None if d.get("replyTo") is None else str(d["replyTo"])
+        reply_preview = (
+            None if d.get("replyPreview") is None else str(d["replyPreview"])
+        )
+        reply_sender = (
+            None if d.get("replySender") is None else str(d["replySender"])
+        )
         return ChatMessage(
             id=msg_id,
             content=str(d.get("content", "")),
@@ -267,6 +298,9 @@ class ChatMessage:
             sender_id=sender_id,
             sender_name=str(d.get("senderName", "")),
             file_info=file_info,
+            reply_to=reply_to,
+            reply_preview=reply_preview,
+            reply_sender=reply_sender,
         )
 
     def marked_from_me(self, my_id: str) -> "ChatMessage":
@@ -440,6 +474,16 @@ class NetworkPacket:
     # receiver can reject replayed/reordered/injected lines. Never set by
     # application code.
     seq: Optional[int] = None
+    # read_receipt: the newest message id the sender has read in the
+    # [group_id] scope; reader_id is the reader's device id (must match the
+    # packet's authenticated sender). Direct chats only — group chats do not
+    # track per-reader receipts (see README).
+    up_to_id: Optional[str] = None
+    reader_id: Optional[str] = None
+    # typing: true while the sender is composing in the [group_id] scope,
+    # false once it stopped. Advisory only: receivers also expire an indicator
+    # that received no refresh (see README).
+    active: Optional[bool] = None
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
@@ -487,6 +531,12 @@ class NetworkPacket:
             d["token"] = self.token
         if self.seq is not None:
             d["seq"] = self.seq
+        if self.up_to_id is not None:
+            d["upToId"] = self.up_to_id
+        if self.reader_id is not None:
+            d["readerId"] = self.reader_id
+        if self.active is not None:
+            d["active"] = self.active
         return d
 
     def to_json(self) -> str:
@@ -549,6 +599,16 @@ class NetworkPacket:
             pkt.token = str(d["token"])
         if d.get("seq") is not None:
             pkt.seq = _strict_int(d["seq"], "seq")
+        if d.get("upToId") is not None:
+            pkt.up_to_id = str(d["upToId"])
+        if d.get("readerId") is not None:
+            pkt.reader_id = str(d["readerId"])
+        if d.get("active") is not None:
+            # like the call flags: only a real boolean passes, so a crafted
+            # "false"/0/1 cannot silently flip the indicator
+            if not isinstance(d["active"], bool):
+                raise ValueError("typing field active must be a boolean")
+            pkt.active = d["active"]
         if pkt_type == "error" and pkt.error_message is None:
             raise ValueError("error packet missing required field: errorMessage")
         if pkt_type == "chat" and pkt.message is None:
@@ -559,6 +619,10 @@ class NetworkPacket:
             raise ValueError("file_download packet missing required field: fileId")
         if pkt_type == "delete_message" and not pkt.message_id:
             raise ValueError("delete_message packet missing required field: messageId")
+        if pkt_type == "read_receipt" and (not pkt.up_to_id or not pkt.reader_id):
+            raise ValueError("read_receipt packet missing required field: upToId or readerId")
+        if pkt_type == "typing" and (not pkt.sender_id or pkt.active is None):
+            raise ValueError("typing packet missing required field: senderId or active")
         return pkt
 
     @staticmethod

@@ -46,5 +46,13 @@ data class SavedChatMessage(
     val folderTotal: Int = 0,
     /** True while an own direct-chat message is still waiting for the peer
      *  to come online (pending send). Restored into the outbox at startup. */
-    val pending: Boolean = false
+    val pending: Boolean = false,
+    /** Reply/quote (empty when the message is not a reply): survives restart
+     *  so the quoted header still renders. Mirrors the wire ChatMessage. */
+    val replyTo: String = "",
+    val replyPreview: String = "",
+    val replySender: String = "",
+    /** Own direct-chat message read by the peer (set by a read_receipt):
+     *  survives restart so "已读" does not flip back after a relaunch. */
+    val read: Boolean = false
 )

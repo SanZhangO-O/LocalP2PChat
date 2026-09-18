@@ -39,12 +39,16 @@ class Rec(DirectChatListener):
     def __init__(self):
         self.contact_changes = 0
         self.message_changes = []
+        self.typing_changes = []
 
     def direct_contacts_changed(self):
         self.contact_changes += 1
 
     def direct_messages_changed(self, peer_id: str):
         self.message_changes.append(peer_id)
+
+    def direct_typing_changed(self, peer_id: str, active: bool):
+        self.typing_changes.append((peer_id, active))
 
 
 def wait_until(cond, timeout=8.0):
@@ -440,6 +444,171 @@ class DirectChatTest(unittest.TestCase):
             "the undelivered message must return to the outbox",
         )
         self.assertTrue(restored and restored[0].pending, "it must be pending again")
+
+    # ------------------------------------------------- reply / receipt / typing
+
+    def test_reply_fields_deliver_over_session(self):
+        """A reply's quoted header (id/preview/sender) reaches the peer intact
+        so its bubble can render 引用头 + 正文 (Android parity)."""
+        self.assertTrue(self.a.start_chat(Peer("dev-B", "\u5c0fB", "127.0.0.1", self.PORT)))
+        self.assertTrue(wait_until(lambda: self.b.is_chat_alive("dev-A")))
+        self.assertTrue(self.b.send_message("dev-A", "original"))
+        self.assertTrue(
+            wait_until(
+                lambda: any(
+                    m.content == "original" for m in self.a.messages_for("dev-B")
+                )
+            )
+        )
+        original_id = next(
+            m.id for m in self.a.messages_for("dev-B") if m.content == "original"
+        )
+        self.assertTrue(
+            self.a.send_message(
+                "dev-B",
+                "reply!",
+                reply_to=original_id,
+                reply_preview="original",
+                reply_sender="\u5c0fB",  # 小B
+            )
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: any(
+                    m.content == "reply!"
+                    and m.reply_to == original_id
+                    and m.reply_preview == "original"
+                    and m.reply_sender == "\u5c0fB"
+                    for m in self.b.messages_for("dev-A")
+                )
+            ),
+            "reply header must survive the wire",
+        )
+        # a plain message carries no reply fields
+        self.assertTrue(self.a.send_message("dev-B", "plain"))
+        self.assertTrue(
+            wait_until(
+                lambda: any(m.content == "plain" for m in self.b.messages_for("dev-A"))
+            )
+        )
+        plain = next(m for m in self.b.messages_for("dev-A") if m.content == "plain")
+        self.assertIsNone(plain.reply_to)
+        self.assertIsNone(plain.reply_preview)
+
+    def test_receiving_chat_auto_sends_read_receipt(self):
+        """B receives A's plain chat and automatically acknowledges it; A's
+        own bubble flips to read (已读) once the receipt arrives. Only OWN
+        messages ever carry read."""
+        self.assertTrue(self.a.start_chat(Peer("dev-B", "\u5c0fB", "127.0.0.1", self.PORT)))
+        self.assertTrue(wait_until(lambda: self.b.is_chat_alive("dev-A")))
+        self.assertTrue(self.a.send_message("dev-B", "read me"))
+        self.assertTrue(
+            wait_until(
+                lambda: any(
+                    m.content == "read me" and m.read
+                    for m in self.a.messages_for("dev-B")
+                )
+            ),
+            "A's own message must flip to read after B's receipt",
+        )
+        # the received copy on B never reports read (it is not B's own)
+        received = next(
+            m for m in self.b.messages_for("dev-A") if m.content == "read me"
+        )
+        self.assertFalse(received.read, "read is an own-message attribute")
+
+    def test_typing_events_reach_the_peer(self):
+        """send_typing rides the live session; the peer's listener sees the
+        active=True then the active=False transition."""
+        self.assertTrue(self.a.start_chat(Peer("dev-B", "\u5c0fB", "127.0.0.1", self.PORT)))
+        self.assertTrue(wait_until(lambda: self.b.is_chat_alive("dev-A")))
+        self.a.send_typing("dev-B", True)
+        self.assertTrue(
+            wait_until(lambda: ("dev-A", True) in self.rec_b.typing_changes)
+        )
+        self.a.send_typing("dev-B", False)
+        self.assertTrue(
+            wait_until(lambda: ("dev-A", False) in self.rec_b.typing_changes)
+        )
+
+    def test_typing_never_queued_offline_and_validates_scope(self):
+        """An offline send_typing is dropped, never parked in the outbox; a
+        live typing packet with a forged sender or scope is ignored."""
+        self.a.send_typing("dev-B", True)
+        self.assertEqual(self.a._outbox.get("dev-B", []), [], "typing must not queue")
+
+        self.assertTrue(self.a.start_chat(Peer("dev-B", "\u5c0fB", "127.0.0.1", self.PORT)))
+        self.assertTrue(wait_until(lambda: self.b.is_chat_alive("dev-A")))
+        self.a.send_packet(
+            "dev-B",
+            NetworkPacket(
+                type="typing", group_id="direct:wrong", sender_id="dev-A", active=True
+            ),
+        )
+        self.a.send_packet(
+            "dev-B",
+            NetworkPacket(
+                type="typing",
+                group_id="direct:dev-A",
+                sender_id="dev-EVIL",
+                active=True,
+            ),
+        )
+        time.sleep(0.3)
+        self.assertEqual(self.rec_b.typing_changes, [], "forged typing must be ignored")
+
+    def test_read_receipt_validates_reader_and_scope(self):
+        """Only the session peer may report its own reading, and only for this
+        chat's scope: a forged readerId/scope must not flip local bubbles."""
+        self.assertTrue(self.a.start_chat(Peer("dev-B", "\u5c0fB", "127.0.0.1", self.PORT)))
+        self.assertTrue(wait_until(lambda: self.b.is_chat_alive("dev-A")))
+        own = network_module.ChatMessage(
+            id="own-1",
+            content="\u5df2\u53d1\u9001",  # 已发送
+            timestamp=int(time.time() * 1000),
+            sender_id="dev-A",
+            sender_name="\u5c0fA",  # 小A
+            is_from_me=True,
+        )
+        self.a._append_message("dev-B", own)
+        # forged readerId and forged scope are both ignored
+        self.b.send_packet(
+            "dev-A",
+            NetworkPacket(
+                type="read_receipt",
+                group_id="direct:dev-B",
+                up_to_id="own-1",
+                reader_id="dev-EVIL",
+            ),
+        )
+        self.b.send_packet(
+            "dev-A",
+            NetworkPacket(
+                type="read_receipt",
+                group_id="direct:wrong",
+                up_to_id="own-1",
+                reader_id="dev-B",
+            ),
+        )
+        time.sleep(0.3)
+        self.assertFalse(
+            self.a.messages_for("dev-B")[0].read,
+            "forged receipts must not flip read",
+        )
+        # the legitimate receipt (peer id + this chat's scope) flips it
+        self.b.send_packet(
+            "dev-A",
+            NetworkPacket(
+                type="read_receipt",
+                group_id="direct:dev-B",
+                up_to_id="own-1",
+                reader_id="dev-B",
+            ),
+        )
+        self.assertTrue(
+            wait_until(lambda: self.a.messages_for("dev-B")[0].read),
+            "the peer's own receipt must mark the message read",
+        )
 
 
 if __name__ == "__main__":

@@ -57,6 +57,11 @@ interface ChatDao {
     @Query("UPDATE saved_messages SET pending = :pending WHERE groupId = :groupId AND id = :id")
     suspend fun updateMessagePending(groupId: String, id: String, pending: Boolean)
 
+    /** Flip the persisted read state of one own direct-chat message (the
+     *  peer's read_receipt covered it). */
+    @Query("UPDATE saved_messages SET read = :read WHERE groupId = :groupId AND id = :id")
+    suspend fun updateMessageRead(groupId: String, id: String, read: Boolean)
+
     /** Move every message row from one conversation key to another (used when
      *  a manually added "ip:..." placeholder chat is revealed to be a real
      *  device id by the handshake). OR REPLACE: the target chat's observer

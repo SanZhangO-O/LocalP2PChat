@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Reply
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -48,11 +49,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
+import com.zqr.localchat.data.replyPreviewText
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.viewmodel.ChatViewModel
 import kotlinx.coroutines.Dispatchers
@@ -145,7 +148,10 @@ fun ChatScreen(
     groups: List<ChatViewModel.GroupMeta>,
     connectionLost: Boolean,
     downloadStates: Map<String, ChatViewModel.DownloadState> = emptyMap(),
-    onSendMessage: (String) -> Boolean,
+    /** Display names of members currently typing ("xx 正在输入…"). */
+    typingNames: List<String> = emptyList(),
+    /** Send the draft, optionally quoting [replyTo] (null = plain message). */
+    onSendMessage: (String, ChatMessage?) -> Boolean,
     onForward: (groupId: String, content: String) -> Boolean,
     onDelete: (String) -> Unit,
     onPickFile: () -> Unit = {},
@@ -165,12 +171,17 @@ fun ChatScreen(
      *  to the inline render without any other recomposition trigger. */
     mediaVersion: Int = 0,
     onOpenFile: (String) -> Unit = {},
+    /** The local user typed in the draft: refresh our typing indicator
+     *  (the ViewModel throttles and auto-stops it). */
+    onTyping: () -> Unit = {},
     onBack: () -> Unit
 ) {
     var inputText by rememberSaveable { mutableStateOf("") }
     var pendingForward by remember { mutableStateOf<String?>(null) }
     var pendingDelete by remember { mutableStateOf<String?>(null) }
     var pendingFolderDelete by remember { mutableStateOf<FolderGroup?>(null) }
+    // Message being quoted by the next send (null = plain message).
+    var replyTarget by remember { mutableStateOf<ChatMessage?>(null) }
     val listState = rememberLazyListState()
     var shouldAutoScroll by remember(groupName) { mutableStateOf(true) }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -187,8 +198,9 @@ fun ChatScreen(
         if (contentTooLong) return
         val text = inputText
         if (text.isNotBlank()) {
-            if (onSendMessage(text)) {
+            if (onSendMessage(text, replyTarget)) {
                 inputText = ""
+                replyTarget = null
             } else {
                 scope.launch {
                     snackbarHostState.showSnackbar("消息未发送：已断开连接")
@@ -217,11 +229,27 @@ fun ChatScreen(
         }
     }
 
+    // a different group never inherits the previous chat's quote target
+    LaunchedEffect(groupId) { replyTarget = null }
+
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
-                title = { Text(groupName) },
+                title = {
+                    Column {
+                        Text(groupName)
+                        if (typingNames.isNotEmpty()) {
+                            Text(
+                                text = typingNames.joinToString("、") + " 正在输入…",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(
@@ -252,6 +280,9 @@ fun ChatScreen(
                                 .fillMaxWidth()
                                 .padding(horizontal = 16.dp, vertical = 4.dp)
                         )
+                    }
+                    replyTarget?.let { target ->
+                        ReplyComposeBar(target = target, onCancel = { replyTarget = null })
                     }
                     Row(
                         modifier = Modifier
@@ -314,7 +345,10 @@ fun ChatScreen(
                     Spacer(modifier = Modifier.width(4.dp))
                     OutlinedTextField(
                         value = inputText,
-                        onValueChange = { inputText = it },
+                        onValueChange = {
+                            inputText = it
+                            if (it.isNotBlank()) onTyping()
+                        },
                         placeholder = { Text("输入消息...") },
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(20.dp),
@@ -434,6 +468,7 @@ fun ChatScreen(
                             } else {
                                 MessageBubble(
                                     message = message,
+                                    onReply = { replyTarget = it },
                                     onForward = { pendingForward = it },
                                     onDelete = { pendingDelete = it }
                                 )
@@ -611,6 +646,7 @@ private fun isSameDay(a: Long, b: Long): Boolean {
 @Composable
 private fun MessageBubble(
     message: ChatMessage,
+    onReply: (ChatMessage) -> Unit,
     onForward: (String) -> Unit,
     onDelete: (String) -> Unit
 ) {
@@ -664,6 +700,7 @@ private fun MessageBubble(
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                 }
+                ReplyHeader(message = message, mine = isFromMe)
                 Text(
                     text = message.content,
                     color = textColor,
@@ -680,6 +717,14 @@ private fun MessageBubble(
                 expanded = showMenu,
                 onDismissRequest = { showMenu = false }
             ) {
+                DropdownMenuItem(
+                    text = { Text("回复") },
+                    onClick = {
+                        onReply(message)
+                        showMenu = false
+                    },
+                    leadingIcon = { Icon(Icons.Filled.Reply, contentDescription = null) }
+                )
                 DropdownMenuItem(
                     text = { Text("复制") },
                     onClick = {
@@ -710,6 +755,101 @@ private fun MessageBubble(
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * Quoted-message header inside a reply bubble: an accent bar plus the
+ * original sender's name and an elided one-line preview. Both come from the
+ * self-contained reply wire fields, so the quote renders even when the
+ * referenced message is not in local history (Windows parity).
+ */
+@Composable
+internal fun ReplyHeader(message: ChatMessage, mine: Boolean) {
+    if (message.replyTo == null) return
+    val base = if (mine) MaterialTheme.colorScheme.onPrimary
+    else MaterialTheme.colorScheme.onSurfaceVariant
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 6.dp)
+            .background(base.copy(alpha = 0.10f), RoundedCornerShape(6.dp))
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .width(3.dp)
+                .height(26.dp)
+                .background(base.copy(alpha = 0.7f), RoundedCornerShape(2.dp))
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Column(modifier = Modifier.weight(1f, fill = false)) {
+            Text(
+                text = message.replySender?.ifBlank { null } ?: "回复",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                color = base.copy(alpha = 0.85f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = message.replyPreview.orEmpty().replace('\n', ' '),
+                fontSize = 11.sp,
+                color = base.copy(alpha = 0.7f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+/** Compose bar shown above the input while replying: what will be quoted and
+ *  a cancel button (shared by the group and direct chat screens). */
+@Composable
+internal fun ReplyComposeBar(target: ChatMessage, onCancel: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .background(
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                RoundedCornerShape(8.dp)
+            )
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .width(3.dp)
+                .height(32.dp)
+                .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp))
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = "回复 ${target.senderName}",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = target.replyPreviewText(),
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        IconButton(onClick = onCancel) {
+            Icon(
+                Icons.Filled.Close,
+                contentDescription = "取消回复",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }

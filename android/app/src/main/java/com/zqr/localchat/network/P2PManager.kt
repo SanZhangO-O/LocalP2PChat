@@ -480,6 +480,12 @@ class P2PManager(
     @Volatile
     var callSignalListener: ((NetworkPacket) -> Unit)? = null
 
+    /** A member's typing indicator changed (host relay path). Advisory: the
+     *  ViewModel also expires an indicator that received no refresh. Invoked
+     *  on the read-loop thread. */
+    @Volatile
+    var typingListener: ((senderId: String, active: Boolean) -> Unit)? = null
+
     /**
      * Invoked by the shared HostGroupServer when the program-wide listener
      * bind state changes (error message, or null when it recovers).
@@ -977,6 +983,15 @@ class P2PManager(
                     runCatching { wire.sendPacket(NetworkPacket(type = "pong")) }
                 }
             }
+            "typing" -> {
+                // advisory typing indicator for a member, attributed by the
+                // host relay (the host validated the sender before forwarding)
+                val sender = packet.senderId
+                val active = packet.active
+                if (sender != null && active != null && sender != myId) {
+                    typingListener?.invoke(sender, active)
+                }
+            }
             "pong" -> { /* traffic only; keeps the read loop alive */ }
             in CALL_PACKET_TYPES -> {
                 // Call packets are never broadcast on the relay path: a client
@@ -1032,6 +1047,18 @@ class P2PManager(
                 if (conn != null) {
                     runCatching { conn.wire.sendPacket(NetworkPacket(type = "pong")) }
                 }
+            }
+            "typing" -> {
+                // a member is composing: attribute the indicator to the
+                // authenticated connection (never to a packet-carried id we
+                // did not verify), show it to the host itself, and relay it
+                // to the other members (exclude the sender, like chat/delete)
+                if (packet.senderId != senderId || packet.active == null) {
+                    Log.w(TAG, "drop typing from $senderId: packet senderId=${packet.senderId}")
+                    return
+                }
+                typingListener?.invoke(senderId, packet.active)
+                broadcastToClients(packet, exclude = senderId)
             }
             "pong" -> { /* traffic only */ }
             in CALL_PACKET_TYPES -> routeCallPacket(packet, senderId)
@@ -1097,8 +1124,14 @@ class P2PManager(
 
     /** Send a chat message through the host relay; returns the created
      *  message (or null when the content is invalid) so the caller can also
-     *  broadcast it over the group mesh. */
-    fun sendMessage(content: String): ChatMessage? {
+     *  broadcast it over the group mesh. The optional reply triple attaches a
+     *  quoted header (see ChatMessage); a forward passes none of them. */
+    fun sendMessage(
+        content: String,
+        replyTo: String? = null,
+        replyPreview: String? = null,
+        replySender: String? = null
+    ): ChatMessage? {
         if (!isValidContent(content)) return null
         val msg = ChatMessage(
             id = UUID.randomUUID().toString(),
@@ -1106,7 +1139,10 @@ class P2PManager(
             timestamp = System.currentTimeMillis(),
             senderId = myId,
             senderName = myName,
-            isFromMe = true
+            isFromMe = true,
+            replyTo = replyTo,
+            replyPreview = replyPreview,
+            replySender = replySender
         )
         // Update local state synchronously so a delete issued right after the
         // send (removeMessage) can find this message immediately.
@@ -1124,6 +1160,29 @@ class P2PManager(
             }
         }
         return msg
+    }
+
+    /** Broadcast a typing indicator to the group over the host relay (the
+     *  ViewModel mirrors it over the mesh). Advisory and never queued
+     *  offline: without a live connection there is nobody to show it to. */
+    fun sendTyping(active: Boolean) {
+        val packet = NetworkPacket(
+            type = "typing",
+            groupId = currentGroupId,
+            senderId = myId,
+            active = active
+        )
+        sendScope.launch {
+            try {
+                if (isHost) {
+                    broadcastToClients(packet)
+                } else {
+                    hostWire?.sendPacket(packet)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "sendTyping failed", e)
+            }
+        }
     }
 
     /** Merge messages that arrived on the group mesh (or history sync) into

@@ -3,7 +3,9 @@ package com.zqr.localchat
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.DeletedMessage
 import com.zqr.localchat.data.FileInfo
+import com.zqr.localchat.data.MAX_REPLY_PREVIEW
 import com.zqr.localchat.data.Peer
+import com.zqr.localchat.data.replyPreviewText
 import com.zqr.localchat.network.FileTransfer
 import com.zqr.localchat.network.GroupMeshManager
 import com.zqr.localchat.network.LineIn
@@ -365,5 +367,133 @@ class NetworkProtocolTest {
         assertEquals(P2PManager.MAX_DELETED_IDS, capped.size)
         assertEquals("m-1", capped.first())
         assertEquals("m-${P2PManager.MAX_DELETED_IDS}", capped.last())
+    }
+
+    // ---------------------------------------- reply / read receipt / typing
+
+    @Test
+    fun `reply fields serialize in wire order and roundtrip`() {
+        // byte contract with the Windows peer: camelCase replyTo / replyPreview
+        // / replySender, compact JSON, in declaration order right after
+        // senderName (fileInfo omitted when null)
+        val msg = ChatMessage(
+            id = "m1",
+            content = "hi",
+            timestamp = 100L,
+            senderId = "dev-a",
+            senderName = "A",
+            replyTo = "m0",
+            replyPreview = "q",
+            replySender = "B"
+        )
+        val encoded = json.encodeToString(NetworkPacket(type = "chat", message = msg))
+
+        assertEquals(
+            "{\"type\":\"chat\",\"message\":{\"id\":\"m1\",\"content\":\"hi\"," +
+                "\"timestamp\":100,\"senderId\":\"dev-a\",\"senderName\":\"A\"," +
+                "\"replyTo\":\"m0\",\"replyPreview\":\"q\",\"replySender\":\"B\"}}",
+            encoded
+        )
+
+        val decoded = json.decodeFromString<NetworkPacket>(encoded)
+        assertEquals("m0", decoded.message!!.replyTo)
+        assertEquals("q", decoded.message!!.replyPreview)
+        assertEquals("B", decoded.message!!.replySender)
+    }
+
+    @Test
+    fun `plain message omits reply fields`() {
+        val encoded = json.encodeToString(
+            NetworkPacket(
+                type = "chat",
+                message = ChatMessage("m1", "hi", 100L, "dev-a", "A")
+            )
+        )
+
+        assertFalse(encoded.contains("replyTo"))
+        assertFalse(encoded.contains("replyPreview"))
+        assertFalse(encoded.contains("replySender"))
+        assertNull(json.decodeFromString<NetworkPacket>(encoded).message!!.replyTo)
+    }
+
+    @Test
+    fun `read state is not transmitted over the wire`() {
+        // read is flipped by a peer read_receipt and persisted locally; like
+        // isFromMe/pending it must never be serialized
+        val msg = ChatMessage(
+            "m1", "hi", 100L, "dev-a", "A",
+            isFromMe = true, pending = false, read = true
+        )
+        val encoded = json.encodeToString(NetworkPacket(type = "chat", message = msg))
+
+        assertFalse("read must not be serialized", encoded.contains("\"read\""))
+        assertFalse(json.decodeFromString<NetworkPacket>(encoded).message!!.read)
+    }
+
+    @Test
+    fun `read_receipt serializes in wire order and roundtrips`() {
+        val packet = NetworkPacket(
+            type = "read_receipt",
+            groupId = "direct:dev-a",
+            upToId = "m9",
+            readerId = "dev-a"
+        )
+        val encoded = json.encodeToString(packet)
+
+        assertEquals(
+            "{\"type\":\"read_receipt\",\"groupId\":\"direct:dev-a\"," +
+                "\"upToId\":\"m9\",\"readerId\":\"dev-a\"}",
+            encoded
+        )
+
+        val decoded = json.decodeFromString<NetworkPacket>(encoded)
+        assertEquals("read_receipt", decoded.type)
+        assertEquals("direct:dev-a", decoded.groupId)
+        assertEquals("m9", decoded.upToId)
+        assertEquals("dev-a", decoded.readerId)
+    }
+
+    @Test
+    fun `typing serializes active true and false and roundtrips`() {
+        // active=false is NOT the nullable default, so it must be encoded —
+        // dropping it would leave the peer's "正在输入…" on forever
+        val started = json.encodeToString(
+            NetworkPacket(type = "typing", groupId = "direct:dev-a", senderId = "dev-a", active = true)
+        )
+        assertEquals(
+            "{\"type\":\"typing\",\"groupId\":\"direct:dev-a\"," +
+                "\"senderId\":\"dev-a\",\"active\":true}",
+            started
+        )
+        assertTrue(json.decodeFromString<NetworkPacket>(started).active!!)
+
+        val stopped = json.encodeToString(
+            NetworkPacket(type = "typing", groupId = "direct:dev-a", senderId = "dev-a", active = false)
+        )
+        assertTrue(stopped.contains("\"active\":false"))
+        assertFalse(json.decodeFromString<NetworkPacket>(stopped).active!!)
+    }
+
+    @Test
+    fun `typing and receipt fields are omitted when null`() {
+        val encoded = json.encodeToString(NetworkPacket(type = "ping"))
+
+        assertEquals("{\"type\":\"ping\"}", encoded)
+        assertFalse(encoded.contains("active"))
+        assertFalse(encoded.contains("upToId"))
+        assertFalse(encoded.contains("readerId"))
+    }
+
+    @Test
+    fun `replyPreviewText flattens newlines and caps length`() {
+        val long = ChatMessage("m1", "a\nb" + "x".repeat(200), 1L, "a", "A")
+        val preview = long.replyPreviewText()
+
+        assertEquals(MAX_REPLY_PREVIEW, preview.length)
+        assertFalse(preview.contains("\n"))
+        assertEquals(
+            "plain",
+            ChatMessage("m2", "  plain  ", 1L, "a", "A").replyPreviewText()
+        )
     }
 }
