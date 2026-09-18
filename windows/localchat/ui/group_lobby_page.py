@@ -1,12 +1,16 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -14,13 +18,73 @@ from PyQt6.QtWidgets import (
 
 from .. import network as network_module
 from ..models import Peer
-from ..view_model import ChatViewModel
+from ..view_model import MAX_NAME_LENGTH, ChatViewModel
 from .theme import ERROR, PRIMARY, TEXT_SUBTLE
 from .widgets import AvatarLabel, Toast
 
 
+class GroupSettingsDialog(QDialog):
+    """Owner-only editor for the group name and announcement. Saving calls
+    ChatViewModel.update_group_info, which broadcasts a group_update."""
+
+    def __init__(self, vm: ChatViewModel, parent=None):
+        super().__init__(parent)
+        self.vm = vm
+        self.setWindowTitle("群设置")
+        self.setObjectName("confirmDialog")
+        self.setMinimumWidth(360)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(8)
+
+        name_label = QLabel("群名称")
+        name_label.setObjectName("faint")
+        layout.addWidget(name_label)
+        self.name_edit = QLineEdit(vm.active_group_name)
+        self.name_edit.setMaxLength(MAX_NAME_LENGTH)
+        layout.addWidget(self.name_edit)
+
+        ann_label = QLabel("群公告")
+        ann_label.setObjectName("faint")
+        layout.addWidget(ann_label)
+        self.announcement_edit = QPlainTextEdit(vm.active_group_announcement())
+        self.announcement_edit.setPlaceholderText("输入群公告（留空则清除）")
+        self.announcement_edit.setFixedHeight(110)
+        layout.addWidget(self.announcement_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        save_btn = buttons.button(QDialogButtonBox.StandardButton.Save)
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        save_btn.setText("保存")
+        cancel_btn.setText("取消")
+        save_btn.clicked.connect(self._on_save)
+        cancel_btn.clicked.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_save(self):
+        name = self.name_edit.text().strip()
+        if not name:
+            Toast(self.window()).show_message("群名称不能为空")
+            return
+        announcement = self.announcement_edit.toPlainText().strip()
+        if not self.vm.update_group_info(name, announcement):
+            Toast(self.window()).show_message("群信息更新失败")
+            return
+        self.accept()
+
+
 class PeerRow(QFrame):
-    def __init__(self, peer: Peer, is_self: bool = False, on_call=None, parent=None):
+    def __init__(
+        self,
+        peer: Peer,
+        is_self: bool = False,
+        on_call=None,
+        on_kick=None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.setObjectName("card")
         layout = QHBoxLayout(self)
@@ -56,6 +120,14 @@ class PeerRow(QFrame):
             call_btn.clicked.connect(lambda checked=False, pid=peer.id: on_call(pid))
             layout.addWidget(call_btn)
 
+        if not is_self and on_kick is not None:
+            kick_btn = QPushButton("移出")
+            kick_btn.setObjectName("danger")
+            kick_btn.setToolTip("将该成员移出群组")
+            kick_btn.setFixedSize(64, 40)
+            kick_btn.clicked.connect(lambda checked=False, pid=peer.id: on_kick(pid))
+            layout.addWidget(kick_btn)
+
 
 class GroupLobbyPage(QWidget):
     def __init__(self, vm: ChatViewModel, on_back, on_open_chat, on_leave):
@@ -90,6 +162,11 @@ class GroupLobbyPage(QWidget):
         self.chat_btn = QPushButton("进入聊天")
         self.chat_btn.clicked.connect(self.on_open_chat)
         header_layout.addWidget(self.chat_btn)
+        self.settings_btn = QPushButton("群设置")
+        self.settings_btn.setObjectName("ghost")
+        self.settings_btn.setToolTip("修改群名称与群公告")
+        self.settings_btn.clicked.connect(self._open_group_settings)
+        header_layout.addWidget(self.settings_btn)
         self.leave_btn = QPushButton("退出群组")
         self.leave_btn.setObjectName("danger")
         self.leave_btn.clicked.connect(self._confirm_leave)
@@ -100,6 +177,19 @@ class GroupLobbyPage(QWidget):
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(16, 8, 16, 16)
         body_layout.setSpacing(8)
+
+        self.announce_card = QFrame()
+        self.announce_card.setObjectName("infoCard")
+        announce_layout = QVBoxLayout(self.announce_card)
+        announce_layout.setContentsMargins(14, 10, 14, 10)
+        announce_title = QLabel("群公告")
+        announce_title.setStyleSheet(f"font-size: 12px; color: {PRIMARY}; font-weight: 700;")
+        announce_layout.addWidget(announce_title)
+        self.announce_label = QLabel("")
+        self.announce_label.setWordWrap(True)
+        self.announce_label.setStyleSheet("font-size: 13px; color: #1C1B1F;")
+        announce_layout.addWidget(self.announce_label)
+        body_layout.addWidget(self.announce_card)
 
         self.host_card = QFrame()
         self.host_card.setObjectName("hostCard")
@@ -245,6 +335,29 @@ class GroupLobbyPage(QWidget):
         if box.clickedButton() is leave_btn:
             self.on_leave()
 
+    def _open_group_settings(self):
+        if not self.vm.active_is_host or self.vm.active_group_id is None:
+            return
+        dialog = GroupSettingsDialog(self.vm, self.window())
+        dialog.exec()
+
+    def _confirm_kick(self, peer_id: str):
+        if not self.vm.active_is_host or self.vm.active_group_id is None:
+            return
+        peers = self.vm.active_peers()
+        peer = peers.get(peer_id)
+        name = peer.name if peer is not None else peer_id
+        box = QMessageBox(self.window())
+        box.setWindowTitle("移出成员")
+        box.setText(
+            f"确定要将 {name} 移出群组吗？\n对方将立即断开连接，且无法再收到本群消息。"
+        )
+        kick_btn = box.addButton("移出", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is kick_btn:
+            self.vm.kick_active_member(peer_id)
+
     def refresh(self):
         gid = self.vm.active_group_id
         is_host = self.vm.active_is_host
@@ -260,6 +373,10 @@ class GroupLobbyPage(QWidget):
         ip = self.vm.local_ip
         self.host_address_label.setText(f"{ip}:{self.vm.local_port}" if ip else "未连接到网络")
         self.host_card.setVisible(is_host and gid is not None)
+        self.settings_btn.setVisible(bool(is_host) and gid is not None)
+        announcement = self.vm.active_group_announcement() if gid else ""
+        self.announce_label.setText(announcement)
+        self.announce_card.setVisible(bool(announcement) and gid is not None)
         group_id = self.vm.active_group_numeric_id()
         self.group_id_label.setText(
             f"群组数字ID: {network_module.format_numeric_group_id(group_id)}" if group_id else ""
@@ -320,7 +437,17 @@ class GroupLobbyPage(QWidget):
 
     def _add_peer_row(self, peer: Peer, is_self: bool):
         item = QListWidgetItem()
-        row = PeerRow(peer, is_self, on_call=self._start_call if not is_self else None)
+        row = PeerRow(
+            peer,
+            is_self,
+            on_call=self._start_call if not is_self else None,
+            # the owner may remove members; members only get the call button
+            on_kick=(
+                self._confirm_kick
+                if (not is_self and self.vm.active_is_host)
+                else None
+            ),
+        )
         item.setSizeHint(row.sizeHint())
         self.peer_list.addItem(item)
         self.peer_list.setItemWidget(item, row)

@@ -21,6 +21,16 @@ class SavedGroup:
     last_message: str = ""
     last_message_time: int = 0
     created_at: int = 0
+    # Group owner (creator) published announcement, persisted so members keep
+    # it across restarts and while the host is offline. None means "leave the
+    # stored value untouched" (an existing caller building a metadata refresh
+    # without an announcement must never clear it); "" clears it.
+    announcement: Optional[str] = None
+    # True when this member was kicked out of the group: the row is kept so the
+    # local chat history survives (messages cascade off saved_groups), but the
+    # group is hidden from the group list and can never be rejoined. None means
+    # "leave the stored value untouched".
+    kicked: Optional[bool] = None
 
 
 @dataclass
@@ -136,6 +146,16 @@ class ChatStore:
             if "hostPort" not in cols:
                 c.execute(
                     "ALTER TABLE saved_groups ADD COLUMN hostPort INTEGER NOT NULL DEFAULT 0"
+                )
+            # migrate databases created before group management (owner
+            # announcement + kicked marker)
+            if "announcement" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_groups ADD COLUMN announcement TEXT NOT NULL DEFAULT ''"
+                )
+            if "kicked" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_groups ADD COLUMN kicked INTEGER NOT NULL DEFAULT 0"
                 )
             c.execute(
                 """
@@ -264,17 +284,20 @@ class ChatStore:
         c.execute("DROP TABLE saved_messages_old")
 
     def _row_to_group(self, row) -> SavedGroup:
+        keys = row.keys()
         return SavedGroup(
             group_id=row["groupId"],
             group_name=row["groupName"],
             is_host=bool(row["isHost"]),
             host_ip=row["hostIp"],
-            host_port=row["hostPort"] if "hostPort" in row.keys() else 0,
+            host_port=row["hostPort"] if "hostPort" in keys else 0,
             my_name=row["myName"],
             member_count=row["memberCount"],
             last_message=self._dec(row["lastMessage"]),
             last_message_time=row["lastMessageTime"],
             created_at=row["createdAt"],
+            announcement=row["announcement"] if "announcement" in keys else "",
+            kicked=bool(row["kicked"]) if "kicked" in keys else False,
         )
 
     def get_all_groups(self) -> List[SavedGroup]:
@@ -308,12 +331,24 @@ class ChatStore:
                 last_message=group.last_message,
                 last_message_time=group.last_message_time,
                 created_at=existing.created_at if existing else group.created_at or int(time.time() * 1000),
+                # None = "leave untouched" so metadata refreshes cannot clear
+                # the announcement, and an explicit "" clears it
+                announcement=(
+                    group.announcement
+                    if group.announcement is not None
+                    else (existing.announcement if existing else "")
+                ),
+                kicked=(
+                    group.kicked
+                    if group.kicked is not None
+                    else (existing.kicked if existing else False)
+                ),
             )
             self._conn.execute(
                 """
                 INSERT INTO saved_groups
-                (groupId, groupName, isHost, hostIp, hostPort, myName, memberCount, lastMessage, lastMessageTime, createdAt)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (groupId, groupName, isHost, hostIp, hostPort, myName, memberCount, lastMessage, lastMessageTime, createdAt, announcement, kicked)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(groupId) DO UPDATE SET
                     groupName = excluded.groupName,
                     isHost = excluded.isHost,
@@ -322,7 +357,9 @@ class ChatStore:
                     myName = excluded.myName,
                     memberCount = excluded.memberCount,
                     lastMessage = excluded.lastMessage,
-                    lastMessageTime = excluded.lastMessageTime
+                    lastMessageTime = excluded.lastMessageTime,
+                    announcement = excluded.announcement,
+                    kicked = excluded.kicked
                 """,
                 (
                     merged.group_id,
@@ -336,7 +373,29 @@ class ChatStore:
                     self._enc(merged.last_message),
                     merged.last_message_time,
                     merged.created_at,
+                    merged.announcement or "",
+                    1 if merged.kicked else 0,
                 ),
+            )
+            self._conn.commit()
+
+    def set_group_kicked(self, group_id: str, kicked: bool = True) -> None:
+        """Flag a group as "removed by the owner": the row (and its message
+        history via the FK) stays, but the group is hidden from the list.
+        [kicked]=False reverses it (a same-id group created again)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE saved_groups SET kicked = ? WHERE groupId = ?",
+                (1 if kicked else 0, group_id),
+            )
+            self._conn.commit()
+
+    def set_group_announcement(self, group_id: str, announcement: str) -> None:
+        """Replace a group's owner announcement ("" clears it)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE saved_groups SET announcement = ? WHERE groupId = ?",
+                (announcement or "", group_id),
             )
             self._conn.commit()
 

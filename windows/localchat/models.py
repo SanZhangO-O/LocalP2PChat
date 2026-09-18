@@ -440,6 +440,12 @@ class NetworkPacket:
     # receiver can reject replayed/reordered/injected lines. Never set by
     # application code.
     seq: Optional[int] = None
+    # group_update packet (group owner only): a new display name and/or a new
+    # announcement. Both optional; None means "unchanged" and is omitted from
+    # the wire so the bytes match kotlinx.serialization (defaults are not
+    # encoded).
+    group_name: Optional[str] = None
+    announcement: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
@@ -487,6 +493,10 @@ class NetworkPacket:
             d["token"] = self.token
         if self.seq is not None:
             d["seq"] = self.seq
+        if self.group_name is not None:
+            d["groupName"] = self.group_name
+        if self.announcement is not None:
+            d["announcement"] = self.announcement
         return d
 
     def to_json(self) -> str:
@@ -549,6 +559,10 @@ class NetworkPacket:
             pkt.token = str(d["token"])
         if d.get("seq") is not None:
             pkt.seq = _strict_int(d["seq"], "seq")
+        if d.get("groupName") is not None:
+            pkt.group_name = str(d["groupName"])
+        if d.get("announcement") is not None:
+            pkt.announcement = str(d["announcement"])
         if pkt_type == "error" and pkt.error_message is None:
             raise ValueError("error packet missing required field: errorMessage")
         if pkt_type == "chat" and pkt.message is None:
@@ -559,6 +573,10 @@ class NetworkPacket:
             raise ValueError("file_download packet missing required field: fileId")
         if pkt_type == "delete_message" and not pkt.message_id:
             raise ValueError("delete_message packet missing required field: messageId")
+        if pkt_type == "group_update" and not pkt.group_id:
+            raise ValueError("group_update packet missing required field: groupId")
+        if pkt_type == "kick_member" and (not pkt.group_id or not pkt.target_id):
+            raise ValueError("kick_member packet missing required field: groupId/targetId")
         return pkt
 
     @staticmethod
