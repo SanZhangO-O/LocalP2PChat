@@ -435,6 +435,13 @@ class NetworkPacket:
     # (encrypted) offer. MANDATORY on every request: a sender refuses a
     # request without it.
     token: Optional[str] = None
+    # file_download request only: bytes the receiver already holds in its
+    # ".part" staging file. MANDATORY (resume support): the sender starts the
+    # byte stream at this offset, so 0 means a fresh download and a value
+    # equal to the file size transfers nothing but the meta/EOF. The chunks
+    # stay independently GCM-encrypted with a fresh random nonce, so no
+    # nonce/AAD state depends on this offset (Android parity).
+    offset: Optional[int] = None
     # Wire-session sequence number: stamped by Wire.send_packet (per
     # direction, strictly 1,2,3,...) INSIDE the GCM-protected JSON, so the
     # receiver can reject replayed/reordered/injected lines. Never set by
@@ -485,6 +492,8 @@ class NetworkPacket:
             d["sig"] = self.sig
         if self.token is not None:
             d["token"] = self.token
+        if self.offset is not None:
+            d["offset"] = self.offset
         if self.seq is not None:
             d["seq"] = self.seq
         return d
@@ -547,6 +556,8 @@ class NetworkPacket:
             pkt.sig = str(d["sig"])
         if d.get("token") is not None:
             pkt.token = str(d["token"])
+        if d.get("offset") is not None:
+            pkt.offset = _strict_int(d["offset"], "offset")
         if d.get("seq") is not None:
             pkt.seq = _strict_int(d["seq"], "seq")
         if pkt_type == "error" and pkt.error_message is None:
@@ -557,6 +568,15 @@ class NetworkPacket:
             raise ValueError("file_message packet missing required field: message")
         if pkt_type == "file_download" and not pkt.file_id:
             raise ValueError("file_download packet missing required field: fileId")
+        if pkt_type == "file_download":
+            # resume is part of the wire contract: a request without (or with
+            # a negative) offset is malformed and refused before any bytes
+            if pkt.offset is None:
+                raise ValueError(
+                    "file_download packet missing required field: offset"
+                )
+            if pkt.offset < 0:
+                raise ValueError("file_download offset must be non-negative")
         if pkt_type == "delete_message" and not pkt.message_id:
             raise ValueError("delete_message packet missing required field: messageId")
         return pkt

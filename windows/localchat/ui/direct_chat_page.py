@@ -37,6 +37,8 @@ from .chat_page import (
     MessageDelegate,
     _safe_save_name,
     file_offer_expired,
+    format_paused_text,
+    format_transfer_detail,
     iter_message_rows,
 )
 from .theme import PRIMARY, TEXT_SUBTLE
@@ -65,8 +67,14 @@ class DirectChatPage(QWidget):
         self._contact: Peer | None = None
         # fileId -> (status, target_path, message) for direct file messages
         self._file_states: dict = {}
+        # fileId -> second progress line (已传/总大小 · 速度 · 剩余时间)
+        self._file_details: dict = {}
+        # fileId -> (last_time, last_received, smoothed_speed) sample
+        self._file_rates: dict = {}
         # folderId -> (status, detail) for folder cards
         self._folder_states: dict = {}
+        # folderId -> chosen destination directory (paused folder resume)
+        self._folder_targets: dict = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -108,6 +116,7 @@ class DirectChatPage(QWidget):
                 self.list_view,
                 on_file_click=self._download_file,
                 file_states=self._file_states,
+                file_details=self._file_details,
                 media_resolver=self._media_path,
                 on_media_open=self._open_media,
                 folder_states=self._folder_states,
@@ -192,7 +201,10 @@ class DirectChatPage(QWidget):
         self.title_label.setText(contact.name)
         self.input_edit.clear()
         self._file_states.clear()
+        self._file_details.clear()
+        self._file_rates.clear()
         self._folder_states.clear()
+        self._folder_targets.clear()
         # use the real member id returned by the handshake so messages and the
         # session line up (a manually added contact starts with a placeholder)
         peer_id = self.vm.open_direct_chat(contact)
@@ -257,12 +269,45 @@ class DirectChatPage(QWidget):
             self._contact = contact
             self.title_label.setText(contact.name)
 
+    def _seed_resume_states(self, msgs) -> None:
+        """Render paused cards from the persisted resume state (interrupted
+        download, app restart): the offer may have no address left, but the
+        resume entry carries one so the card stays clickable."""
+        for m in msgs:
+            if m.file_info is None or m.id in self._file_states:
+                continue
+            info = self.vm.resume_info(m.id)
+            if not info:
+                continue
+            percent = int(info["percent"])
+            self._file_states[m.id] = (
+                "paused",
+                info["target"],
+                str(percent) if percent else "",
+            )
+            self._file_details[m.id] = format_paused_text(percent)
+        for kind, payload in iter_message_rows(msgs):
+            if kind != "folder":
+                continue
+            group = payload
+            if group.is_from_me or group.folder_id in self._folder_states:
+                continue
+            info = self.vm.folder_resume_info(group.folder_id)
+            if not info:
+                continue
+            self._folder_states[group.folder_id] = (
+                "paused",
+                f"已暂停 {info['done']}/{info['total']}（点击续传）",
+            )
+            self._folder_targets[group.folder_id] = info["target"]
+
     def _refresh(self):
         self._refresh_status()
         peer_id = self._peer_id
         if peer_id is None:
             return
         msgs = self.vm.direct_messages(peer_id)
+        self._seed_resume_states(msgs)
         self.model.setRowCount(0)
         self.list_view.setVisible(bool(msgs))
         self.empty_label.setVisible(not msgs)
@@ -369,12 +414,23 @@ class DirectChatPage(QWidget):
 
     def _download_folder(self, group: FolderGroup):
         peer_id = self._peer_id
-        if peer_id is None or group.is_from_me or group.expired:
+        if peer_id is None or group.is_from_me:
             return
-        dest = QFileDialog.getExistingDirectory(self.window(), "选择保存文件夹位置")
-        if not dest:
-            return
-        self._folder_states[group.folder_id] = ("downloading", f"0/{group.total}")
+        state = self._folder_states.get(group.folder_id, ("idle", ""))[0]
+        dest = self._folder_targets.get(group.folder_id, "")
+        if state == "paused" and dest and os.path.isdir(dest):
+            # resume into the remembered directory without asking again
+            pass
+        else:
+            if group.expired:
+                return
+            dest = QFileDialog.getExistingDirectory(self.window(), "选择保存文件夹位置")
+            if not dest:
+                return
+            self._folder_targets[group.folder_id] = dest
+        info = self.vm.folder_resume_info(group.folder_id) if state == "paused" else None
+        detail = f"{info['done']}/{info['total']}" if info else f"0/{group.total}"
+        self._folder_states[group.folder_id] = ("downloading", detail)
         self.list_view.viewport().update()
         self.vm.download_direct_folder(peer_id, group.folder_id, dest)
 
@@ -395,12 +451,21 @@ class DirectChatPage(QWidget):
             return
         if ok:
             self._folder_states[folder_id] = ("done", message)
+            self._folder_targets.pop(folder_id, None)
             Toast(self.window()).show_message("文件夹已保存")
-        elif "取消" in message:
-            self._folder_states[folder_id] = ("cancelled", message)
         else:
-            self._folder_states[folder_id] = ("failed", message)
-            Toast(self.window()).show_message(f"文件夹保存失败：{message}")
+            info = self.vm.folder_resume_info(folder_id)
+            if info is not None:
+                self._folder_states[folder_id] = (
+                    "paused",
+                    f"已暂停 {info['done']}/{info['total']}（点击续传）",
+                )
+                self._folder_targets[folder_id] = info["target"]
+            elif "取消" in message:
+                self._folder_states[folder_id] = ("cancelled", message)
+            else:
+                self._folder_states[folder_id] = ("failed", message)
+                Toast(self.window()).show_message(f"文件夹保存失败：{message}")
         self.list_view.viewport().update()
         self.list_view.doItemsLayout()
 
@@ -417,7 +482,19 @@ class DirectChatPage(QWidget):
     def _download_file(self, msg):
         peer_id = self._peer_id
         fi = msg.file_info
-        if peer_id is None or fi is None or file_offer_expired(fi):
+        if peer_id is None or fi is None:
+            return
+        state = self._file_states.get(msg.id, ("idle", "", ""))
+        # a paused download continues into its remembered target (the ViewModel
+        # re-attaches the address/key from the persisted resume entry)
+        if state[0] == "paused" and state[1]:
+            self._file_details.pop(msg.id, None)
+            self._file_rates.pop(msg.id, None)
+            self._file_states[msg.id] = ("downloading", state[1], "")
+            self.list_view.viewport().update()
+            self.vm.download_direct_file(peer_id, msg.id, state[1])
+            return
+        if file_offer_expired(fi):
             return
         if fi.kind in MEDIA_KINDS:
             # media: NO save dialog — download into the app media dir so the
@@ -427,6 +504,8 @@ class DirectChatPage(QWidget):
                 self._file_states[msg.id] = ("done", target, "")
                 self._open_media(target)
                 return
+            self._file_details.pop(msg.id, None)
+            self._file_rates.pop(msg.id, None)
             self._file_states[msg.id] = ("downloading", target, "")
             self.list_view.viewport().update()
             self.vm.download_direct_file(peer_id, msg.id, target)
@@ -445,6 +524,8 @@ class DirectChatPage(QWidget):
         )
         if not path:
             return
+        self._file_details.pop(msg.id, None)
+        self._file_rates.pop(msg.id, None)
         self._file_states[msg.id] = ("downloading", path, "0")
         self.list_view.viewport().update()
         self.vm.download_direct_file(peer_id, msg.id, path)
@@ -453,10 +534,26 @@ class DirectChatPage(QWidget):
         state = self._file_states.get(file_id)
         if state is None or state[0] != "downloading":
             return
+        now = time.monotonic()
+        prev = self._file_rates.get(file_id)
+        speed = 0.0
+        if prev is not None:
+            elapsed = now - prev[0]
+            delta = received - prev[1]
+            if elapsed > 0 and delta > 0:
+                instant = delta / elapsed
+                speed = instant if prev[2] <= 0 else prev[2] * 0.6 + instant * 0.4
+        self._file_rates[file_id] = (now, received, speed)
         if total > 0:
             percent = min(99, int(received * 100 / total))
+            eta = (total - received) / speed if speed > 0 and received < total else -1
             self._file_states[file_id] = ("downloading", state[1], str(percent))
-            self.list_view.viewport().update()
+        else:
+            eta = -1
+        self._file_details[file_id] = format_transfer_detail(
+            received, total, speed, eta
+        )
+        self.list_view.viewport().update()
 
     def _cancel_download(self, msg):
         peer_id = self._peer_id
@@ -465,23 +562,49 @@ class DirectChatPage(QWidget):
         self.vm.cancel_download(peer_id, msg.id)
         state = self._file_states.get(msg.id)
         if state is not None and state[0] == "downloading":
-            self._file_states[msg.id] = ("cancelled", "", "")
+            percent = int(state[2]) if str(state[2]).isdigit() else 0
+            self._file_states[msg.id] = (
+                "paused",
+                state[1],
+                str(percent) if percent else "",
+            )
+            self._file_details[msg.id] = format_paused_text(percent)
             self.list_view.viewport().update()
 
     def _on_file_download_finished(self, file_id: str, ok: bool, message: str):
+        self._file_rates.pop(file_id, None)
         if ok:
             path = self._file_states.get(file_id, ("", "", ""))[1]
             self._file_states[file_id] = ("done", path, "")
+            self._file_details.pop(file_id, None)
             Toast(self.window()).show_message("文件已保存")
-        elif "取消" in message:
-            self._file_states[file_id] = ("cancelled", "", "")
         else:
-            self._file_states[file_id] = ("failed", "", message)
-            Toast(self.window()).show_message(f"下载失败：{message}")
+            info = self.vm.resume_info(file_id)
+            if info is not None or "取消" in message:
+                percent = int(info["percent"]) if info else 0
+                target = self._file_states.get(file_id, ("", "", ""))[1]
+                target = target or (info["target"] if info else "")
+                self._file_states[file_id] = (
+                    "paused",
+                    target,
+                    str(percent) if percent else "",
+                )
+                self._file_details[file_id] = format_paused_text(percent)
+            else:
+                self._file_states[file_id] = ("failed", "", message)
+                self._file_details.pop(file_id, None)
+                Toast(self.window()).show_message(f"下载失败：{message}")
         self.list_view.viewport().update()
         # a downloaded image swaps its placeholder card for a much taller
         # inline bubble: repaint alone keeps the stale row height
         self.list_view.doItemsLayout()
+
+    def _downloadable_file(self, msg) -> bool:
+        """An offer stays download-clickable when a paused resume state exists
+        (a restored offer has no address, but the resume entry does)."""
+        if not file_offer_expired(msg.file_info):
+            return True
+        return self._file_states.get(msg.id, ("idle", "", ""))[0] == "paused"
 
     def _on_media_ready(self):
         """An own sent image landed in the media dir: re-render so the
@@ -508,13 +631,17 @@ class DirectChatPage(QWidget):
             download_action = None
             cancel_action = None
             dl_state = self._file_states.get(msg.id, ("idle", "", ""))[0]
-            if not file_offer_expired(msg.file_info):
+            if self._downloadable_file(msg):
                 if dl_state == "downloading":
                     # an in-flight download offers 取消下载 instead of starting
                     # a second one
                     cancel_action = menu.addAction("取消下载")
+                elif is_media:
+                    download_action = menu.addAction("另存为...")
                 else:
-                    download_action = menu.addAction("另存为..." if is_media else "下载 / 另存为")
+                    download_action = menu.addAction(
+                        "续传 / 另存为" if dl_state == "paused" else "下载 / 另存为"
+                    )
             copy_name_action = menu.addAction("复制文件名")
             delete_action = None
             if msg.is_from_me:
@@ -548,11 +675,13 @@ class DirectChatPage(QWidget):
         state = self._folder_states.get(group.folder_id, ("idle", ""))[0]
         save_action = None
         cancel_action = None
-        if not group.is_from_me and not group.expired:
+        if not group.is_from_me and (not group.expired or state == "paused"):
             if state == "downloading":
                 cancel_action = menu.addAction("取消下载")
             else:
-                save_action = menu.addAction("保存文件夹...")
+                save_action = menu.addAction(
+                    "继续保存" if state == "paused" else "保存文件夹..."
+                )
         copy_action = menu.addAction("复制文件夹名")
         delete_action = None
         if group.is_from_me:
@@ -573,7 +702,8 @@ class DirectChatPage(QWidget):
         if peer_id is None:
             return
         self.vm.cancel_download(peer_id, group.folder_id)
-        self._folder_states[group.folder_id] = ("cancelled", "")
+        # the worker keeps every ".part": show the paused card immediately
+        self._folder_states[group.folder_id] = ("paused", "已暂停（点击续传）")
         self.list_view.viewport().update()
 
     def _confirm_delete_folder(self, group: FolderGroup):

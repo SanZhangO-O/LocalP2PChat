@@ -243,9 +243,16 @@ def _serve_file_download(
     """Serve one file-download connection. Handshake (Android parity, see
     FileTransfer.kt):
 
-        receiver -> "file_download" {fileId, token}                   (plaintext)
+        receiver -> "file_download" {fileId, token, offset}            (plaintext)
         sender   -> ENCRYPTED LINE: AES-GCM(fileKey, file_meta JSON)
         sender   -> [4B ctLen][12B nonce][AES-GCM chunk]... [4B zero EOF]
+
+    [offset] (bytes the receiver already holds) is REQUIRED and the stream
+    starts there: a fresh download sends 0, an interrupted one resumes from
+    the size of its ".part" staging file. An offset past the declared size is
+    refused outright (no meta, no bytes). Each chunk is an independent AEAD
+    message with a fresh random nonce, so seeking does not change the GCM
+    layout at all — no nonce/AAD state depends on the offset.
 
     The per-file key travels only inside the (itself encrypted) chat message
     that offered the file, so a passive sniffer sees ciphertext for the meta
@@ -264,8 +271,19 @@ def _serve_file_download(
         try:
             req = NetworkPacket.from_json(handshake)
         except Exception:
+            # includes a request without the (now mandatory) offset field
             return
         if req.type != "file_download" or req.file_id != file_id:
+            return
+        if req.offset is None or req.offset < 0:
+            return
+        if file_size >= 0 and req.offset > file_size:
+            logger.warning(
+                "file download rejected: offset %s past size %s for %s",
+                req.offset,
+                file_size,
+                file_id,
+            )
             return
         if not req.token:
             # no token = the requester never received the (encrypted) offer:
@@ -295,6 +313,7 @@ def _serve_file_download(
         )
         sock.settimeout(120)
         with open(path, "rb") as f:
+            f.seek(req.offset)
             while True:
                 chunk = f.read(CHUNK_SIZE)
                 if not chunk:
@@ -326,18 +345,29 @@ def _download_file_offer(
     progress=None,
     cancel: Optional[threading.Event] = None,
     sock_holder: Optional[list] = None,
+    offset: int = 0,
 ) -> tuple:
     """Download a file offered via [file_info] to [target_path]. Blocks the
     calling thread. Returns (ok: bool, message: str). The meta line and every
     chunk are decrypted with the per-file key from the (encrypted) offer; any
     tampering or key mismatch aborts.
 
+    Resume: bytes are appended to "target_path + .part" and the request tells
+    the sender to stream from that offset. [offset] is the receiver's
+    persisted "already received" count; it is clamped down to the actual
+    ".part" size, so a stale count can never skip unauthenticated bytes (a
+    missing/short part just restarts lower, never higher). On cancel or any
+    network failure the ".part" is KEPT and the caller persists the received
+    count so the next attempt resumes; only a part that can never complete
+    (bigger than the declared size) is dropped. On success the part is
+    finished and atomically renamed onto [target_path].
+
     [progress](received, total) fires per decrypted chunk (the caller
-    throttles); [cancel] (threading.Event) aborts with "下载已取消"; and
+    throttles; [received] is cumulative, i.e. it includes the resumed
+    offset); [cancel] (threading.Event) aborts with "下载已取消"; and
     [sock_holder] (a caller-owned list) receives the socket so the canceler
     can shut a blocked read down immediately. The request always carries the
-    file_download token (Android parity; older senders without verification
-    simply ignore the extra field)."""
+    file_download token."""
     if file_info.file_size < 0:
         return False, "文件大小无效"
     if cancel is not None and cancel.is_set():
@@ -350,6 +380,26 @@ def _download_file_offer(
         file_key = None
     if file_key is None or len(file_key) != KEY_LEN:
         return False, "文件密钥缺失或无效"
+    tmp_path = target_path + ".part"
+    try:
+        start = int(offset)
+    except (TypeError, ValueError):
+        start = 0
+    if start < 0:
+        start = 0
+    # a count past the offer's declared size can never be completed (the
+    # sender would refuse the request): restart from scratch instead of
+    # looping forever on an unusable part
+    if file_info.file_size > 0 and start > file_info.file_size:
+        start = 0
+    try:
+        part_size = os.path.getsize(tmp_path)
+    except OSError:
+        part_size = 0
+    if start > part_size:
+        # persisted count is ahead of the staging file (crash between write
+        # and state update): resume from what actually exists
+        start = part_size
     try:
         sock = socket.create_connection(
             (file_info.download_host, file_info.download_port), timeout=10
@@ -358,7 +408,6 @@ def _download_file_offer(
         return False, f"连接失败: {e}"
     if sock_holder is not None:
         sock_holder.append(sock)
-    tmp_path = target_path + ".part"
     try:
         if cancel is not None and cancel.is_set():
             # the cancel landed during connect: fall through (do NOT return
@@ -372,6 +421,7 @@ def _download_file_offer(
                 type="file_download",
                 file_id=file_info.file_id,
                 token=file_download_token(file_key, file_info.file_id),
+                offset=start,
             ).to_json(),
         )
         # read the meta line from the raw socket, byte by byte: a buffered
@@ -417,10 +467,24 @@ def _download_file_offer(
         # progress falls back to the offer's declared size (Android parity:
         # FileTransfer.totalForProgress).
         progress_total = expected if expected > 0 else file_info.file_size
+        if expected > 0 and start > expected:
+            # the staged bytes exceed the declared size: this part can never
+            # complete, drop it so the next tap starts clean
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            return False, "断点数据损坏，请重新下载"
         sock.settimeout(120)
-        received = 0
+        received = start
         eof_marker = False
-        with open(tmp_path, "wb") as f:
+        # "r+b" appends onto the staged bytes (truncating any excess a stale
+        # resume count might leave behind); "wb" is a fresh download
+        mode = "r+b" if start > 0 else "wb"
+        with open(tmp_path, mode) as f:
+            if start > 0:
+                f.truncate(start)
+                f.seek(start)
             while not eof_marker:
                 if cancel is not None and cancel.is_set():
                     return False, "下载已取消"
@@ -463,11 +527,10 @@ def _download_file_offer(
     except Exception as e:
         return False, f"下载失败: {e}"
     finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except OSError:
-            pass
+        # Interrupted/cancelled downloads KEEP the .part staging file so the
+        # next attempt resumes from its size; the ViewModel records the
+        # received count for the UI. A completed download renamed the part
+        # away; an unusable part was removed explicitly above.
         try:
             sock.shutdown(socket.SHUT_RDWR)
         except OSError:
@@ -2224,12 +2287,18 @@ class P2PManager:
         progress=None,
         cancel: Optional[threading.Event] = None,
         sock_holder: Optional[list] = None,
+        offset: int = 0,
     ) -> tuple:
         """Download a file offered via [file_info] to [target_path]. Blocks the
         calling thread. Returns (ok: bool, message: str); see
-        _download_file_offer for [progress]/[cancel]/[sock_holder]."""
+        _download_file_offer for [progress]/[cancel]/[sock_holder]/[offset]."""
         return _download_file_offer(
-            file_info, target_path, progress=progress, cancel=cancel, sock_holder=sock_holder
+            file_info,
+            target_path,
+            progress=progress,
+            cancel=cancel,
+            sock_holder=sock_holder,
+            offset=offset,
         )
 
     # -------------------------------------------------------------- server
@@ -3548,12 +3617,18 @@ class DirectChatManager:
         progress=None,
         cancel: Optional[threading.Event] = None,
         sock_holder: Optional[list] = None,
+        offset: int = 0,
     ) -> tuple:
         """Download a file offered via [file_info] to [target_path]. Blocks the
         calling thread. Returns (ok: bool, message: str); see
-        _download_file_offer for [progress]/[cancel]/[sock_holder]."""
+        _download_file_offer for [progress]/[cancel]/[sock_holder]/[offset]."""
         return _download_file_offer(
-            file_info, target_path, progress=progress, cancel=cancel, sock_holder=sock_holder
+            file_info,
+            target_path,
+            progress=progress,
+            cancel=cancel,
+            sock_holder=sock_holder,
+            offset=offset,
         )
 
     def _direct_file_server_loop(

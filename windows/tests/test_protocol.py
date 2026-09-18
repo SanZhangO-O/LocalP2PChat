@@ -608,7 +608,7 @@ class FileTransferTest(ProtocolTestBase):
             fi = msg.file_info
 
             sock = socket.create_connection(("127.0.0.1", fi.download_port), timeout=6)
-            sock.sendall(b'{"type":"file_download","fileId":"wrong-id"}\n')
+            sock.sendall(b'{"type":"file_download","fileId":"wrong-id","offset":0}\n')
             sock.settimeout(2)
             buf = bytearray()
             try:

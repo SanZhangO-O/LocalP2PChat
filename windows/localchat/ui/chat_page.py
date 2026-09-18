@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 from PyQt6.QtCore import QEvent, QPointF, QRect, QRectF, QSize, Qt, QUrl
 from PyQt6.QtGui import (
@@ -87,6 +88,30 @@ def format_file_size(size: int) -> str:
     return f"{size} B"
 
 
+def format_transfer_detail(received: int, total: int, speed_bps: float, eta_sec: float) -> str:
+    """Progress detail line of a downloading file card: 已传/总大小、速度、
+    剩余时间 (e.g. "12.3 MB/45.6 MB · 1.2 MB/s · 剩余 28 秒")."""
+    if total > 0:
+        text = f"{format_file_size(received)}/{format_file_size(total)}"
+    else:
+        text = format_file_size(received)
+    if speed_bps and speed_bps > 0:
+        text += f" · {format_file_size(int(speed_bps))}/s"
+    # NaN-safe: an unknown/zero speed leaves the remaining time out entirely
+    if eta_sec is not None and eta_sec == eta_sec and eta_sec >= 0:
+        seconds = int(eta_sec)
+        if seconds < 60:
+            text += f" · 剩余 {max(1, seconds)} 秒"
+        else:
+            text += f" · 剩余 {seconds // 60} 分 {seconds % 60} 秒"
+    return text
+
+
+def format_paused_text(percent: int) -> str:
+    """Shared paused-card wording (Android parity)."""
+    return f"已暂停 {percent}%（点击续传）" if percent > 0 else "已暂停（点击续传）"
+
+
 def file_offer_expired(fi) -> bool:
     """A restored file offer is expired: the download address was captured in
     a previous session and the sender's server died with its process (blanked
@@ -170,6 +195,7 @@ class MessageDelegate(QStyledItemDelegate):
         view,
         on_file_click=None,
         file_states=None,
+        file_details=None,
         media_resolver=None,
         on_media_open=None,
         folder_states=None,
@@ -181,6 +207,8 @@ class MessageDelegate(QStyledItemDelegate):
         self._view = view
         self.on_file_click = on_file_click
         self.file_states = file_states if file_states is not None else {}
+        # fileId -> second-line text (已传/总大小、速度、剩余时间 / 已暂停提示)
+        self.file_details = file_details if file_details is not None else {}
         # msg -> local path of an already-downloaded image/video copy (None
         # when not downloaded yet); lets the delegate render media inline.
         self.media_resolver = media_resolver
@@ -293,9 +321,11 @@ class MessageDelegate(QStyledItemDelegate):
         ):
             msg = index.data(MSG_ROLE)
             if isinstance(msg, FolderGroup):
-                if msg.is_from_me or msg.expired:
-                    return True
                 state = self.folder_states.get(msg.folder_id, ("idle", ""))[0]
+                # a paused folder stays clickable even after the addresses were
+                # blanked on restore: resume state carries them again
+                if msg.is_from_me or (msg.expired and state != "paused"):
+                    return True
                 if state == "done":
                     if self.on_folder_open:
                         self.on_folder_open(msg)
@@ -316,7 +346,7 @@ class MessageDelegate(QStyledItemDelegate):
                         return True
                     if (
                         not msg.is_from_me
-                        and not file_offer_expired(msg.file_info)
+                        and self._downloadable(msg)
                         and self.on_file_click
                     ):
                         state = self.file_states.get(msg.id, ("idle", "", ""))[0]
@@ -324,13 +354,22 @@ class MessageDelegate(QStyledItemDelegate):
                             self.on_file_click(msg)
                     return True
                 if self.on_file_click:
-                    if file_offer_expired(msg.file_info):
+                    if not self._downloadable(msg):
                         return True  # expired offers are not clickable
                     state = self.file_states.get(msg.id, ("idle", "", ""))[0]
                     if state != "downloading":
                         self.on_file_click(msg)
                 return True
         return super().editorEvent(event, model, option, index)
+
+    def _downloadable(self, msg) -> bool:
+        """An offer is clickable when it still carries a download address OR a
+        paused resume state exists: the address and per-file key then come from
+        the persisted resume entry (ViewModel._merged_offer), so a download
+        interrupted before an app restart can continue."""
+        if not file_offer_expired(msg.file_info):
+            return True
+        return self.file_states.get(msg.id, ("idle", "", ""))[0] == "paused"
 
     def paint(self, painter: QPainter, option, index) -> None:
         header_text = index.data(HEADER_ROLE)
@@ -447,7 +486,9 @@ class MessageDelegate(QStyledItemDelegate):
 
         fi = msg.file_info
         state = self.file_states.get(msg.id, ("idle", "", ""))
-        expired = file_offer_expired(fi)
+        # a paused download shows its own status: its restored offer has no
+        # address, but the persisted resume entry can continue it
+        expired = file_offer_expired(fi) and state[0] != "paused"
         is_media = self._is_media(msg)
         downloaded = self._media_path(msg) is not None
         # throttle-friendly progress text: the ViewModel reports integer
@@ -463,6 +504,7 @@ class MessageDelegate(QStyledItemDelegate):
                 status_text = {
                     "idle": "点击播放" if downloaded else idle_text,
                     "downloading": progress_text,
+                    "paused": "已暂停",
                     "done": "点击播放" if fi.kind == FILE_KIND_VIDEO else "已下载",
                     "failed": state[2] or "下载失败",
                 }.get(state[0], idle_text if not downloaded else "点击播放")
@@ -470,9 +512,19 @@ class MessageDelegate(QStyledItemDelegate):
                 status_text = {
                     "idle": "点击下载",
                     "downloading": progress_text,
+                    "paused": "已暂停",
                     "done": "已保存",
                     "failed": state[2] or "下载失败",
                 }.get(state[0], "点击下载")
+        # second line: live 已传/总大小 + speed + ETA while downloading, the
+        # resume hint while paused, the plain file size otherwise
+        detail_text = ""
+        if state[0] == "downloading":
+            detail_text = self.file_details.get(msg.id, "")
+        elif state[0] == "paused":
+            detail_text = self.file_details.get(msg.id, "") or format_paused_text(
+                int(state[2]) if str(state[2]).isdigit() else 0
+            )
         text_color = QColor("#FFFFFF" if msg.is_from_me else BUBBLE_TEXT_OTHER)
         subtle = QColor("#FFFFFF" if msg.is_from_me else "#6B6875")
         subtle.setAlpha(200 if msg.is_from_me else 255)
@@ -516,7 +568,7 @@ class MessageDelegate(QStyledItemDelegate):
         )
         painter.setFont(small_font)
         painter.setPen(subtle)
-        size_text = format_file_size(fi.file_size)
+        size_text = detail_text or format_file_size(fi.file_size)
         painter.drawText(
             QRectF(inner_x, bubble_rect.y() + 32, text_w, 16),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
@@ -544,12 +596,13 @@ class MessageDelegate(QStyledItemDelegate):
         state = self.folder_states.get(group.folder_id, ("idle", ""))
         if group.is_from_me:
             status_text = "已发送"
-        elif group.expired:
+        elif group.expired and state[0] != "paused":
             status_text = "已过期"
         else:
             status_text = {
                 "idle": "点击保存",
                 "downloading": state[1] or "保存中...",
+                "paused": "已暂停",
                 "done": "已保存",
                 "failed": state[1] or "保存失败",
                 "cancelled": "已取消",
@@ -590,10 +643,15 @@ class MessageDelegate(QStyledItemDelegate):
         )
         painter.setFont(small_font)
         painter.setPen(subtle)
+        detail_text = (
+            state[1]
+            if state[0] == "paused" and state[1]
+            else f"{group.total} 个文件 · {format_file_size(group.size)}"
+        )
         painter.drawText(
             QRectF(inner_x, bubble_rect.y() + 32, text_w, 16),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            f"{group.total} 个文件 · {format_file_size(group.size)}",
+            detail_text,
         )
         painter.restore()
 
@@ -729,8 +787,16 @@ class ChatPage(QWidget):
         self._building = False
         # fileId -> (status, target_path, message) for file messages
         self._file_states: dict = {}
+        # fileId -> second progress line (已传/总大小 · 速度 · 剩余时间)
+        self._file_details: dict = {}
+        # fileId -> (last_time, last_received, smoothed_speed) sample for the
+        # live speed/ETA line (refreshed from the throttled file_progress)
+        self._file_rates: dict = {}
         # folderId -> (status, detail) for folder cards
         self._folder_states: dict = {}
+        # folderId -> chosen destination directory, kept so a paused save can
+        # resume without asking for the directory again
+        self._folder_targets: dict = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -756,6 +822,7 @@ class ChatPage(QWidget):
                 self.list_view,
                 on_file_click=self._download_file,
                 file_states=self._file_states,
+                file_details=self._file_details,
                 media_resolver=self._media_path,
                 on_media_open=self._open_media,
                 folder_states=self._folder_states,
@@ -826,17 +893,54 @@ class ChatPage(QWidget):
         self.model.setRowCount(0)
         self.input_edit.clear()
         self._file_states.clear()
+        self._file_details.clear()
+        self._file_rates.clear()
         self._folder_states.clear()
+        self._folder_targets.clear()
         self._stick_to_bottom = True
         self._rebuild()
 
     def _on_messages_changed(self):
         self._rebuild()
 
+    def _seed_resume_states(self, msgs) -> None:
+        """Render paused cards from the persisted resume state: a file whose
+        ".part" survived an interruption (or an app restart) shows
+        「已暂停 xx%（点击续传）」 and stays clickable even though a restored
+        offer has no download address."""
+        for m in msgs:
+            if m.file_info is None or m.id in self._file_states:
+                continue
+            info = self.vm.resume_info(m.id)
+            if not info:
+                continue
+            percent = int(info["percent"])
+            self._file_states[m.id] = (
+                "paused",
+                info["target"],
+                str(percent) if percent else "",
+            )
+            self._file_details[m.id] = format_paused_text(percent)
+        for kind, payload in iter_message_rows(msgs):
+            if kind != "folder":
+                continue
+            group = payload
+            if group.is_from_me or group.folder_id in self._folder_states:
+                continue
+            info = self.vm.folder_resume_info(group.folder_id)
+            if not info:
+                continue
+            self._folder_states[group.folder_id] = (
+                "paused",
+                f"已暂停 {info['done']}/{info['total']}（点击续传）",
+            )
+            self._folder_targets[group.folder_id] = info["target"]
+
     def _rebuild(self):
         self._building = True
         self.model.setRowCount(0)
         msgs = self.vm.active_messages()
+        self._seed_resume_states(msgs)
         for kind, payload in iter_message_rows(msgs):
             item = QStandardItem()
             if kind == "header":
@@ -952,12 +1056,23 @@ class ChatPage(QWidget):
     # ------------------------------------------------------- folder saving
 
     def _download_folder(self, group: FolderGroup):
-        if group.is_from_me or group.expired:
+        if group.is_from_me:
             return
-        dest = QFileDialog.getExistingDirectory(self.window(), "选择保存文件夹位置")
-        if not dest:
-            return
-        self._folder_states[group.folder_id] = ("downloading", f"0/{group.total}")
+        state = self._folder_states.get(group.folder_id, ("idle", ""))[0]
+        dest = self._folder_targets.get(group.folder_id, "")
+        if state == "paused" and dest and os.path.isdir(dest):
+            # resume into the remembered directory without asking again
+            pass
+        else:
+            if group.expired:
+                return
+            dest = QFileDialog.getExistingDirectory(self.window(), "选择保存文件夹位置")
+            if not dest:
+                return
+            self._folder_targets[group.folder_id] = dest
+        info = self.vm.folder_resume_info(group.folder_id) if state == "paused" else None
+        detail = f"{info['done']}/{info['total']}" if info else f"0/{group.total}"
+        self._folder_states[group.folder_id] = ("downloading", detail)
         self.list_view.viewport().update()
         self.vm.download_folder(group.folder_id, dest)
 
@@ -978,12 +1093,23 @@ class ChatPage(QWidget):
             return
         if ok:
             self._folder_states[folder_id] = ("done", message)
+            self._folder_targets.pop(folder_id, None)
             Toast(self.window()).show_message("文件夹已保存")
-        elif "取消" in message:
-            self._folder_states[folder_id] = ("cancelled", message)
         else:
-            self._folder_states[folder_id] = ("failed", message)
-            Toast(self.window()).show_message(f"文件夹保存失败：{message}")
+            # any interruption keeps the per-file ".part" files: show the
+            # paused card so the next tap resumes where it stopped
+            info = self.vm.folder_resume_info(folder_id)
+            if info is not None:
+                self._folder_states[folder_id] = (
+                    "paused",
+                    f"已暂停 {info['done']}/{info['total']}（点击续传）",
+                )
+                self._folder_targets[folder_id] = info["target"]
+            elif "取消" in message:
+                self._folder_states[folder_id] = ("cancelled", message)
+            else:
+                self._folder_states[folder_id] = ("failed", message)
+                Toast(self.window()).show_message(f"文件夹保存失败：{message}")
         self.list_view.viewport().update()
         self.list_view.doItemsLayout()
 
@@ -1001,6 +1127,16 @@ class ChatPage(QWidget):
         fi = msg.file_info
         if fi is None:
             return
+        state = self._file_states.get(msg.id, ("idle", "", ""))
+        # a paused download continues into its remembered target (the ViewModel
+        # re-attaches the address/key from the persisted resume entry)
+        if state[0] == "paused" and state[1]:
+            self._file_details.pop(msg.id, None)
+            self._file_rates.pop(msg.id, None)
+            self._file_states[msg.id] = ("downloading", state[1], "")
+            self.list_view.viewport().update()
+            self.vm.download_file(msg.id, state[1])
+            return
         if fi.kind in MEDIA_KINDS:
             # media: NO save dialog — download into the app media dir so the
             # message renders inline; "另存为" in the context menu saves a copy
@@ -1009,6 +1145,8 @@ class ChatPage(QWidget):
                 self._file_states[msg.id] = ("done", target, "")
                 self._open_media(target)
                 return
+            self._file_details.pop(msg.id, None)
+            self._file_rates.pop(msg.id, None)
             self._file_states[msg.id] = ("downloading", target, "")
             self.list_view.viewport().update()
             self.vm.download_file(msg.id, target)
@@ -1026,6 +1164,8 @@ class ChatPage(QWidget):
         )
         if not path:
             return
+        self._file_details.pop(msg.id, None)
+        self._file_rates.pop(msg.id, None)
         self._file_states[msg.id] = ("downloading", path, "0")
         self.list_view.viewport().update()
         self.vm.download_file(msg.id, path)
@@ -1034,10 +1174,28 @@ class ChatPage(QWidget):
         state = self._file_states.get(file_id)
         if state is None or state[0] != "downloading":
             return
+        now = time.monotonic()
+        prev = self._file_rates.get(file_id)
+        speed = 0.0
+        if prev is not None:
+            elapsed = now - prev[0]
+            delta = received - prev[1]
+            if elapsed > 0 and delta > 0:
+                instant = delta / elapsed
+                # smooth the estimate so the ETA does not flicker per sample
+                speed = instant if prev[2] <= 0 else prev[2] * 0.6 + instant * 0.4
+        self._file_rates[file_id] = (now, received, speed)
         if total > 0:
             percent = min(99, int(received * 100 / total))
+            eta = (total - received) / speed if speed > 0 and received < total else -1
             self._file_states[file_id] = ("downloading", state[1], str(percent))
-            self.list_view.viewport().update()
+        else:
+            eta = -1
+        # live 已传/总大小 · 速度 · 剩余时间 on the card's second line
+        self._file_details[file_id] = format_transfer_detail(
+            received, total, speed, eta
+        )
+        self.list_view.viewport().update()
 
     def _cancel_download(self, msg):
         gid = self.vm.active_group_id
@@ -1046,23 +1204,51 @@ class ChatPage(QWidget):
         self.vm.cancel_download(gid, msg.id)
         state = self._file_states.get(msg.id)
         if state is not None and state[0] == "downloading":
-            self._file_states[msg.id] = ("cancelled", "", "")
+            percent = int(state[2]) if str(state[2]).isdigit() else 0
+            self._file_states[msg.id] = (
+                "paused",
+                state[1],
+                str(percent) if percent else "",
+            )
+            self._file_details[msg.id] = format_paused_text(percent)
             self.list_view.viewport().update()
 
     def _on_file_download_finished(self, file_id: str, ok: bool, message: str):
+        self._file_rates.pop(file_id, None)
         if ok:
             path = self._file_states.get(file_id, ("", "", ""))[1]
             self._file_states[file_id] = ("done", path, "")
+            self._file_details.pop(file_id, None)
             Toast(self.window()).show_message("文件已保存")
-        elif "取消" in message:
-            self._file_states[file_id] = ("cancelled", "", "")
         else:
-            self._file_states[file_id] = ("failed", "", message)
-            Toast(self.window()).show_message(f"下载失败：{message}")
+            # a surviving ".part" is a pause (cancel included): the card shows
+            # 已暂停 xx%（点击续传） and the next tap continues
+            info = self.vm.resume_info(file_id)
+            if info is not None or "取消" in message:
+                percent = int(info["percent"]) if info else 0
+                target = self._file_states.get(file_id, ("", "", ""))[1]
+                target = target or (info["target"] if info else "")
+                self._file_states[file_id] = (
+                    "paused",
+                    target,
+                    str(percent) if percent else "",
+                )
+                self._file_details[file_id] = format_paused_text(percent)
+            else:
+                self._file_states[file_id] = ("failed", "", message)
+                self._file_details.pop(file_id, None)
+                Toast(self.window()).show_message(f"下载失败：{message}")
         self.list_view.viewport().update()
         # a downloaded image swaps its placeholder card for a much taller
         # inline bubble: repaint alone keeps the stale row height
         self.list_view.doItemsLayout()
+
+    def _downloadable_file(self, msg) -> bool:
+        """An offer stays download-clickable when a paused resume state exists
+        (a restored offer has no address, but the resume entry does)."""
+        if not file_offer_expired(msg.file_info):
+            return True
+        return self._file_states.get(msg.id, ("idle", "", ""))[0] == "paused"
 
     def _on_media_ready(self):
         """An own sent image landed in the media dir: re-render so the
@@ -1089,13 +1275,17 @@ class ChatPage(QWidget):
             download_action = None
             cancel_action = None
             dl_state = self._file_states.get(msg.id, ("idle", "", ""))[0]
-            if not file_offer_expired(msg.file_info):
+            if self._downloadable_file(msg):
                 if dl_state == "downloading":
                     # an in-flight download offers 取消下载 instead of starting
                     # a second one
                     cancel_action = menu.addAction("取消下载")
+                elif is_media:
+                    download_action = menu.addAction("另存为...")
                 else:
-                    download_action = menu.addAction("另存为..." if is_media else "下载 / 另存为")
+                    download_action = menu.addAction(
+                        "续传 / 另存为" if dl_state == "paused" else "下载 / 另存为"
+                    )
             copy_name_action = menu.addAction("复制文件名")
             delete_action = None
             if msg.is_from_me:
@@ -1132,11 +1322,13 @@ class ChatPage(QWidget):
         state = self._folder_states.get(group.folder_id, ("idle", ""))[0]
         save_action = None
         cancel_action = None
-        if not group.is_from_me and not group.expired:
+        if not group.is_from_me and (not group.expired or state == "paused"):
             if state == "downloading":
                 cancel_action = menu.addAction("取消下载")
             else:
-                save_action = menu.addAction("保存文件夹...")
+                save_action = menu.addAction(
+                    "继续保存" if state == "paused" else "保存文件夹..."
+                )
         copy_action = menu.addAction("复制文件夹名")
         delete_action = None
         if group.is_from_me:
@@ -1157,7 +1349,9 @@ class ChatPage(QWidget):
         if gid is None:
             return
         self.vm.cancel_download(gid, group.folder_id)
-        self._folder_states[group.folder_id] = ("cancelled", "")
+        # the worker keeps every ".part": show the paused card immediately, the
+        # finished handler then fills in the exact done/total counts
+        self._folder_states[group.folder_id] = ("paused", "已暂停（点击续传）")
         self.list_view.viewport().update()
 
     def _confirm_delete_folder(self, group: FolderGroup):
