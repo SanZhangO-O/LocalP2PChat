@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..models import MAX_CONTENT_LENGTH, MAX_FOLDER_FILES, MEDIA_KINDS, Peer
+from ..models import MAX_CONTENT_LENGTH, MAX_FOLDER_FILES, MAX_REPLY_PREVIEW, MEDIA_KINDS, Peer
 from ..view_model import ChatViewModel
 from .chat_page import (
     HEADER_ROLE,
@@ -63,6 +63,8 @@ class DirectChatPage(QWidget):
         self.on_back = on_back
         self._peer_id: str | None = None
         self._contact: Peer | None = None
+        # The message being replied to (None when not replying).
+        self._reply_target = None
         # fileId -> (status, target_path, message) for direct file messages
         self._file_states: dict = {}
         # folderId -> (status, detail) for folder cards
@@ -113,6 +115,8 @@ class DirectChatPage(QWidget):
                 folder_states=self._folder_states,
                 on_folder_click=self._download_folder,
                 on_folder_open=self._open_folder,
+                # direct chats show 已读/未读 on own bubbles
+                show_read_state=True,
                 parent=self,
             )
         )
@@ -133,6 +137,31 @@ class DirectChatPage(QWidget):
         bottom_layout = QVBoxLayout(bottom)
         bottom_layout.setContentsMargins(14, 8, 14, 12)
         bottom_layout.setSpacing(2)
+        # Reply/quote bar: hidden until the user picks 回复 on a message
+        self.reply_bar = QFrame()
+        self.reply_bar.setObjectName("replyBar")
+        self.reply_bar.setStyleSheet(
+            "QFrame#replyBar { background-color: #F2F1F5; border-radius: 6px; }"
+        )
+        reply_layout = QHBoxLayout(self.reply_bar)
+        reply_layout.setContentsMargins(8, 4, 4, 4)
+        reply_layout.setSpacing(6)
+        self.reply_label = QLabel("")
+        self.reply_label.setObjectName("faint")
+        self.reply_label.setWordWrap(True)
+        reply_layout.addWidget(self.reply_label, 1)
+        self.reply_cancel_btn = QPushButton("×")
+        self.reply_cancel_btn.setObjectName("ghost")
+        self.reply_cancel_btn.setFixedSize(24, 24)
+        self.reply_cancel_btn.setToolTip("取消回复")
+        # clicked injects a bool into the first lambda parameter: keep it
+        # explicit (AGENTS.md PyQt6 trap) so _clear_reply never receives it
+        self.reply_cancel_btn.clicked.connect(
+            lambda checked=False: self._clear_reply()
+        )
+        reply_layout.addWidget(self.reply_cancel_btn)
+        self.reply_bar.hide()
+        bottom_layout.addWidget(self.reply_bar)
         input_row = QHBoxLayout()
         input_row.setSpacing(8)
 
@@ -174,10 +203,11 @@ class DirectChatPage(QWidget):
         bottom_layout.addWidget(self.count_label)
         layout.addWidget(bottom)
 
-        self.input_edit.textChanged.connect(self._update_send_ui)
+        self.input_edit.textChanged.connect(self._on_input_changed)
         self.vm.direct_messages_signal.connect(self._on_messages_changed)
         self.vm.direct_contacts_signal.connect(self._on_contacts_changed)
         self.vm.direct_session_closed.connect(self._on_session_closed)
+        self.vm.typing_state_changed.connect(self._refresh_status)
         self.vm.file_download_finished.connect(self._on_file_download_finished)
         self.vm.media_ready.connect(self._on_media_ready)
         self.vm.file_progress.connect(self._on_file_progress)
@@ -193,6 +223,7 @@ class DirectChatPage(QWidget):
         self.input_edit.clear()
         self._file_states.clear()
         self._folder_states.clear()
+        self._clear_reply()
         # use the real member id returned by the handshake so messages and the
         # session line up (a manually added contact starts with a placeholder)
         peer_id = self.vm.open_direct_chat(contact)
@@ -204,6 +235,8 @@ class DirectChatPage(QWidget):
         # returning must not end a video call riding this session, and a
         # session only closes on a real disconnect. Reopening the chat reuses
         # the live session.
+        if self._peer_id is not None:
+            self.vm.end_direct_typing(self._peer_id)
         self._peer_id = None
         self.on_back()
 
@@ -224,12 +257,46 @@ class DirectChatPage(QWidget):
         if peer_id is None:
             return
         alive = self.vm.direct_chat_alive(peer_id)
-        self.status_label.setText("在线" if alive else "未连接")
+        typing = alive and self.vm.direct_peer_typing(peer_id)
+        if typing:
+            self.status_label.setText("对方正在输入…")
+        else:
+            self.status_label.setText("在线" if alive else "未连接")
         self.status_label.setStyleSheet(
             f"font-size: 11px; color: {PRIMARY if alive else '#6B6875'};"
         )
         self.banner_label.setVisible(not alive)
         self.call_btn.setEnabled(alive)
+
+    # ------------------------------------------------------------ reply
+
+    def _set_reply_target(self, msg) -> None:
+        """Arm the reply bar for [msg]: the next send quotes it."""
+        self._reply_target = msg
+        preview = (msg.content or "").replace("\n", " ").strip()
+        if msg.file_info is not None and not preview:
+            preview = msg.file_info.file_name
+        if len(preview) > MAX_REPLY_PREVIEW:
+            preview = preview[:MAX_REPLY_PREVIEW] + "…"
+        self.reply_label.setText(
+            f"回复 {msg.sender_name}：{preview}" if preview else f"回复 {msg.sender_name}"
+        )
+        self.reply_bar.show()
+
+    def _clear_reply(self) -> None:
+        self._reply_target = None
+        self.reply_bar.hide()
+
+    def _reply_payload(self):
+        """(reply_to, reply_preview, reply_sender) for the armed reply, or
+        (None, None, None) when not replying (Android parity cap)."""
+        target = self._reply_target
+        if target is None:
+            return None, None, None
+        preview = (target.content or "").replace("\n", " ").strip()
+        if len(preview) > MAX_REPLY_PREVIEW:
+            preview = preview[:MAX_REPLY_PREVIEW]
+        return target.id, preview, target.sender_name
 
     def _on_chat_migrated(self, from_id: str, to_id: str) -> None:
         # a handshake revealed the real device id for this chat (a manually
@@ -293,10 +360,19 @@ class DirectChatPage(QWidget):
             self.count_label.setStyleSheet("font-size: 11px; color: #B3261E;")
             self.count_label.show()
             return
-        if self.vm.send_direct_message(peer_id, text):
+        if self.vm.send_direct_message(peer_id, text, *self._reply_payload()):
             self.input_edit.clear()
+            self._clear_reply()
         else:
             Toast(self.window()).show_message("未连接，无法发送消息")
+
+    def _on_input_changed(self):
+        self._update_send_ui()
+        # composing a non-empty draft refreshes our typing indicator (the
+        # ViewModel throttles it); clearing the box does not re-arm it
+        peer_id = self._peer_id
+        if peer_id is not None and self.input_edit.toPlainText().strip():
+            self.vm.notify_direct_typing(peer_id)
 
     def _update_send_ui(self):
         length = len(self.input_edit.toPlainText())
@@ -532,13 +608,16 @@ class DirectChatPage(QWidget):
             elif chosen is delete_action:
                 self._delete(msg)
             return
+        reply_action = menu.addAction("回复")
         copy_action = menu.addAction("复制")
         delete_action = None
         if msg.is_from_me:
             menu.addSeparator()
             delete_action = menu.addAction("删除")
         chosen = menu.exec(self.list_view.viewport().mapToGlobal(pos))
-        if chosen is copy_action:
+        if chosen is reply_action:
+            self._set_reply_target(msg)
+        elif chosen is copy_action:
             QApplication.clipboard().setText(msg.content)
         elif chosen is delete_action:
             self._delete(msg)

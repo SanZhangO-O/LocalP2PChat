@@ -110,6 +110,14 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # A direct chat's key moved from an "ip:..." placeholder id to the member's
     # real device id (revealed by a handshake): the UI re-keys the open chat.
     direct_chat_migrated = pyqtSignal(str, str)
+    # A peer's typing indicator changed (direct chat) / a group member's did
+    # (group chat). Emitted from network threads; the slots run on the main
+    # thread (queued connection) and update the typing state + page labels.
+    direct_typing_signal = pyqtSignal(str, bool)
+    group_typing_signal = pyqtSignal(str, str, bool)
+    # The typing indicator shown by a page changed (appeared/refreshed/expired):
+    # the chat pages re-render their label.
+    typing_state_changed = pyqtSignal()
 
     # Burst window in ms: incoming notifications within this span are merged
     # into a single tray bubble instead of one popup per message.
@@ -119,6 +127,14 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # elapsed since the last emission OR 64KB of new bytes arrived.
     FILE_PROGRESS_MIN_INTERVAL = 0.25
     FILE_PROGRESS_MIN_DELTA = 64 * 1024
+
+    # Typing indicator (Android parity): while the local user keeps typing,
+    # refresh at most once per TYPING_ACTIVE_INTERVAL; TYPING_STOP_DELAY of
+    # silence sends active=false. The receiver expires an indicator that saw
+    # no refresh for TYPING_TIMEOUT (a path can die mid-typing).
+    TYPING_ACTIVE_INTERVAL = 2.0
+    TYPING_STOP_DELAY = 4.0
+    TYPING_TIMEOUT = 6.0
 
     def __init__(self, store: ChatStore, data_dir: str = "."):
         super().__init__()
@@ -189,11 +205,24 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.host_server.ensure_running()
         self._direct_persisted_ids: Dict[str, set] = {}
         self._direct_pending: Dict[str, Dict[str, bool]] = {}
+        # Own direct messages' persisted read state (peer read_receipts):
+        # message id -> read. Mirrors the _direct_pending bookkeeping.
+        self._direct_read: Dict[str, Dict[str, bool]] = {}
         self._direct_last: Dict[str, Optional[ChatMessage]] = {}
         # Running file downloads: (group_id|peer_id, message_id) ->
         # (cancel Event, [download socket]). cancel_download sets the event
         # and shuts the socket down so a blocked read aborts immediately.
         self._download_registry: Dict[tuple, tuple] = {}
+
+        # Typing indicators (main thread only): peer id -> monotonic deadline
+        # of the received indicator, group id -> {sender id: (name, deadline)},
+        # and the outbound "stop typing" timers per conversation scope.
+        self._direct_typing: Dict[str, float] = {}
+        self._group_typing: Dict[str, Dict[str, tuple]] = {}
+        self._typing_out: Dict[str, dict] = {}
+        self._typing_timer = QTimer(self)
+        self._typing_timer.setInterval(1000)
+        self._typing_timer.timeout.connect(self._on_typing_tick)
 
         # Group mesh: member-to-member links so chat survives the host going
         # offline, plus history backfill on connect.
@@ -266,6 +295,8 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.direct_call_signal.connect(self._on_direct_call_signal)
         self.direct_session_closed.connect(self._on_direct_session_closed)
         self.direct_chat_migrated.connect(self._on_direct_chat_migrated_slot)
+        self.direct_typing_signal.connect(self._on_direct_typing)
+        self.group_typing_signal.connect(self._on_group_typing)
 
         # Tray-notification aggregation state (main thread only).
         self._tray_timer = QTimer(self)
@@ -572,6 +603,144 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     def direct_chat_alive(self, peer_id: str) -> bool:
         return self.direct.is_chat_alive(peer_id)
 
+    # ---------------------------------------------------- typing indicators
+
+    def direct_peer_typing(self, peer_id: str) -> bool:
+        """True while the peer's typing indicator is live (direct chat)."""
+        with self._lock:
+            deadline = self._direct_typing.get(peer_id)
+        return deadline is not None and time.monotonic() < deadline
+
+    def group_typing_names(self, group_id: str) -> list:
+        """Display names of members currently typing in [group_id]."""
+        with self._lock:
+            entries = dict(self._group_typing.get(group_id, {}))
+        now = time.monotonic()
+        return [name for name, deadline in entries.values() if now < deadline]
+
+    def notify_direct_typing(self, peer_id: str) -> None:
+        """The local user typed in the direct chat: refresh our indicator
+        (throttled) and arm the stop timer. Call on every input change."""
+        if peer_id:
+            self._typing_activity(
+                "direct:" + peer_id,
+                lambda active, pid=peer_id: self.direct.send_typing(pid, active),
+            )
+
+    def notify_group_typing(self) -> None:
+        """The local user typed in the active group: refresh our indicator."""
+        gid = self.active_group_id
+        if gid:
+            self._typing_activity(
+                gid, lambda active, g=gid: self._send_group_typing(g, active)
+            )
+
+    def end_direct_typing(self, peer_id: str) -> None:
+        """The user left the direct chat: our indicator is stale now."""
+        if peer_id:
+            self._end_active_typing("direct:" + peer_id)
+
+    def _send_group_typing(self, group_id: str, active: bool) -> None:
+        p2p = self.group_p2p_map.get(group_id)
+        if p2p is not None:
+            p2p.send_typing(active)
+        # host-offline path: the mesh carries the indicator too
+        self.mesh.broadcast_typing(group_id, self.direct.my_id_value, active)
+
+    def _typing_activity(self, scope_key: str, send) -> None:
+        """Throttle an outgoing typing indicator: active=true at most once per
+        TYPING_ACTIVE_INTERVAL, and active=false after TYPING_STOP_DELAY with
+        no further activity. [send] receives the boolean active flag (kept in
+        the state so the delayed stop reaches the same channel)."""
+        state = self._typing_out.get(scope_key)
+        if state is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda key=scope_key: self._stop_typing(key))
+            state = {"last": 0.0, "timer": timer, "send": send}
+            self._typing_out[scope_key] = state
+        else:
+            state["send"] = send
+        now = time.monotonic()
+        if now - state["last"] >= self.TYPING_ACTIVE_INTERVAL:
+            state["last"] = now
+            send(True)
+        state["timer"].start(int(self.TYPING_STOP_DELAY * 1000))
+
+    def _stop_typing(self, scope_key: str) -> None:
+        state = self._typing_out.pop(scope_key, None)
+        if state is None:
+            return
+        state["send"](False)
+
+    def _end_active_typing(self, scope_key: str) -> None:
+        """Our message just went out (or the chat closed): the indicator is
+        stale immediately, no need to wait for the stop delay."""
+        if scope_key in self._typing_out:
+            self._stop_typing(scope_key)
+
+    def _on_direct_typing(self, peer_id: str, active: bool) -> None:
+        """Main-thread slot: a peer's typing indicator changed."""
+        with self._lock:
+            if active:
+                self._direct_typing[peer_id] = (
+                    time.monotonic() + self.TYPING_TIMEOUT
+                )
+            else:
+                self._direct_typing.pop(peer_id, None)
+        self._ensure_typing_timer()
+        self.typing_state_changed.emit()
+
+    def _on_group_typing(self, group_id: str, sender_id: str, active: bool) -> None:
+        """Main-thread slot: a group member's typing indicator changed."""
+        if not group_id or sender_id == self.direct.my_id_value:
+            return
+        with self._lock:
+            entries = self._group_typing.setdefault(group_id, {})
+            if active:
+                name = sender_id
+                p2p = self.group_p2p_map.get(group_id)
+                if p2p is not None:
+                    peer = p2p.peers.get(sender_id)
+                    if peer is not None and peer.name:
+                        name = peer.name
+                entries[sender_id] = (name, time.monotonic() + self.TYPING_TIMEOUT)
+            else:
+                entries.pop(sender_id, None)
+                if not entries:
+                    self._group_typing.pop(group_id, None)
+        self._ensure_typing_timer()
+        self.typing_state_changed.emit()
+
+    def _ensure_typing_timer(self) -> None:
+        """Run the 1s expiry tick only while some indicator is live."""
+        with self._lock:
+            has_any = bool(self._direct_typing) or bool(self._group_typing)
+        if has_any and not self._typing_timer.isActive():
+            self._typing_timer.start()
+        elif not has_any and self._typing_timer.isActive():
+            self._typing_timer.stop()
+
+    def _on_typing_tick(self) -> None:
+        now = time.monotonic()
+        changed = False
+        with self._lock:
+            for peer_id in [p for p, d in self._direct_typing.items() if now >= d]:
+                self._direct_typing.pop(peer_id, None)
+                changed = True
+            for gid in list(self._group_typing.keys()):
+                entries = self._group_typing[gid]
+                for sender_id in [
+                    s for s, (_, deadline) in entries.items() if now >= deadline
+                ]:
+                    entries.pop(sender_id, None)
+                    changed = True
+                if not entries:
+                    self._group_typing.pop(gid, None)
+        if changed:
+            self.typing_state_changed.emit()
+        self._ensure_typing_timer()
+
     def direct_last_message(self, peer_id: str) -> Optional[ChatMessage]:
         """Last message of a direct chat, for the home-page preview."""
         return self._direct_last.get(peer_id)
@@ -606,11 +775,16 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 is_from_me=m.is_from_me,
                 file_info=self._restored_file_info(m),
                 pending=m.pending,
+                reply_to=m.reply_to or None,
+                reply_preview=m.reply_preview or None,
+                reply_sender=m.reply_sender or None,
+                read=m.read,
             )
             for m in saved
         ]
         self.direct.seed_messages(peer_id, msgs)
         self._direct_persisted_ids[peer_id] = {m.id for m in saved}
+        self._direct_read[peer_id] = {m.id: m.read for m in saved}
         self._direct_last[peer_id] = msgs[-1] if msgs else None
 
     @staticmethod
@@ -639,11 +813,28 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             folder_total=m.folder_total,
         )
 
-    def send_direct_message(self, peer_id: str, content: str) -> bool:
+    def send_direct_message(
+        self,
+        peer_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        reply_preview: Optional[str] = None,
+        reply_sender: Optional[str] = None,
+    ) -> bool:
         # peers are first-class: a message may queue as pending while the peer
         # is offline and deliver automatically once it comes online (Android
         # parity). False only when there is no contact and no session.
-        return self.direct.send_message(peer_id, content)
+        sent = self.direct.send_message(
+            peer_id,
+            content,
+            reply_to=reply_to,
+            reply_preview=reply_preview,
+            reply_sender=reply_sender,
+        )
+        if sent:
+            # the message supersedes any "typing" we were showing
+            self._end_active_typing("direct:" + peer_id)
+        return sent
 
     def delete_direct_message(self, peer_id: str, message_id: str, sender_id: str) -> None:
         self.direct.delete_message(peer_id, message_id, sender_id)
@@ -699,6 +890,8 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # the chat before dropping the contact)
         self.direct.close_chat(contact_id)
         self.direct.remove_contact(contact_id)
+        # a removed member's live typing indicator must not linger
+        self._on_direct_typing(contact_id, False)
 
     # ------------------------------------------ direct calls and file transfer
 
@@ -955,6 +1148,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             f"无法连接成员 {peer.name}（{peer.ip_address}:{peer.port}）：{reason}"
         )
 
+    def direct_typing_changed(self, peer_id: str, active: bool) -> None:
+        # network thread -> main thread via the queued signal
+        self.direct_typing_signal.emit(peer_id, active)
+
     # GroupMeshListener (called from mesh worker threads; hop to the main
     # thread via queued signals).
     def group_mesh_message(self, group_id: str, msgs) -> None:
@@ -985,6 +1182,16 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             self.store.record_deleted_messages(group_id, deleted_ids)
         if group_id == self.active_group_id:
             self.active_messages_changed.emit()
+
+    def group_mesh_typing(self, group_id: str, sender_id: str, active: bool) -> None:
+        """A linked member's typing indicator (host-offline path); hop to the
+        main thread via the queued signal like the other mesh events."""
+        self.group_typing_signal.emit(group_id, sender_id, active)
+
+    def typing_changed(self, p2p: P2PManager, sender_id: str, active: bool) -> None:
+        """A member's typing indicator (host relay path); hop to the main
+        thread via the queued signal."""
+        self.group_typing_signal.emit(p2p.current_group_id or "", sender_id, active)
 
     def deleted_ids_received(self, p2p: P2PManager, deleted_ids) -> None:
         """join_ack carried tombstone convergence data: the still-present
@@ -1134,12 +1341,14 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             {m.id for m in self.store.get_messages_for_group("direct:" + peer_id)},
         )
         pending_map = self._direct_pending.setdefault(peer_id, {})
+        read_map = self._direct_read.setdefault(peer_id, {})
         current = {m.id for m in msgs}
         removed = stored - current
         if removed:
             stored.difference_update(removed)
             for mid in removed:
                 pending_map.pop(mid, None)
+                read_map.pop(mid, None)
                 self.store.delete_message("direct:" + peer_id, mid)
         new = [m for m in msgs if m.id not in stored]
         peer = next((c for c in self.direct.contacts_list() if c.id == peer_id), None)
@@ -1168,6 +1377,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             stored.update(m.id for m in new)
             for m in new:
                 pending_map[m.id] = m.pending
+                read_map[m.id] = m.read
             self.store.insert_messages(
                 [to_saved_message("direct:" + peer_id, m) for m in new]
             )
@@ -1180,6 +1390,15 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             for m in flag_changes:
                 pending_map[m.id] = m.pending
                 self.store.update_message_pending("direct:" + peer_id, m.id, m.pending)
+        # peer read_receipts flip own messages to 已读: persist like pending
+        read_changes = [
+            m for m in msgs
+            if m.is_from_me and m.id in read_map and read_map[m.id] != m.read
+        ]
+        if read_changes:
+            for m in read_changes:
+                read_map[m.id] = m.read
+                self.store.update_message_read("direct:" + peer_id, m.id, m.read)
 
     def _on_direct_chat_migrated(self, from_id: str, to_id: str) -> None:
         """A direct chat's key moved from a "ip:..." placeholder to the real
@@ -1192,6 +1411,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         )
         self._direct_pending[to_id] = self._direct_pending.pop(
             from_id, self._direct_pending.get(to_id, {})
+        )
+        self._direct_read[to_id] = self._direct_read.pop(
+            from_id, self._direct_read.get(to_id, {})
         )
         if from_id in self._direct_last:
             self._direct_last[to_id] = self._direct_last.pop(from_id)
@@ -1413,6 +1635,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                             sender_name=m.sender_name,
                             is_from_me=m.is_from_me,
                             file_info=self._restored_file_info(m),
+                            reply_to=m.reply_to or None,
+                            reply_preview=m.reply_preview or None,
+                            reply_sender=m.reply_sender or None,
                         )
                         for m in saved
                     ]
@@ -1831,7 +2056,13 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.active_connection_lost_changed.emit()
         self.active_server_error_changed.emit()
 
-    def send_message(self, content: str) -> bool:
+    def send_message(
+        self,
+        content: str,
+        reply_to: Optional[str] = None,
+        reply_preview: Optional[str] = None,
+        reply_sender: Optional[str] = None,
+    ) -> bool:
         if not content.strip():
             return False
         gid = self.active_group_id
@@ -1842,9 +2073,16 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # offline) — either path suffices
         if p2p is None or (p2p.connection_lost and not self.mesh.has_links(gid)):
             return False
-        msg = p2p.send_message(content)
+        msg = p2p.send_message(
+            content,
+            reply_to=reply_to,
+            reply_preview=reply_preview,
+            reply_sender=reply_sender,
+        )
         if msg is not None:
             self.mesh.broadcast(gid, msg)
+            # the message supersedes any "typing" we were showing
+            self._end_active_typing(gid)
         return True
 
     def send_message_to_group(self, group_id: str, content: str) -> bool:
@@ -1856,6 +2094,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         msg = p2p.send_message(content)
         if msg is not None:
             self.mesh.broadcast(group_id, msg)
+            self._end_active_typing(group_id)
         return True
 
     def delete_message(self, message_id: str) -> None:

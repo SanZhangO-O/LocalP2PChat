@@ -47,6 +47,14 @@ class SavedMessage:
     # True while an own direct-chat message still waits for the peer to come
     # online (pending send). Restored into the outbox at startup.
     pending: bool = False
+    # Reply/quote (empty when the message is not a reply): survives restart so
+    # the quoted header still renders. Mirrors the wire ChatMessage fields.
+    reply_to: str = ""
+    reply_preview: str = ""
+    reply_sender: str = ""
+    # Own direct-chat message read by the peer (set by a read_receipt):
+    # survives restart so "已读" does not flip back after a relaunch.
+    read: bool = False
 
 
 class ChatStore:
@@ -216,6 +224,22 @@ class ChatStore:
                 c.execute(
                     "ALTER TABLE saved_messages ADD COLUMN folderTotal INTEGER NOT NULL DEFAULT 0"
                 )
+            if "replyTo" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN replyTo TEXT NOT NULL DEFAULT ''"
+                )
+            if "replyPreview" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN replyPreview TEXT NOT NULL DEFAULT ''"
+                )
+            if "replySender" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN replySender TEXT NOT NULL DEFAULT ''"
+                )
+            if "read" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0"
+                )
             return
         # old schema: rebuild with the composite PK (+ pending) and copy rows
         c.execute("ALTER TABLE saved_messages RENAME TO saved_messages_old")
@@ -238,6 +262,10 @@ class ChatStore:
                 relativePath TEXT NOT NULL DEFAULT '',
                 folderTotal INTEGER NOT NULL DEFAULT 0,
                 pending INTEGER NOT NULL DEFAULT 0,
+                replyTo TEXT NOT NULL DEFAULT '',
+                replyPreview TEXT NOT NULL DEFAULT '',
+                replySender TEXT NOT NULL DEFAULT '',
+                read INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (groupId) REFERENCES saved_groups(groupId) ON DELETE CASCADE,
                 PRIMARY KEY (groupId, id)
             )
@@ -252,12 +280,15 @@ class ChatStore:
             INSERT INTO saved_messages
                 (id, groupId, content, timestamp, senderId, senderName, isFromMe,
                  fileSize, downloadHost, downloadPort, kind,
-                 folderId, folderName, relativePath, folderTotal, pending)
+                 folderId, folderName, relativePath, folderTotal, pending,
+                 replyTo, replyPreview, replySender, read)
             SELECT id, groupId, content, timestamp, senderId, senderName, isFromMe,
                    {_col('fileSize', '0')}, {_col('downloadHost', "''")},
                    {_col('downloadPort', '0')}, {_col('kind', "'file'")},
                    {_col('folderId', "''")}, {_col('folderName', "''")},
-                   {_col('relativePath', "''")}, {_col('folderTotal', '0')}, 0
+                   {_col('relativePath', "''")}, {_col('folderTotal', '0')}, 0,
+                   {_col('replyTo', "''")}, {_col('replyPreview', "''")},
+                   {_col('replySender', "''")}, {_col('read', '0')}
             FROM saved_messages_old
             """
         )
@@ -352,8 +383,9 @@ class ChatStore:
                 INSERT OR REPLACE INTO saved_messages
                 (id, groupId, content, timestamp, senderId, senderName, isFromMe,
                  fileSize, downloadHost, downloadPort, kind,
-                 folderId, folderName, relativePath, folderTotal, pending)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 folderId, folderName, relativePath, folderTotal, pending,
+                 replyTo, replyPreview, replySender, read)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -375,6 +407,11 @@ class ChatStore:
                         m.relative_path,
                         m.folder_total,
                         1 if m.pending else 0,
+                        m.reply_to,
+                        # the quote snippet is conversation content too
+                        self._enc(m.reply_preview),
+                        m.reply_sender,
+                        1 if m.read else 0,
                     )
                     for m in messages
                 ],
@@ -405,6 +442,14 @@ class ChatStore:
                 relative_path=r["relativePath"] if "relativePath" in r.keys() else "",
                 folder_total=r["folderTotal"] if "folderTotal" in r.keys() else 0,
                 pending=bool(r["pending"]) if "pending" in r.keys() else False,
+                reply_to=r["replyTo"] if "replyTo" in r.keys() else "",
+                reply_preview=(
+                    self._dec(r["replyPreview"])
+                    if "replyPreview" in r.keys()
+                    else ""
+                ),
+                reply_sender=r["replySender"] if "replySender" in r.keys() else "",
+                read=bool(r["read"]) if "read" in r.keys() else False,
             )
             for r in rows
         ]
@@ -438,6 +483,14 @@ class ChatStore:
                 relative_path=r["relativePath"] if "relativePath" in r.keys() else "",
                 folder_total=r["folderTotal"] if "folderTotal" in r.keys() else 0,
                 pending=True,
+                reply_to=r["replyTo"] if "replyTo" in r.keys() else "",
+                reply_preview=(
+                    self._dec(r["replyPreview"])
+                    if "replyPreview" in r.keys()
+                    else ""
+                ),
+                reply_sender=r["replySender"] if "replySender" in r.keys() else "",
+                read=bool(r["read"]) if "read" in r.keys() else False,
             )
             for r in rows
         ]
@@ -448,6 +501,16 @@ class ChatStore:
             self._conn.execute(
                 "UPDATE saved_messages SET pending = ? WHERE groupId = ? AND id = ?",
                 (1 if pending else 0, group_id, message_id),
+            )
+            self._conn.commit()
+
+    def update_message_read(self, group_id: str, message_id: str, read: bool) -> None:
+        """Flip the persisted read state of one own direct-chat message (the
+        peer's read_receipt covered it)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE saved_messages SET read = ? WHERE groupId = ? AND id = ?",
+                (1 if read else 0, group_id, message_id),
             )
             self._conn.commit()
 
@@ -463,10 +526,12 @@ class ChatStore:
                 INSERT OR REPLACE INTO saved_messages
                     (id, groupId, content, timestamp, senderId, senderName, isFromMe,
                      fileSize, downloadHost, downloadPort, kind,
-                     folderId, folderName, relativePath, folderTotal, pending)
+                     folderId, folderName, relativePath, folderTotal, pending,
+                     replyTo, replyPreview, replySender, read)
                 SELECT id, ?, content, timestamp, senderId, senderName, isFromMe,
                        fileSize, downloadHost, downloadPort, kind,
-                       folderId, folderName, relativePath, folderTotal, pending
+                       folderId, folderName, relativePath, folderTotal, pending,
+                       replyTo, replyPreview, replySender, read
                 FROM saved_messages WHERE groupId = ?
                 """,
                 (to_group_id, from_group_id),
@@ -572,4 +637,8 @@ def to_saved_message(group_id: str, msg: ChatMessage) -> SavedMessage:
         relative_path=fi.relative_path if fi is not None else "",
         folder_total=fi.folder_total if fi is not None else 0,
         pending=msg.pending,
+        reply_to=msg.reply_to or "",
+        reply_preview=msg.reply_preview or "",
+        reply_sender=msg.reply_sender or "",
+        read=msg.read,
     )

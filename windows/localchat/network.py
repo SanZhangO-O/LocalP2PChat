@@ -1005,6 +1005,13 @@ class P2PListener:
         message ids deleted in the group while this member was away."""
         pass
 
+    def typing_changed(self, p2p: "P2PManager", sender_id: str, active: bool) -> None:
+        """A member's typing indicator changed (host relay path). Called from
+        the read-loop thread; [active] False means the member stopped (or sent
+        its message). Advisory only — the ViewModel also expires an indicator
+        that received no refresh."""
+        pass
+
 
 class P2PManager:
     # Peer-presence heartbeat: both sides send a ping every interval; a read
@@ -1772,6 +1779,11 @@ class P2PManager:
             with self._lock:
                 self.messages = [m for m in self.messages if m.id != packet.message_id]
             self.listener.messages_changed(self)
+        elif packet.type == "typing" and packet.sender_id and packet.active is not None:
+            # advisory typing indicator for a member, attributed by the host
+            # relay (a client's own senderId was validated by the host before
+            # forwarding, so it cannot be forged here)
+            self.listener.typing_changed(self, packet.sender_id, bool(packet.active))
         elif packet.type == "ping":
             wire = self._host_wire
             if wire is not None:
@@ -1846,6 +1858,19 @@ class P2PManager:
                     packet.sender_id,
                     target.sender_id if target is not None else None,
                 )
+        elif packet.type == "typing" and packet.active is not None:
+            # a member is composing: attribute the indicator to the
+            # authenticated connection (never to a packet-carried id we did
+            # not verify), show it to the host itself, and relay it to the
+            # other members (exclude the sender, like chat/delete)
+            if packet.sender_id != sender_id:
+                logger.warning(
+                    "drop typing from %s: packet senderId=%r",
+                    sender_id, packet.sender_id,
+                )
+            else:
+                self.listener.typing_changed(self, sender_id, bool(packet.active))
+                self._broadcast_to_clients(packet, exclude=sender_id)
         elif packet.type == "ping":
             with self._lock:
                 conn = self._connected_clients.get(sender_id)
@@ -1926,10 +1951,17 @@ class P2PManager:
 
     # -------------------------------------------------------------- sending
 
-    def send_message(self, content: str) -> Optional[ChatMessage]:
+    def send_message(
+        self,
+        content: str,
+        reply_to: Optional[str] = None,
+        reply_preview: Optional[str] = None,
+        reply_sender: Optional[str] = None,
+    ) -> Optional[ChatMessage]:
         """Send a chat message through the host relay; returns the created
         message (or None for invalid content) so the caller can also broadcast
-        it over the group mesh."""
+        it over the group mesh. The optional reply_* triple attaches a quoted
+        header (see ChatMessage); a forward passes none of them."""
         if not is_valid_content(content):
             return None
         message = ChatMessage(
@@ -1939,6 +1971,9 @@ class P2PManager:
             sender_id=self.my_id,
             sender_name=self.my_name,
             is_from_me=True,
+            reply_to=reply_to,
+            reply_preview=reply_preview,
+            reply_sender=reply_sender,
         )
         with self._lock:
             self.messages.append(message)
@@ -1946,6 +1981,18 @@ class P2PManager:
         packet = NetworkPacket(type="chat", message=message)
         self._enqueue_send(packet)
         return message
+
+    def send_typing(self, active: bool) -> None:
+        """Broadcast a typing indicator to the group over the host relay (the
+        ViewModel mirrors it over the mesh). Advisory and never queued
+        offline: without a live connection there is nobody to show it to."""
+        packet = NetworkPacket(
+            type="typing",
+            group_id=self.current_group_id,
+            sender_id=self.my_id,
+            active=bool(active),
+        )
+        self._enqueue_send(packet)
 
     def merge_incoming(self, msgs) -> None:
         """Merge messages that arrived over the group mesh (or history sync)
@@ -2365,6 +2412,12 @@ class DirectChatListener:
     def direct_connect_failed(self, peer, reason: str) -> None:
         pass
 
+    def direct_typing_changed(self, peer_id: str, active: bool) -> None:
+        """The peer's typing indicator changed. Advisory: the ViewModel also
+        expires an indicator that received no refresh, and a session that
+        drops clears it."""
+        pass
+
 
 class DirectChatManager:
     """Direct member-to-member chat: the management unit is the member, not
@@ -2449,6 +2502,10 @@ class DirectChatManager:
         # handshake migrate alias keys (manually added "ip:..." placeholders)
         # to the peer's REAL device id.
         self._chat_endpoints: Dict[str, str] = {}
+        # Peers whose typing indicator is currently on (last event forwarded).
+        # Used to avoid duplicate notifications and to emit a final False when
+        # the session drops.
+        self._typing_peers: set = set()
         # Keys with a redial loop currently running.
         self._redial_loops: set = set()
         # Per-peer dial locks: the presence sweep, the outbox redial loop and
@@ -2952,6 +3009,50 @@ class DirectChatManager:
         if changed:
             self._notify_messages(peer_id)
 
+    def _set_peer_typing(self, peer_id: str, active: bool) -> None:
+        """Record/forward a peer typing change, deduped to real transitions."""
+        with self._lock:
+            was = peer_id in self._typing_peers
+            if active:
+                self._typing_peers.add(peer_id)
+            else:
+                self._typing_peers.discard(peer_id)
+        if was == active:
+            return
+        listener = self._listener
+        if listener is not None:
+            try:
+                listener.direct_typing_changed(peer_id, active)
+            except Exception:
+                pass
+
+    def _clear_peer_typing(self, peer_id: str) -> None:
+        """A session ended: whatever it claimed about typing is stale."""
+        self._set_peer_typing(peer_id, False)
+
+    def _apply_read_receipt(self, peer_id: str, up_to_id: str) -> None:
+        """Mark every OWN message up to the receipt's message id as read. The
+        receipt names a peer message id, so the cut-off is that message's
+        timestamp; an id we no longer hold (history pruned) is ignored."""
+        with self._lock:
+            msgs = self._messages.get(peer_id)
+            if not msgs:
+                return
+            target = next((m for m in msgs if m.id == up_to_id), None)
+            if target is None:
+                return
+            changed = False
+            for m in msgs:
+                if (
+                    m.is_from_me
+                    and not m.read
+                    and m.timestamp <= target.timestamp
+                ):
+                    m.read = True
+                    changed = True
+        if changed:
+            self._notify_messages(peer_id)
+
     # ---------------------------------------------------------------- actions
 
     def open_chat(self, contact: Peer) -> None:
@@ -3196,12 +3297,20 @@ class DirectChatManager:
         self._put_send(session, packet)
         return True
 
-    def send_message(self, peer_id: str, content: str) -> bool:
+    def send_message(
+        self,
+        peer_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        reply_preview: Optional[str] = None,
+        reply_sender: Optional[str] = None,
+    ) -> bool:
         """Send a text message. The peer does NOT have to be online: with no
         live session the message is appended locally (marked pending), parked
         in the outbox, and delivered automatically once a session comes up —
         our redial or the peer dialing us. Returns False only when there is
-        no known contact AND no session to deliver to."""
+        no known contact AND no session to deliver to. The optional reply_*
+        triple attaches a quoted header (see ChatMessage)."""
         # validate with the SAME rule the receiver enforces: the receiver
         # drops content longer than MAX_CONTENT_LENGTH, so without this check
         # a too-long message would "send" locally but silently never arrive
@@ -3222,6 +3331,9 @@ class DirectChatManager:
             sender_name=my_name,
             is_from_me=True,
             pending=not alive,
+            reply_to=reply_to,
+            reply_preview=reply_preview,
+            reply_sender=reply_sender,
         )
         # show the message locally right away (pending until delivered)
         self._append_message(peer_id, msg)
@@ -3237,6 +3349,51 @@ class DirectChatManager:
         elif contact is not None:
             self._enqueue_pending(peer_id, contact, msg)
         return True
+
+    def send_typing(self, peer_id: str, active: bool) -> None:
+        """Send a typing indicator to a direct-chat peer. Advisory and never
+        queued offline: with no live session it is dropped (nobody to show it
+        to). The scope names THIS device's conversation key for the chat, so
+        the receiver's "direct:<peer>" key matches it exactly."""
+        with self._lock:
+            session = self._sessions.get(peer_id)
+            my_id = self._my_id
+        if session is None or not session["alive"]:
+            return
+        try:
+            self._put_send(
+                session,
+                NetworkPacket(
+                    type="typing",
+                    group_id="direct:" + my_id,
+                    sender_id=my_id,
+                    active=bool(active),
+                ),
+            )
+        except Exception:
+            pass
+
+    def _send_read_receipt(self, peer_id: str, up_to_id: str) -> None:
+        """Tell [peer_id] that everything up to [up_to_id] has been read.
+        Only sent on a live session (a receipt for a message that arrived
+        while offline is meaningless)."""
+        with self._lock:
+            session = self._sessions.get(peer_id)
+            my_id = self._my_id
+        if session is None or not session["alive"]:
+            return
+        try:
+            self._put_send(
+                session,
+                NetworkPacket(
+                    type="read_receipt",
+                    group_id="direct:" + my_id,
+                    up_to_id=up_to_id,
+                    reader_id=my_id,
+                ),
+            )
+        except Exception:
+            pass
 
     def _enqueue_pending(self, peer_id: str, contact: Peer, msg: ChatMessage) -> None:
         """Park a message for a currently-offline peer and start the redial loop."""
@@ -3617,6 +3774,7 @@ class DirectChatManager:
         if session is not None:
             session["alive"] = False
             self._safe_close(session["sock"])
+        self._clear_peer_typing(peer_id)
 
     def is_chat_alive(self, peer_id: str) -> bool:
         with self._lock:
@@ -3756,6 +3914,27 @@ class DirectChatManager:
                         logger.info("drop duplicate message %s on session %s", msg.id, peer_id)
                         continue
                     self._append_message(peer_id, msg.marked_from_me(self._my_id))
+                    if packet.type == "chat":
+                        # receiving a plain chat IS reading it (the protocol
+                        # defines the automatic receipt on delivery): ack so
+                        # the sender flips its bubble to 已读
+                        self._send_read_receipt(peer_id, msg.id)
+                elif packet.type == "typing" and packet.active is not None:
+                    # a member's typing indicator; only the session peer may
+                    # speak for itself and the scope must name this chat
+                    if (
+                        packet.sender_id == peer_id
+                        and packet.group_id == "direct:" + peer_id
+                    ):
+                        self._set_peer_typing(peer_id, bool(packet.active))
+                elif packet.type == "read_receipt" and packet.up_to_id:
+                    # the peer read up to up_to_id; only the session peer may
+                    # report its own reading, and only for this chat's scope
+                    if (
+                        packet.reader_id == peer_id
+                        and packet.group_id == "direct:" + peer_id
+                    ):
+                        self._apply_read_receipt(peer_id, packet.up_to_id)
                 elif packet.type == "delete_message" and packet.message_id:
                     sender = packet.sender_id
                     if sender != peer_id:
@@ -3816,6 +3995,8 @@ class DirectChatManager:
                     replaced = True
             self._safe_close(session["sock"])
             if not replaced:
+                # a session that died can no longer be typing
+                self._clear_peer_typing(session["peer_id"])
                 self._emit_event(f"与 {session['peer_name']} 的直聊连接已断开")
                 closed = self.on_session_closed
                 if closed is not None:
@@ -3889,6 +4070,10 @@ class GroupMeshListener:
     def group_mesh_deleted_ids(self, group_id: str, deleted_ids) -> None:
         """history_reply carried tombstone convergence data: [deleted_ids]
         were deleted in the group while this member was away."""
+        pass
+
+    def group_mesh_typing(self, group_id: str, sender_id: str, active: bool) -> None:
+        """A linked member's typing indicator changed (host-offline path)."""
         pass
 
 
@@ -4089,6 +4274,26 @@ class GroupMeshManager:
             return
         packet = NetworkPacket(
             type="delete_message", message_id=message_id, sender_id=my_id
+        )
+        for link in links:
+            self._spawn(self._link_write, link, packet)
+
+    def broadcast_typing(self, group_id: str, sender_id: str, active: bool) -> None:
+        """Tell every linked member that [sender_id] started/stopped typing
+        (host-offline path). Advisory: no history/state is touched, and a
+        member with no link simply misses the indicator."""
+        with self._lock:
+            state = self._groups.get(group_id)
+            if state is None:
+                return
+            links = list(state["links"].values())
+        if not links:
+            return
+        packet = NetworkPacket(
+            type="typing",
+            group_id=group_id,
+            sender_id=sender_id,
+            active=bool(active),
         )
         for link in links:
             self._spawn(self._link_write, link, packet)
@@ -4434,6 +4639,20 @@ class GroupMeshManager:
                 elif packet.type == "delete_message":
                     if packet.message_id and packet.sender_id:
                         self._handle_delete_incoming(group_id, link, packet.message_id, packet.sender_id)
+                elif (
+                    packet.type == "typing"
+                    and packet.active is not None
+                    and packet.sender_id == link["peer_id"]
+                ):
+                    # only the linked member may claim ITS OWN typing state
+                    listener = self._listener
+                    if listener is not None:
+                        try:
+                            listener.group_mesh_typing(
+                                group_id, packet.sender_id, bool(packet.active)
+                            )
+                        except Exception:
+                            pass
                 elif packet.type == "history_reply":
                     # History legitimately contains messages from many senders,
                     # but each message must still be well-formed and bounded.

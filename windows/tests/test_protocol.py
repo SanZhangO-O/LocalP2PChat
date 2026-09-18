@@ -1532,5 +1532,124 @@ class CallManagerSignalingTest(unittest.TestCase):
             host.stop()
 
 
+class ChatUxProtocolTest(unittest.TestCase):
+    """Reply/quote, read_receipt and typing wire contracts.
+
+    The Android side declares these fields identically (camelCase, nullable,
+    omitted at their default) so both implementations produce the same bytes:
+    replyTo/replyPreview/replySender on ChatMessage, upToId/readerId on
+    read_receipt and senderId/active on typing. read is local-only (like
+    isFromMe/pending) and must never appear on the wire.
+    """
+
+    def test_reply_fields_roundtrip(self):
+        msg = ChatMessage(
+            id="m1",
+            content="hi",
+            timestamp=100,
+            sender_id="dev-a",
+            sender_name="A",
+            reply_to="m0",
+            reply_preview="quoted",
+            reply_sender="B",
+        )
+        line = NetworkPacket(type="chat", message=msg).to_json()
+
+        self.assertIn('"replyTo":"m0"', line)
+        self.assertIn('"replyPreview":"quoted"', line)
+        self.assertIn('"replySender":"B"', line)
+
+        decoded = NetworkPacket.from_json(line)
+        self.assertEqual("m0", decoded.message.reply_to)
+        self.assertEqual("quoted", decoded.message.reply_preview)
+        self.assertEqual("B", decoded.message.reply_sender)
+
+    def test_plain_message_omits_reply_fields(self):
+        line = NetworkPacket(
+            type="chat", message=ChatMessage("m1", "hi", 1, "dev-a", "A")
+        ).to_json()
+
+        self.assertNotIn("replyTo", line)
+        self.assertNotIn("replyPreview", line)
+        self.assertNotIn("replySender", line)
+
+    def test_read_state_is_local_only(self):
+        # read is flipped by a peer read_receipt and persisted locally; like
+        # isFromMe/pending it must never be serialized
+        msg = ChatMessage("m1", "hi", 1, "dev-a", "A", is_from_me=True, read=True)
+        line = NetworkPacket(type="chat", message=msg).to_json()
+
+        self.assertNotIn("read", line)
+        self.assertFalse(NetworkPacket.from_json(line).message.read)
+
+    def test_read_receipt_roundtrip(self):
+        packet = NetworkPacket(
+            type="read_receipt",
+            group_id="direct:dev-a",
+            up_to_id="m9",
+            reader_id="dev-a",
+        )
+        line = packet.to_json()
+
+        self.assertIn('"upToId":"m9"', line)
+        self.assertIn('"readerId":"dev-a"', line)
+
+        decoded = NetworkPacket.from_json(line)
+        self.assertEqual("read_receipt", decoded.type)
+        self.assertEqual("direct:dev-a", decoded.group_id)
+        self.assertEqual("m9", decoded.up_to_id)
+        self.assertEqual("dev-a", decoded.reader_id)
+
+    def test_read_receipt_requires_up_to_id_and_reader(self):
+        with self.assertRaises(ValueError):
+            NetworkPacket.from_dict(
+                {"type": "read_receipt", "groupId": "direct:a", "upToId": "m9"}
+            )
+        with self.assertRaises(ValueError):
+            NetworkPacket.from_dict(
+                {"type": "read_receipt", "groupId": "direct:a", "readerId": "a"}
+            )
+
+    def test_typing_roundtrip(self):
+        packet = NetworkPacket(
+            type="typing", group_id="direct:dev-a", sender_id="dev-a", active=True
+        )
+        line = packet.to_json()
+
+        self.assertIn('"active":true', line)
+        self.assertIn('"senderId":"dev-a"', line)
+
+        decoded = NetworkPacket.from_json(line)
+        self.assertEqual("typing", decoded.type)
+        self.assertEqual("direct:dev-a", decoded.group_id)
+        self.assertEqual("dev-a", decoded.sender_id)
+        self.assertTrue(decoded.active)
+
+        stopped = NetworkPacket.from_json(
+            NetworkPacket(
+                type="typing", group_id="direct:dev-a", sender_id="dev-a", active=False
+            ).to_json()
+        )
+        self.assertFalse(stopped.active)
+
+    def test_typing_requires_boolean_active_and_sender(self):
+        with self.assertRaises(ValueError):
+            NetworkPacket.from_dict({"type": "typing", "senderId": "a"})
+        # a stringly "false" is truthy in Python: reject it instead of
+        # silently showing a live indicator
+        with self.assertRaises(ValueError):
+            NetworkPacket.from_dict({"type": "typing", "senderId": "a", "active": "false"})
+        with self.assertRaises(ValueError):
+            NetworkPacket.from_dict({"type": "typing", "active": True})
+
+    def test_typing_and_receipt_fields_absent_from_other_packets(self):
+        line = NetworkPacket(type="ping").to_json()
+
+        self.assertEqual('{"type":"ping"}', line)
+        self.assertNotIn("active", line)
+        self.assertNotIn("upToId", line)
+        self.assertNotIn("readerId", line)
+
+
 if __name__ == "__main__":
     unittest.main()

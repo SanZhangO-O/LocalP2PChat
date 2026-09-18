@@ -57,6 +57,7 @@ class Recorder(P2PListener):
     def __init__(self):
         self.join_results = []
         self.query_results = []
+        self.typing_events = []
 
     def join_state_changed(self, p2p):
         if p2p.connection_result is not None:
@@ -64,6 +65,9 @@ class Recorder(P2PListener):
 
     def query_result_changed(self, p2p):
         self.query_results.append((p2p.queried_group_info, p2p.query_error))
+
+    def typing_changed(self, p2p, sender_id, active):
+        self.typing_events.append((sender_id, active))
 
 
 def wait_until(cond, timeout=12.0, pump=None):
@@ -207,6 +211,42 @@ class P2PNetworkTest(unittest.TestCase):
             )
         finally:
             client.stop()
+
+    def test_group_typing_relayed_to_other_members(self):
+        """typing packets ride the host relay: the host sees a member's
+        indicator and relays it to the other members, but never back to the
+        sender (the sender's UI already knows it is typing)."""
+        member_a = self._join("\u6210\u5458A")  # 成员A
+        member_b = self._join("\u6210\u5458B")  # 成员B
+        try:
+            member_a.send_typing(True)
+            self.assertTrue(
+                wait_until(
+                    lambda: (member_a.my_id, True) in self.host.listener.typing_events
+                ),
+                "host must see A typing",
+            )
+            self.assertTrue(
+                wait_until(
+                    lambda: (member_a.my_id, True) in member_b.listener.typing_events
+                ),
+                "B must see A typing through the relay",
+            )
+            self.assertNotIn(
+                (member_a.my_id, True),
+                member_a.listener.typing_events,
+                "A must not receive its own relayed indicator",
+            )
+            member_a.send_typing(False)
+            self.assertTrue(
+                wait_until(
+                    lambda: (member_a.my_id, False) in member_b.listener.typing_events
+                ),
+                "the stop must be relayed too",
+            )
+        finally:
+            member_a.stop()
+            member_b.stop()
 
     def test_delete_authorized_broadcast(self):
         a = self._join("\u6210\u5458A")
@@ -1908,6 +1948,165 @@ class ViewModelFlowTest(unittest.TestCase):
         buttons["\u5ffd\u7565"].click()
         self.assertEqual(calls, [("accept", "dev-42"), ("ignore", "dev-42")])
         page.deleteLater()
+
+    # ------------------------------------------- reply / read / typing (chat UX)
+
+    def test_store_reply_and_read_roundtrip(self):
+        """SavedMessage carries the reply triple and the own-message read flag
+        across a reopen: a restart must not lose the quoted header or flip a
+        delivered message back to 未读."""
+        from localchat.storage import SavedMessage
+
+        db = _fresh_db("lc_test_reply_store.db")
+        store = ChatStore(db)
+        store.upsert_group(
+            SavedGroup(group_id="direct:dev-2", group_name="\u5c0f\u4e59", is_host=False)
+        )
+        store.insert_message(
+            SavedMessage(
+                id="m1",
+                group_id="direct:dev-2",
+                content="\u56de\u590d\u6b63\u6587",  # 回复正文
+                timestamp=1700000000000,
+                sender_id="dev-me",
+                sender_name="\u6211",  # 我
+                is_from_me=True,
+                reply_to="m0",
+                reply_preview="\u88ab\u5f15\u7528\u7684\u5185\u5bb9",  # 被引用的内容
+                reply_sender="\u5c0f\u4e59",
+                read=True,
+            )
+        )
+        store.close()
+
+        reopened = ChatStore(db)
+        saved = reopened.get_messages_for_group("direct:dev-2")
+        reopened.close()
+        self.assertEqual(len(saved), 1)
+        m = saved[0]
+        self.assertEqual(m.reply_to, "m0")
+        self.assertEqual(m.reply_preview, "\u88ab\u5f15\u7528\u7684\u5185\u5bb9")
+        self.assertEqual(m.reply_sender, "\u5c0f\u4e59")
+        self.assertTrue(m.read)
+
+    def test_direct_page_reply_bar_arms_sends_and_cancels(self):
+        """DirectChatPage: picking 回复 shows the quote bar, the sent message
+        carries the reply triple, and the cancel button (whose clicked signal
+        injects a bool — AGENTS.md trap) clears it."""
+        from PyQt6.QtWidgets import QPushButton
+
+        from localchat.models import ChatMessage
+        from localchat.ui.direct_chat_page import DirectChatPage
+
+        network_module.TCP_PORT = 10049
+        vm = make_vm(_fresh_db("lc_ui_reply.db"))
+        self._vms = [vm]
+        page = DirectChatPage(vm, lambda: None)
+        page._peer_id = "dev-2"
+
+        target = ChatMessage(
+            id="m0",
+            content="\u88ab\u5f15\u7528\u7684\u5185\u5bb9",
+            timestamp=1700000000000,
+            sender_id="dev-2",
+            sender_name="\u5c0f\u4e59",
+        )
+        page._set_reply_target(target)
+        self.assertFalse(page.reply_bar.isHidden(), "quote bar must show")
+        self.assertIn("\u5c0f\u4e59", page.reply_label.text())
+
+        # cancel via the real button click path
+        buttons = {b.text(): b for b in page.reply_bar.findChildren(QPushButton)}
+        buttons["\u00d7"].click()
+        self.assertTrue(page.reply_bar.isHidden(), "cancel must hide the quote bar")
+        self.assertIsNone(page._reply_target)
+
+        # arm again, type, send: the VM receives the reply triple
+        page._set_reply_target(target)
+        calls = []
+
+        def fake_send(peer_id, content, reply_to=None, reply_preview=None, reply_sender=None):
+            calls.append((peer_id, content, reply_to, reply_preview, reply_sender))
+            return True
+
+        vm.send_direct_message = fake_send
+        page.input_edit.setPlainText("hello")
+        page.send_btn.click()
+        self.assertEqual(
+            calls,
+            [("dev-2", "hello", "m0", "\u88ab\u5f15\u7528\u7684\u5185\u5bb9", "\u5c0f\u4e59")],
+        )
+        self.assertTrue(page.reply_bar.isHidden(), "send must clear the quote bar")
+        self.assertEqual(page.input_edit.toPlainText(), "")
+        page.deleteLater()
+
+    def test_group_page_shows_typing_names(self):
+        """ChatPage renders 群成员正在输入 from the ViewModel's live indicator
+        set and hides it once the set empties."""
+        import time as time_mod
+
+        from localchat.ui.chat_page import ChatPage
+
+        network_module.TCP_PORT = 10050
+        vm = make_vm(_fresh_db("lc_ui_typing.db"))
+        self._vms = [vm]
+        vm.active_group_id = "g1"
+        page = ChatPage(vm, lambda: None)
+        self.assertTrue(page.typing_label.isHidden())
+
+        vm._group_typing = {
+            "g1": {
+                "u1": ("\u5f20\u4e09", time_mod.monotonic() + 10),  # 张三
+                "u2": ("\u674e\u56db", time_mod.monotonic() + 10),  # 李四
+            }
+        }
+        vm.typing_state_changed.emit()
+        self.pump()
+        self.assertFalse(page.typing_label.isHidden())
+        self.assertIn("\u5f20\u4e09", page.typing_label.text())
+        self.assertIn("\u674e\u56db", page.typing_label.text())
+
+        vm._group_typing = {}
+        vm.typing_state_changed.emit()
+        self.pump()
+        self.assertTrue(page.typing_label.isHidden())
+        page.deleteLater()
+
+    def test_typing_indicator_expires_without_refresh(self):
+        """A received typing indicator is dropped after TYPING_TIMEOUT with no
+        refresh (the expiry tick), so a peer that dies mid-typing clears."""
+        import time as time_mod
+
+        network_module.TCP_PORT = 10051
+        vm = make_vm(_fresh_db("lc_typing_expiry.db"))
+        self._vms = [vm]
+        vm._on_direct_typing("dev-9", True)
+        self.assertTrue(vm.direct_peer_typing("dev-9"))
+        vm._on_direct_typing("dev-9", False)
+        self.assertFalse(vm.direct_peer_typing("dev-9"))
+
+        vm._on_direct_typing("dev-9", True)
+        # simulate the deadline passing, then run one expiry tick
+        vm._direct_typing["dev-9"] = time_mod.monotonic() - 0.01
+        vm._on_typing_tick()
+        self.assertFalse(vm.direct_peer_typing("dev-9"))
+        self.assertFalse(vm._typing_timer.isActive(), "no indicator left: tick stops")
+
+    def test_typing_activity_throttles_and_stops(self):
+        """The outbound throttle sends active=True at most once per interval
+        and only on transitions; _end_active_typing stops it immediately."""
+        network_module.TCP_PORT = 10052
+        vm = make_vm(_fresh_db("lc_typing_throttle.db"))
+        self._vms = [vm]
+        sent = []
+        # no real session: intercept the send callback directly
+        vm._typing_activity("direct:dev-9", lambda active: sent.append(active))
+        self.assertEqual(sent, [True], "first keystroke sends active")
+        vm._typing_activity("direct:dev-9", lambda active: sent.append(active))
+        self.assertEqual(sent, [True], "within the interval it must be throttled")
+        vm._end_active_typing("direct:dev-9")
+        self.assertEqual(sent, [True, False], "ending typing sends active=False now")
+        self.assertNotIn("direct:dev-9", vm._typing_out)
 
 
 if __name__ == "__main__":

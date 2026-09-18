@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
 from ..models import (
     MAX_CONTENT_LENGTH,
     MAX_FOLDER_FILES,
+    MAX_REPLY_PREVIEW,
     ChatMessage,
     FILE_KIND_IMAGE,
     FILE_KIND_VIDEO,
@@ -70,6 +71,10 @@ SIDE_MARGIN = 12
 FILE_CARD_H = 66
 # Inline media image: longest edge cap (logical px) inside the conversation.
 MEDIA_IMAGE_MAX = 240
+# Quoted-message header strip inside a reply bubble (sender line + preview
+# line) and the width of its left accent bar.
+REPLY_H = 28
+REPLY_ACCENT_W = 3
 
 
 def _safe_save_name(name: str) -> str:
@@ -175,6 +180,7 @@ class MessageDelegate(QStyledItemDelegate):
         folder_states=None,
         on_folder_click=None,
         on_folder_open=None,
+        show_read_state=False,
         parent=None,
     ):
         super().__init__(parent)
@@ -191,6 +197,9 @@ class MessageDelegate(QStyledItemDelegate):
         self.folder_states = folder_states if folder_states is not None else {}
         self.on_folder_click = on_folder_click
         self.on_folder_open = on_folder_open
+        # Direct chats only: own bubbles carry 已读/未读 (read_receipt). Group
+        # chats do not track per-reader receipts, so their page leaves it off.
+        self.show_read_state = show_read_state
         self._pixmaps: dict = {}
 
     # ------------------------------------------------------------- media
@@ -273,6 +282,9 @@ class MessageDelegate(QStyledItemDelegate):
         height = bounding.height() + 2 * V_PAD + TIME_H + 2
         if not msg.is_from_me:
             height += NAME_H
+        if msg.reply_to:
+            # quoted header strip above the content
+            height += REPLY_H + 2
         return bubble_w, height, bounding
 
     def sizeHint(self, option, index) -> QSize:
@@ -370,10 +382,67 @@ class MessageDelegate(QStyledItemDelegate):
     def _time_label(self, msg: ChatMessage) -> str:
         """Bottom-row label: a "待送达" prefix when the message is a pending
         (offline-queued) direct-chat send, so the user knows it is still
-        waiting for the peer to come online (Android parity)."""
+        waiting for the peer to come online (Android parity). In direct chats
+        an own delivered message also shows 已读/未读 from the peer's
+        read_receipt (group chats never do)."""
+        parts = []
         if msg.pending:
-            return "待送达 · " + format_message_time(msg.timestamp)
-        return format_message_time(msg.timestamp)
+            parts.append("待送达")
+        elif self.show_read_state and msg.is_from_me:
+            parts.append("已读" if msg.read else "未读")
+        parts.append(format_message_time(msg.timestamp))
+        return " · ".join(parts)
+
+    def _paint_reply_header(self, painter: QPainter, msg: ChatMessage, rect, mine: bool) -> None:
+        """Draw the quoted-message header inside a reply bubble: a rounded
+        strip with a left accent bar, the original sender's name and an
+        elided one-line preview. Both come from the reply wire fields, so the
+        quote renders even when the referenced message is not in history."""
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        strip = QRectF(rect.x(), rect.y(), rect.width(), rect.height() - 2)
+        bg = QColor("#FFFFFF" if mine else "#000000")
+        bg.setAlpha(30 if mine else 16)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(bg)
+        painter.drawRoundedRect(strip, 6, 6)
+        accent = QColor("#FFFFFF" if mine else PRIMARY)
+        accent.setAlpha(210 if mine else 255)
+        painter.setBrush(accent)
+        painter.drawRect(
+            QRectF(strip.x(), strip.y() + 3, REPLY_ACCENT_W, strip.height() - 6)
+        )
+        text_color = QColor("#FFFFFF" if mine else BUBBLE_TEXT_OTHER)
+        text_x = strip.x() + REPLY_ACCENT_W + 6
+        text_w = max(strip.width() - REPLY_ACCENT_W - 12, 20)
+        sender_font = QFont(self._view.font())
+        sender_font.setPointSize(7)
+        sender_font.setBold(True)
+        painter.setFont(sender_font)
+        painter.setPen(text_color)
+        sender = (msg.reply_sender or "").strip() or "回复"
+        painter.drawText(
+            QRectF(text_x, strip.y() + 1, text_w, 12),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            QFontMetrics(sender_font).elidedText(
+                sender, Qt.TextElideMode.ElideRight, int(text_w)
+            ),
+        )
+        preview_font = QFont(self._view.font())
+        preview_font.setPointSize(7)
+        preview_color = QColor(text_color)
+        preview_color.setAlpha(175)
+        painter.setFont(preview_font)
+        painter.setPen(preview_color)
+        preview = (msg.reply_preview or "").replace("\n", " ").strip()
+        painter.drawText(
+            QRectF(text_x, strip.y() + 12, text_w, 14),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            QFontMetrics(preview_font).elidedText(
+                preview, Qt.TextElideMode.ElideRight, int(text_w)
+            ),
+        )
+        painter.restore()
 
     def _paint_message(self, painter: QPainter, option, msg: ChatMessage) -> None:
         painter.save()
@@ -408,6 +477,15 @@ class MessageDelegate(QStyledItemDelegate):
                 msg.sender_name,
             )
             y += NAME_H
+            painter.setFont(font)
+        if msg.reply_to:
+            self._paint_reply_header(
+                painter,
+                msg,
+                QRectF(inner.x(), y, inner.width(), REPLY_H),
+                msg.is_from_me,
+            )
+            y += REPLY_H + 2
             painter.setFont(font)
         painter.setPen(QColor("#FFFFFF" if msg.is_from_me else BUBBLE_TEXT_OTHER))
         content_rect = QRectF(inner.x(), y, inner.width(), inner.height() - (y - inner.y()) - TIME_H - 2)
@@ -731,6 +809,8 @@ class ChatPage(QWidget):
         self._file_states: dict = {}
         # folderId -> (status, detail) for folder cards
         self._folder_states: dict = {}
+        # The message being replied to (None when not replying).
+        self._reply_target = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -747,6 +827,15 @@ class ChatPage(QWidget):
         self.title_label.setStyleSheet("font-size: 16px; font-weight: 700;")
         header_layout.addWidget(self.title_label, 1)
         layout.addWidget(header)
+
+        # Typing indicator line (group chat): "xx 正在输入…" while a member is
+        # composing; hidden otherwise.
+        self.typing_label = QLabel("")
+        self.typing_label.setStyleSheet(
+            "font-size: 11px; color: #6B6875; padding: 0 16px 4px 16px;"
+        )
+        self.typing_label.hide()
+        layout.addWidget(self.typing_label)
 
         self.model = QStandardItemModel(self)
         self.list_view = QListView()
@@ -777,6 +866,32 @@ class ChatPage(QWidget):
         bottom_layout = QVBoxLayout(bottom)
         bottom_layout.setContentsMargins(14, 8, 14, 12)
         bottom_layout.setSpacing(2)
+        # Reply/quote bar: hidden until the user picks 回复 on a message; shows
+        # what will be quoted and lets the user cancel it.
+        self.reply_bar = QFrame()
+        self.reply_bar.setObjectName("replyBar")
+        self.reply_bar.setStyleSheet(
+            "QFrame#replyBar { background-color: #F2F1F5; border-radius: 6px; }"
+        )
+        reply_layout = QHBoxLayout(self.reply_bar)
+        reply_layout.setContentsMargins(8, 4, 4, 4)
+        reply_layout.setSpacing(6)
+        self.reply_label = QLabel("")
+        self.reply_label.setObjectName("faint")
+        self.reply_label.setWordWrap(True)
+        reply_layout.addWidget(self.reply_label, 1)
+        self.reply_cancel_btn = QPushButton("×")
+        self.reply_cancel_btn.setObjectName("ghost")
+        self.reply_cancel_btn.setFixedSize(24, 24)
+        self.reply_cancel_btn.setToolTip("取消回复")
+        # clicked injects a bool into the first lambda parameter: keep it
+        # explicit (AGENTS.md PyQt6 trap) so _clear_reply never receives it
+        self.reply_cancel_btn.clicked.connect(
+            lambda checked=False: self._clear_reply()
+        )
+        reply_layout.addWidget(self.reply_cancel_btn)
+        self.reply_bar.hide()
+        bottom_layout.addWidget(self.reply_bar)
         input_row = QHBoxLayout()
         input_row.setSpacing(8)
         self.file_btn = QPushButton()
@@ -820,6 +935,7 @@ class ChatPage(QWidget):
         self.vm.folder_download_finished.connect(self._on_folder_download_finished)
         self.vm.folder_send_finished.connect(self._on_folder_send_finished)
         self.vm.folder_send_truncated.connect(self._on_folder_send_truncated)
+        self.vm.typing_state_changed.connect(self._refresh_typing)
 
     def _on_group_changed(self):
         self.title_label.setText(self.vm.active_group_name)
@@ -827,8 +943,50 @@ class ChatPage(QWidget):
         self.input_edit.clear()
         self._file_states.clear()
         self._folder_states.clear()
+        self._clear_reply()
         self._stick_to_bottom = True
         self._rebuild()
+        self._refresh_typing()
+
+    # ------------------------------------------------------------ reply/typing
+
+    def _set_reply_target(self, msg: ChatMessage) -> None:
+        """Arm the reply bar for [msg]: the next send quotes it."""
+        self._reply_target = msg
+        preview = (msg.content or "").replace("\n", " ").strip()
+        if msg.file_info is not None and not preview:
+            preview = msg.file_info.file_name
+        if len(preview) > MAX_REPLY_PREVIEW:
+            preview = preview[:MAX_REPLY_PREVIEW] + "…"
+        self.reply_label.setText(
+            f"回复 {msg.sender_name}：{preview}" if preview else f"回复 {msg.sender_name}"
+        )
+        self.reply_bar.show()
+
+    def _clear_reply(self) -> None:
+        self._reply_target = None
+        self.reply_bar.hide()
+
+    def _reply_payload(self):
+        """(reply_to, reply_preview, reply_sender) for the armed reply, or
+        (None, None, None) when not replying. The preview is capped like the
+        wire field (Android parity)."""
+        target = self._reply_target
+        if target is None:
+            return None, None, None
+        preview = (target.content or "").replace("\n", " ").strip()
+        if len(preview) > MAX_REPLY_PREVIEW:
+            preview = preview[:MAX_REPLY_PREVIEW]
+        return target.id, preview, target.sender_name
+
+    def _refresh_typing(self):
+        gid = self.vm.active_group_id
+        names = self.vm.group_typing_names(gid) if gid else []
+        if names:
+            self.typing_label.setText("、".join(names) + " 正在输入…")
+            self.typing_label.show()
+        else:
+            self.typing_label.hide()
 
     def _on_messages_changed(self):
         self._rebuild()
@@ -865,10 +1023,13 @@ class ChatPage(QWidget):
             self.count_label.setStyleSheet("font-size: 11px; color: #B3261E;")
             self.count_label.show()
             return
-        if self._connection_blocked() or not self.vm.send_message(text):
+        if self._connection_blocked() or not self.vm.send_message(
+            text, *self._reply_payload()
+        ):
             self._show_send_blocked()
             return
         self.input_edit.clear()
+        self._clear_reply()
 
     def _connection_blocked(self) -> bool:
         gid = self.vm.active_group_id
@@ -887,6 +1048,11 @@ class ChatPage(QWidget):
 
     def _on_input_changed(self):
         self._update_send_ui()
+        # composing a non-empty draft refreshes our typing indicator (the
+        # ViewModel throttles it); clearing the box must NOT re-arm it after
+        # a send — the VM ends typing as the message goes out
+        if self.input_edit.toPlainText().strip():
+            self.vm.notify_group_typing()
 
     def _update_send_ui(self):
         length = len(self.input_edit.toPlainText())
@@ -1113,6 +1279,7 @@ class ChatPage(QWidget):
             elif chosen is delete_action:
                 self._confirm_delete(msg.id)
             return
+        reply_action = menu.addAction("回复")
         copy_action = menu.addAction("复制")
         forward_action = menu.addAction("转发")
         delete_action = None
@@ -1120,7 +1287,9 @@ class ChatPage(QWidget):
             menu.addSeparator()
             delete_action = menu.addAction("删除")
         chosen = menu.exec(self.list_view.viewport().mapToGlobal(pos))
-        if chosen is copy_action:
+        if chosen is reply_action:
+            self._set_reply_target(msg)
+        elif chosen is copy_action:
             QApplication.clipboard().setText(msg.content)
         elif chosen is forward_action:
             self._show_forward_dialog(msg.content)
