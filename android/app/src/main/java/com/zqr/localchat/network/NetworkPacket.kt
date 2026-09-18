@@ -54,6 +54,13 @@ data class NetworkPacket(
      *  + fileId)) — proves the downloader knows the per-file key (see
      *  [FileTransfer.downloadToken]). Mandatory on every request. */
     val token: String? = null,
+    /** file_download request: bytes the receiver already holds in its ".part"
+     *  staging file. Mandatory (resume contract): the sender seeks to this
+     *  offset and streams the rest, so 0 is a fresh download and a value equal
+     *  to the file size transfers nothing but the meta/EOF. The per-chunk GCM
+     *  nonce is fresh and random on every encrypted chunk, so the offset does
+     *  not change the wire layout in any way (Windows parity). */
+    val offset: Long? = null,
     /** Wire-session sequence number: stamped by [Wire.sendPacket] (per
      *  direction, strictly 1,2,3,...) INSIDE the GCM-protected JSON, so the
      *  receiver can reject replayed/reordered/injected lines. Never set by

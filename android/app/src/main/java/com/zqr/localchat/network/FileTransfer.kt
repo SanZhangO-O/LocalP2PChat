@@ -26,9 +26,16 @@ import kotlin.concurrent.thread
  * FileInfo carried by a "file_message". Receivers connect back and speak the
  * handshake:
  *
- *     receiver -> "file_download" {fileId, token}                   (plaintext)
+ *     receiver -> "file_download" {fileId, token, offset}            (plaintext)
  *     sender   -> ENCRYPTED LINE: AES-GCM(fileKey, file_meta JSON)
  *     sender   -> [4B ctLen][12B nonce][AES-GCM chunk]... [4B zero EOF]
+ *
+ * `offset` (bytes the receiver already staged in its ".part" file) is
+ * MANDATORY: a fresh download sends 0, an interrupted one resumes from the
+ * staging file's size and the sender seeks there before streaming. Every
+ * chunk is an independent AEAD message with a fresh random nonce, so resuming
+ * never changes the GCM layout (Windows parity). An offset past the declared
+ * size is refused with no meta and no bytes.
  *
  * The download request MUST carry [downloadToken] (HMAC of the fileId under
  * the per-file key): a downloader that only learned (fileId, host, port)
@@ -148,6 +155,17 @@ object FileTransfer {
             val req = runCatching { json.decodeFromString<NetworkPacket>(handshake) }.getOrNull()
                 ?: return
             if (req.type != "file_download" || req.fileId != fileId) return
+            // resume offset: mandatory, non-negative and never past the
+            // declared size (a request past EOF gets no meta and no bytes)
+            val offset = req.offset
+            if (offset == null || offset < 0) {
+                Log.w(TAG, "file_download without a valid offset: dropping connection")
+                return
+            }
+            if (fileSize >= 0 && offset > fileSize) {
+                Log.w(TAG, "file_download offset $offset past size $fileSize: dropping")
+                return
+            }
             // Download-token check (constant time): the token proves the
             // client received the ENCRYPTED offer — a missing or wrong token
             // means it only saw the sniffed (plaintext) request format.
@@ -168,6 +186,23 @@ object FileTransfer {
             socket.soTimeout = 120_000
             val input = resolver.openInputStream(uri) ?: return
             input.use { ins ->
+                // resume: skip the bytes the receiver already has. skip() may
+                // consume less than requested (or 0 without EOF), so loop and
+                // fall back to single-byte reads.
+                var remaining = offset
+                while (remaining > 0) {
+                    val skipped = try {
+                        ins.skip(remaining)
+                    } catch (e: Exception) {
+                        -1L
+                    }
+                    if (skipped > 0) {
+                        remaining -= skipped
+                        continue
+                    }
+                    if (ins.read() < 0) break
+                    remaining--
+                }
                 val buffer = ByteArray(CHUNK_SIZE)
                 val out = socket.getOutputStream()
                 while (true) {
@@ -205,6 +240,13 @@ object FileTransfer {
      * per-file key from the (encrypted) offer; any tampering or key mismatch
      * aborts. Verifies the received byte count against the offer and aborts
      * early the moment the stream exceeds the declared size or the hard cap.
+     *
+     * [offset] is the receiver's resume position: the caller must position
+     * [out] at that many already-received bytes (the transfer appends) and the
+     * request tells the sender to stream from there. The byte accounting and
+     * [onProgress] are CUMULATIVE (offset included), so a resumed download
+     * still finishes exactly at the declared size.
+     *
      * [onProgress] reports (receivedBytes, totalBytes) after every chunk
      * (totalBytes may be 0 when unknown; callers throttle); [cancelled] is
      * polled per chunk and aborts the download.
@@ -214,8 +256,12 @@ object FileTransfer {
         out: OutputStream,
         onProgress: (received: Long, total: Long) -> Unit = { _, _ -> },
         cancelled: () -> Boolean = { false },
-        sockHolder: MutableList<Socket>? = null
+        sockHolder: MutableList<Socket>? = null,
+        offset: Long = 0L
     ): DownloadResult {
+        if (offset < 0) {
+            return DownloadResult(false, "断点位置无效")
+        }
         if (fileInfo.fileSize > MAX_DOWNLOAD_BYTES) {
             return DownloadResult(false, "文件过大（超过 ${MAX_DOWNLOAD_BYTES / 1024 / 1024} MB 限制）")
         }
@@ -236,15 +282,16 @@ object FileTransfer {
             s.soTimeout = 10_000
             val rawIn = s.getInputStream()
             val writer = PrintWriter(s.getOutputStream(), true)
-            // the request always carries the download token: it proves this
-            // client received the ENCRYPTED offer message (which is the only
-            // place the per-file key travels)
+            // the request always carries the download token (it proves this
+            // client received the ENCRYPTED offer, which is the only place the
+            // per-file key travels) and the resume offset
             writer.println(
                 json.encodeToString(
                     NetworkPacket(
                         type = "file_download",
                         fileId = fileInfo.fileId,
-                        token = downloadToken(fileInfo.fileId, fileKey)
+                        token = downloadToken(fileInfo.fileId, fileKey),
+                        offset = offset
                     )
                 )
             )
@@ -280,7 +327,12 @@ object FileTransfer {
                 else -> 0L
             }
             s.soTimeout = 120_000
-            var received = 0L
+            if (expected > 0 && offset > expected) {
+                // staged bytes beyond the declared size can never complete
+                return DownloadResult(false, "断点数据损坏，请重新下载")
+            }
+            // cumulative accounting: a resumed stream starts at [offset]
+            var received = offset
             var eofMarker = false
             val totalForProgress = if (expected > 0) expected else fileInfo.fileSize
             while (!eofMarker) {

@@ -44,6 +44,8 @@ import com.zqr.localchat.data.ChatDao
 import com.zqr.localchat.data.ChatDatabase
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.DeletedMessage
+import com.zqr.localchat.data.DownloadResumeEntry
+import com.zqr.localchat.data.DownloadResumeStore
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.data.MAX_FOLDER_FILES
@@ -778,79 +780,35 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Download a media (image/video) message into the app's media dir so it
      *  renders inline in the conversation; NO system save dialog. Progress is
-     *  surfaced via [downloadStates] keyed by the file message id. */
+     *  surfaced via [downloadStates] keyed by the file message id; a paused
+     *  download resumes from its staging offset. */
     fun downloadMedia(fileInfo: FileInfo, isDirect: Boolean) {
-        val fileId = fileInfo.fileId
-        val target = mediaTargetFile(fileId, fileInfo.fileName)
+        val target = mediaTargetFile(fileInfo.fileId, fileInfo.fileName)
         if (fileInfo.fileSize > 0 && target.isFile && target.length() == fileInfo.fileSize) {
             _downloadStates.update { map ->
-                map + (fileId to DownloadState.Done(target.absolutePath))
+                map + (fileInfo.fileId to DownloadState.Done(target.absolutePath))
             }
             return
         }
-        // register the cancel handle + throttled progress (5% or 256KB) for
-        // this media download: the transfer socket is handed to the canceller
-        // so a stalled read can be shut down, and [downloadStates] shows the
-        // percent while the row is 下载中
-        val handle = DownloadHandle()
-        activeDownloads[fileId] = handle
-        var lastBytes = 0L
-        var lastPercent = -5
-        val progress: (Long, Long) -> Unit = { received, total ->
-            val percent = if (total > 0) {
-                ((received * 100) / total).toInt().coerceIn(0, 100)
-            } else 0
-            if (received - lastBytes >= 256 * 1024 ||
-                percent >= lastPercent + 5 ||
-                (total > 0 && received >= total)
-            ) {
-                lastBytes = received
-                lastPercent = percent
-                _downloadStates.update { it + (fileId to DownloadState.Downloading(percent)) }
+        runDownload(
+            fileInfo,
+            target.absolutePath,
+            finalize = { part ->
+                if (part.renameTo(target)) {
+                    target.absolutePath
+                } else {
+                    part.delete()
+                    null
+                }
             }
-        }
-        _downloadStates.update { it + (fileId to DownloadState.Downloading(0)) }
-        viewModelScope.launch(Dispatchers.IO) {
-            // download to a .part file and rename on success: the UI probes
-            // the target path to render inline media, so a partially written
-            // target must never be visible there (Windows parity)
-            val tmp = java.io.File(target.absolutePath + ".part")
-            val result = runCatching {
-                tmp.parentFile?.mkdirs()
-                tmp.outputStream().use { out ->
-                    if (isDirect) {
-                        DirectChatManager.downloadFile(
-                            fileInfo, out, progress, { handle.cancelled.get() }, handle.socks
-                        )
-                    } else {
-                        val gid = _activeGroupId.value
-                        val p2p = gid?.let { groupP2pMap[it] }
-                            ?: return@runCatching FileTransfer.DownloadResult(false, "未连接到群组")
-                        p2p.downloadFile(
-                            fileInfo, out, progress, { handle.cancelled.get() }, handle.socks
-                        )
-                    }
-                }
-                FileTransfer.DownloadResult(true)
-            }.getOrElse { FileTransfer.DownloadResult(false, it.message ?: "未知错误") }
-            activeDownloads.remove(fileId)
-            if (result.ok) {
-                if (!tmp.renameTo(target)) {
-                    tmp.delete()
-                    _downloadStates.update { map ->
-                        map + (fileId to DownloadState.Failed("无法保存媒体文件"))
-                    }
-                    return@launch
-                }
+        ) { info, out, offset, onProgress, cancelled, socks ->
+            if (isDirect) {
+                DirectChatManager.downloadFile(info, out, onProgress, cancelled, socks, offset)
             } else {
-                tmp.delete()
-            }
-            _downloadStates.update { map ->
-                map + (fileId to when {
-                    result.ok -> DownloadState.Done(target.absolutePath)
-                    handle.cancelled.get() -> DownloadState.Failed("已取消")
-                    else -> DownloadState.Failed(result.message)
-                })
+                val gid = _activeGroupId.value
+                val p2p = gid?.let { groupP2pMap[it] }
+                if (p2p == null) FileTransfer.DownloadResult(false, "未连接到群组")
+                else p2p.downloadFile(info, out, onProgress, cancelled, socks, offset)
             }
         }
     }
@@ -877,10 +835,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Download a file offered in a direct chat into [targetUri]; progress is
-     *  surfaced via [downloadStates] keyed by the file message id. */
+     *  surfaced via [downloadStates] keyed by the file message id. A paused
+     *  download resumes from its staging offset. */
     fun downloadDirectFile(fileInfo: FileInfo, targetUri: Uri) {
-        runDownload(fileInfo.fileId, targetUri) { out, onProgress, cancelled, socks ->
-            DirectChatManager.downloadFile(fileInfo, out, onProgress, cancelled, socks)
+        val resolver = getApplication<Application>().contentResolver
+        runDownload(
+            fileInfo,
+            targetUri.toString(),
+            finalize = { part -> finalizeToDocument(resolver, targetUri, part) }
+        ) { info, out, offset, onProgress, cancelled, socks ->
+            DirectChatManager.downloadFile(info, out, onProgress, cancelled, socks, offset)
         }
     }
 
@@ -1421,8 +1385,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Download state per file message id, surfaced to the chat UI. */
     sealed class DownloadState {
-        /** [percent] is 0..100; updated throttled (5% or 256KB steps). */
-        data class Downloading(val percent: Int = 0) : DownloadState()
+        /** [percent] is 0..100; [received]/[total] are cumulative (a resumed
+         *  download starts at its offset) and power the detail line
+         *  (已传/总大小 · 速度 · 剩余时间). Updated throttled. */
+        data class Downloading(
+            val percent: Int = 0,
+            val received: Long = 0,
+            val total: Long = 0,
+            val speedBps: Long = 0,
+            val etaSeconds: Long = -1
+        ) : DownloadState()
+
+        /** The download was cancelled or the connection broke; the staging
+         *  file and its offset are kept, tapping resumes. */
+        data class Paused(
+            val percent: Int = 0,
+            val received: Long = 0,
+            val total: Long = 0
+        ) : DownloadState()
+
         data class Done(val uri: String) : DownloadState()
         data class Failed(val message: String) : DownloadState()
     }
@@ -1438,7 +1419,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val done: Int = 0,
         val total: Int = 0,
         val savedPath: String = "",
-        val message: String = ""
+        val message: String = "",
+        /** Interrupted (or cancelled) with per-entry staging files kept: the
+         *  card shows 已暂停 and the next tap resumes without re-picking. */
+        val paused: Boolean = false
     )
 
     private val _folderDownloadStates =
@@ -1478,11 +1462,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
          *  whole folder save via [cancelDownload] without the ViewModel. */
         private val activeFolderDownloads = ConcurrentHashMap<String, DownloadHandle>()
 
-        /** User tapped 取消下载: the download aborts, the partial file is
-         *  deleted and the state becomes 失败（已取消）. The transfer socket is
-         *  shut down so an in-flight read returns immediately (a stalled peer
-         *  must not hold the cancel for the whole 120s read timeout). The key
-         *  is a file message id OR a folderId. */
+        /** User tapped 取消下载: the download pauses. Every socket is shut
+         *  down so an in-flight read returns immediately (a stalled peer must
+         *  not hold the cancel for the whole 120s read timeout), and the
+         *  staging file/offset are KEPT — the state becomes 已暂停 and the next
+         *  tap resumes (Windows parity: 取消 = 保留断点). The key is a file
+         *  message id OR a folderId. */
         fun cancelDownload(fileId: String) {
             val handle = activeDownloads[fileId] ?: activeFolderDownloads[fileId] ?: return
             handle.cancelled.set(true)
@@ -1638,74 +1623,316 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ---------------------------------------------------- download resume
+
+    /** App-private staging file for a download: SAF documents have no sibling
+     *  ".part" path, so every transfer streams here first and is finalized
+     *  onto the user's document (or renamed for app media) only on success —
+     *  a partial target never becomes visible, and an interrupted transfer
+     *  leaves a resumable file even across a process restart. */
+    private fun stagingPartFile(fileId: String, fileName: String): java.io.File {
+        val safe = fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .trim('.', ' ')
+            .ifBlank { "file" }
+            .take(80)
+        val dir = java.io.File(getApplication<Application>().filesDir, "downloads")
+        return java.io.File(dir, "${fileId}_$safe.part")
+    }
+
+    /** Merge the persisted address/per-file key back into an offer. Offers
+     *  restored from the database deliberately blank them (a previous
+     *  session's server may be gone), but a resume entry recorded when the
+     *  download was interrupted still carries them. */
+    private fun mergedOffer(fileInfo: FileInfo): FileInfo {
+        if (fileInfo.downloadHost.isNotBlank() && fileInfo.downloadPort > 0 &&
+            fileInfo.fileKey.isNotBlank()
+        ) return fileInfo
+        val entry = DownloadResumeStore.get(getApplication(), fileInfo.fileId)
+            ?: return fileInfo
+        if (entry.host.isBlank() || entry.port <= 0 || entry.fileKey.isBlank()) return fileInfo
+        return fileInfo.copy(
+            downloadHost = entry.host,
+            downloadPort = entry.port,
+            fileKey = entry.fileKey
+        )
+    }
+
+    private fun percentOf(received: Long, total: Long): Int =
+        if (total > 0) ((received * 100) / total).toInt().coerceIn(0, 100) else 0
+
+    /** Resume offset for [fileInfo]: the staging file's actual length (only
+     *  GCM-verified chunks are ever written to it, so its size IS the received
+     *  count; a crash mid-transfer resumes further than the persisted hint).
+     *  A staging file past the declared size can never complete, so it is
+     *  deleted and the download restarts. */
+    private fun resumeOffsetFor(fileInfo: FileInfo): Long {
+        val entry = DownloadResumeStore.get(getApplication(), fileInfo.fileId) ?: return 0
+        if (entry.partPath.isEmpty()) return 0
+        val part = java.io.File(entry.partPath)
+        if (!part.isFile) return 0
+        var start = part.length()
+        if (fileInfo.fileSize in 1..FileTransfer.MAX_DOWNLOAD_BYTES && start > fileInfo.fileSize) {
+            part.delete()
+            DownloadResumeStore.remove(getApplication(), fileInfo.fileId)
+            return 0
+        }
+        return start
+    }
+
+    /** Rebuild paused states from the persisted resume entries after a
+     *  restart: entries whose staging file is gone are dropped, the rest show
+     *  as 已暂停 xx%（点击续传） on their file/folder cards. */
+    private fun seedResumeStates() {
+        val app = getApplication<Application>()
+        val entries = DownloadResumeStore.all(app)
+        if (entries.isEmpty()) return
+        val fileStates = mutableMapOf<String, DownloadState>()
+        val folderCounts = mutableMapOf<String, Int>()
+        val folderTotals = mutableMapOf<String, Int>()
+        for (entry in entries) {
+            val part = java.io.File(entry.partPath)
+            if (!part.isFile || part.length() <= 0) {
+                DownloadResumeStore.remove(app, entry.fileId)
+                continue
+            }
+            val received = part.length()
+            fileStates[entry.fileId] = DownloadState.Paused(
+                percent = percentOf(received, entry.total),
+                received = received,
+                total = entry.total
+            )
+            if (entry.folderId.isNotEmpty()) {
+                folderCounts[entry.folderId] = (folderCounts[entry.folderId] ?: 0) + 1
+                folderTotals[entry.folderId] = maxOf(
+                    folderTotals[entry.folderId] ?: 0, entry.folderTotal
+                )
+            }
+        }
+        if (fileStates.isNotEmpty()) {
+            _downloadStates.update { fileStates + it }
+        }
+        if (folderCounts.isNotEmpty()) {
+            _folderDownloadStates.update { current ->
+                val seeded = folderCounts.keys.associateWith { fid ->
+                    val total = folderTotals[fid] ?: 0
+                    FolderDownloadState(
+                        downloading = false,
+                        done = (total - folderCounts.getValue(fid)).coerceAtLeast(0),
+                        total = total,
+                        paused = true,
+                        message = "已暂停"
+                    )
+                }
+                seeded + current
+            }
+        }
+    }
+
+    /** Persist (or refresh) the resumable state of a staging file. */
+    private fun rememberResume(
+        fileInfo: FileInfo,
+        part: java.io.File,
+        target: String,
+        received: Long,
+        folderId: String = "",
+        folderTotal: Int = 0,
+        destDir: String = ""
+    ) {
+        DownloadResumeStore.put(
+            getApplication(),
+            DownloadResumeEntry(
+                fileId = fileInfo.fileId,
+                target = target,
+                partPath = part.absolutePath,
+                received = received,
+                total = fileInfo.fileSize,
+                host = fileInfo.downloadHost,
+                port = fileInfo.downloadPort,
+                fileKey = fileInfo.fileKey,
+                fileName = fileInfo.fileName,
+                fileSize = fileInfo.fileSize,
+                kind = fileInfo.kind,
+                folderId = folderId,
+                folderTotal = folderTotal,
+                destDir = destDir
+            )
+        )
+    }
+
+    /** Finalize a completed staging file onto a SAF document: stream it into
+     *  the user-picked URI ("wt" truncates a previous copy) and drop the part.
+     *  Returns the target URI string, or null when the copy failed. */
+    private fun finalizeToDocument(
+        resolver: android.content.ContentResolver,
+        targetUri: Uri,
+        part: java.io.File
+    ): String? {
+        return try {
+            val out = resolver.openOutputStream(targetUri, "wt") ?: return null
+            out.use { target -> java.io.FileInputStream(part).use { it.copyTo(target) } }
+            part.delete()
+            targetUri.toString()
+        } catch (e: Exception) {
+            Log.w("ChatViewModel", "finalize failed: ${e.message}")
+            null
+        }
+    }
+
     /**
-     * Shared runner for group and direct downloads: registers a cancel flag
-     * and the transfer's sockets, streams into [targetUri] with throttled
-     * progress (5% or 256KB, the UI shows 下载中 N%), deletes the partial file
-     * on any failure and marks the final state. [transfer] performs the actual
-     * blocking transfer.
+     * Shared runner for group/direct/media downloads. Streams into an
+     * app-private ".part" staging file at the persisted resume offset with
+     * throttled progress (a refresh is forced after 250ms — >=4 updates/s —
+     * or 256KB or 5%), keeps the staging file on cancel/failure as a paused
+     * resumable state, and finalizes the destination via [finalize] only on
+     * success. [transfer] performs the blocking transfer; [onProgress] counts
+     * are cumulative (offset included).
      */
     private fun runDownload(
-        fileId: String,
-        targetUri: Uri,
+        fileInfo: FileInfo,
+        target: String,
+        folderId: String = "",
+        folderTotal: Int = 0,
+        destDir: String = "",
+        finalize: (java.io.File) -> String?,
         transfer: (
+            FileInfo,
             OutputStream,
+            Long,
             (Long, Long) -> Unit,
             () -> Boolean,
             MutableList<java.net.Socket>
         ) -> FileTransfer.DownloadResult
     ) {
+        val app = getApplication<Application>()
+        val merged = mergedOffer(fileInfo)
+        val part = stagingPartFile(merged.fileId, merged.fileName)
+        val entry = DownloadResumeStore.get(app, merged.fileId)
+        val start = if (entry != null && entry.partPath == part.absolutePath) {
+            resumeOffsetFor(merged)
+        } else {
+            0L
+        }
         val handle = DownloadHandle()
-        activeDownloads[fileId] = handle
-        _downloadStates.update { it + (fileId to DownloadState.Downloading(0)) }
+        activeDownloads[merged.fileId] = handle
+        _downloadStates.update {
+            it + (merged.fileId to DownloadState.Downloading(
+                percent = percentOf(start, merged.fileSize),
+                received = start,
+                total = merged.fileSize
+            ))
+        }
+        var lastTime = android.os.SystemClock.elapsedRealtime()
+        var lastBytes = start
+        var lastPercent = percentOf(start, merged.fileSize)
+        var speed = 0L
+        val progress: (Long, Long) -> Unit = { received, total ->
+            val now = android.os.SystemClock.elapsedRealtime()
+            val elapsed = now - lastTime
+            val delta = received - lastBytes
+            if (elapsed > 0 && delta > 0) {
+                val instant = delta * 1000 / elapsed
+                speed = if (speed <= 0) instant else (speed * 3 + instant) / 4
+            }
+            val percent = percentOf(received, total)
+            // >=4 refreshes per second: time-based OR throughput-based, so a
+            // slow link still ticks and a fast one is not flooded
+            if (elapsed >= 250 || delta >= 256 * 1024 || percent >= lastPercent + 5 ||
+                (total > 0 && received >= total)
+            ) {
+                lastTime = now
+                lastBytes = received
+                lastPercent = percent
+                val eta = if (speed > 0 && total > received) (total - received) / speed else -1L
+                _downloadStates.update {
+                    it + (merged.fileId to DownloadState.Downloading(
+                        percent = percent,
+                        received = received,
+                        total = total,
+                        speedBps = speed,
+                        etaSeconds = eta
+                    ))
+                }
+            }
+        }
         viewModelScope.launch(Dispatchers.IO) {
-            val resolver = getApplication<Application>().contentResolver
+            part.parentFile?.mkdirs()
+            // remembered from the first byte: a process death mid-transfer
+            // still leaves a resumable entry for the staging file
+            rememberResume(merged, part, target, start, folderId, folderTotal, destDir)
             val result = runCatching {
-                val out = resolver.openOutputStream(targetUri, "w")
-                    ?: error("无法打开输出流")
-                var lastBytes = 0L
-                var lastPercent = -5
-                out.use { os ->
-                    transfer(
-                        os,
-                        { received, total ->
-                            // throttle: report at 5%-of-total OR 256KB steps,
-                            // whichever comes first (a known total also forces
-                            // the final 100% update)
-                            val percent = if (total > 0) {
-                                ((received * 100) / total).toInt().coerceIn(0, 100)
-                            } else 0
-                            if (received - lastBytes >= 256 * 1024 ||
-                                percent >= lastPercent + 5 ||
-                                (total > 0 && received >= total)
-                            ) {
-                                lastBytes = received
-                                lastPercent = percent
-                                _downloadStates.update {
-                                    it + (fileId to DownloadState.Downloading(percent))
-                                }
-                            }
-                        },
-                        { handle.cancelled.get() },
-                        handle.socks
-                    )
+                if (start > 0) {
+                    java.io.RandomAccessFile(part, "rw").use { it.setLength(start) }
+                } else if (part.exists()) {
+                    part.delete()
+                }
+                java.io.FileOutputStream(part, true).use { out ->
+                    transfer(merged, out, start, progress, { handle.cancelled.get() }, handle.socks)
                 }
             }.getOrElse { FileTransfer.DownloadResult(false, it.message ?: "未知错误") }
-            activeDownloads.remove(fileId)
-            if (!result.ok) {
-                // drop the partially written file so a failed download does
-                // not leave a corrupt copy behind
-                runCatching { resolver.delete(targetUri, null, null) }
-            }
-            _downloadStates.update { map ->
-                map + (fileId to when {
-                    result.ok -> DownloadState.Done(targetUri.toString())
-                    handle.cancelled.get() -> DownloadState.Failed("已取消")
-                    else -> DownloadState.Failed(result.message)
-                })
+            activeDownloads.remove(merged.fileId)
+            if (result.ok) {
+                val doneUri = finalize(part)
+                if (doneUri != null) {
+                    DownloadResumeStore.remove(app, merged.fileId)
+                    _downloadStates.update {
+                        it + (merged.fileId to DownloadState.Done(doneUri))
+                    }
+                } else {
+                    // the transfer finished but could not be saved: keep the
+                    // part so the user can retry into the same target
+                    val received = part.length()
+                    rememberResume(merged, part, target, received, folderId, folderTotal, destDir)
+                    _downloadStates.update {
+                        it + (merged.fileId to DownloadState.Paused(
+                            percent = percentOf(received, merged.fileSize),
+                            received = received,
+                            total = merged.fileSize
+                        ))
+                    }
+                }
+            } else {
+                val received = if (part.isFile) part.length() else 0L
+                val cancelled = handle.cancelled.get()
+                if (received > 0 || cancelled) {
+                    // cancel = pause: the staging file and its offset survive
+                    rememberResume(merged, part, target, received, folderId, folderTotal, destDir)
+                    _downloadStates.update {
+                        it + (merged.fileId to DownloadState.Paused(
+                            percent = percentOf(received, merged.fileSize),
+                            received = received,
+                            total = merged.fileSize
+                        ))
+                    }
+                } else {
+                    DownloadResumeStore.remove(app, merged.fileId)
+                    _downloadStates.update {
+                        it + (merged.fileId to DownloadState.Failed(
+                            if (cancelled) "已取消" else result.message
+                        ))
+                    }
+                }
             }
         }
     }
+
+    /** Resume a paused download without a new save dialog: uses the persisted
+     *  target. Returns false when no resumable entry exists (the caller then
+     *  falls back to the file picker). Media entries store an app-internal
+     *  path (not a SAF URI) and resume through downloadMedia instead. */
+    fun resumeFile(fileInfo: FileInfo, isDirect: Boolean): Boolean {
+        val entry = DownloadResumeStore.get(getApplication(), fileInfo.fileId) ?: return false
+        if (!entry.target.startsWith("content://")) return false
+        val uri = Uri.parse(entry.target)
+        if (isDirect) downloadDirectFile(fileInfo, uri) else downloadFile(fileInfo, uri)
+        return true
+    }
+
+    /** Destination tree URI of a paused folder save (resume without asking for
+     *  the directory again), or null. */
+    fun folderResumeTarget(folderId: String): String? =
+        DownloadResumeStore.all(getApplication())
+            .firstOrNull { it.folderId == folderId && it.destDir.isNotEmpty() }
+            ?.destDir
 
     /**
      * Save every entry of a folder offer (all messages sharing [folderId]) to
@@ -1714,23 +1941,35 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * first) and every path segment is re-sanitized, so a crafted relativePath
      * can never write outside the chosen folder. Progress and the outcome are
      * surfaced via [folderDownloadStates]; cancel via [cancelDownload] keyed by
-     * folderId. Returns false when the folder has no entries.
+     * folderId. Every entry streams into its own app-private ".part" staging
+     * file and is resumed from that offset after an interruption (Windows
+     * parity: per-file resume inside a folder). Returns false when the folder
+     * has no entries.
      */
     fun downloadFolder(folderId: String, destTreeUri: Uri): Boolean {
         val gid = _activeGroupId.value ?: return false
         val p2p = groupP2pMap[gid] ?: return false
-        return startFolderDownload(folderId, destTreeUri, p2p.messages.value) { fi, out, progress, cancelled, socks ->
-            p2p.downloadFile(fi, out, progress, cancelled, socks)
+        return startFolderDownload(folderId, destTreeUri, p2p.messages.value) { fi, out, offset, progress, cancelled, socks ->
+            p2p.downloadFile(fi, out, progress, cancelled, socks, offset)
         }
     }
 
     /** Save every entry of a direct-chat folder offer (see [downloadFolder]). */
     fun downloadDirectFolder(peerId: String, folderId: String, destTreeUri: Uri): Boolean {
         val messages = DirectChatManager.messagesFor(peerId).value
-        return startFolderDownload(folderId, destTreeUri, messages) { fi, out, progress, cancelled, socks ->
-            DirectChatManager.downloadFile(fi, out, progress, cancelled, socks)
+        return startFolderDownload(folderId, destTreeUri, messages) { fi, out, offset, progress, cancelled, socks ->
+            DirectChatManager.downloadFile(fi, out, progress, cancelled, socks, offset)
         }
     }
+
+    private fun queryDocumentSize(
+        resolver: android.content.ContentResolver,
+        uri: Uri
+    ): Long = runCatching {
+        resolver.query(uri, arrayOf(DocumentsContract.Document.COLUMN_SIZE), null, null, null)
+            ?.use { cursor -> if (cursor.moveToFirst()) cursor.getLong(0) else -1L }
+            ?: -1L
+    }.getOrDefault(-1L)
 
     private fun startFolderDownload(
         folderId: String,
@@ -1739,6 +1978,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         transfer: (
             FileInfo,
             OutputStream,
+            Long,
             (Long, Long) -> Unit,
             () -> Boolean,
             MutableList<java.net.Socket>
@@ -1756,6 +1996,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             .sortedBy { it.fileInfo!!.relativePath.ifEmpty { it.fileInfo!!.fileName } }
         if (entries.isEmpty()) return false
 
+        val app = getApplication<Application>()
         val handle = DownloadHandle()
         activeFolderDownloads[folderId] = handle
         val rootName = entries.firstNotNullOfOrNull {
@@ -1766,23 +2007,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             it + (folderId to FolderDownloadState(downloading = true, done = 0, total = total))
         }
 
-        val resolver = getApplication<Application>().contentResolver
+        val resolver = app.contentResolver
         val rootDoc = DocumentsContract.buildDocumentUriUsingTree(
             destTreeUri, DocumentsContract.getTreeDocumentId(destTreeUri)
         )
         viewModelScope.launch(Dispatchers.IO) {
             var done = 0
             var failedMessage = ""
+            var paused = false
             for (entry in entries) {
                 if (handle.cancelled.get()) {
                     failedMessage = "已取消"
                     break
                 }
-                val fi = entry.fileInfo!!
-                if (fi.downloadHost.isBlank() || fi.downloadPort <= 0) {
-                    failedMessage = "部分文件已过期，请对方重新发送"
-                    break
-                }
+                val fi = mergedOffer(entry.fileInfo!!)
                 val rel = sanitizeRelativePath(fi.relativePath.ifEmpty { fi.fileName })
                 if (rel.isEmpty()) {
                     failedMessage = "无效的文件路径"
@@ -1812,16 +2050,117 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     failedMessage = "无法创建文件"
                     break
                 }
+                val staging = stagingPartFile(fi.fileId, fi.fileName)
+                val saved = DownloadResumeStore.get(app, fi.fileId)
+                val start = if (saved != null && saved.partPath == staging.absolutePath) {
+                    resumeOffsetFor(fi)
+                } else {
+                    0L
+                }
+                // an entry finalized by a previous run has no staging file
+                // left (so the resume store cannot tell us): the target
+                // document's size can, and the download is skipped
+                if (start == 0L && existing != null && fi.fileSize > 0 &&
+                    queryDocumentSize(resolver, existing) == fi.fileSize
+                ) {
+                    DownloadResumeStore.remove(app, fi.fileId)
+                    done++
+                    _folderDownloadStates.update {
+                        it + (folderId to FolderDownloadState(
+                            downloading = true, done = done, total = total
+                        ))
+                    }
+                    continue
+                }
+                if (fi.downloadHost.isBlank() || fi.downloadPort <= 0) {
+                    failedMessage = "部分文件已过期，请对方重新发送"
+                    break
+                }
+                staging.parentFile?.mkdirs()
+                rememberResume(
+                    fi, staging, targetUri.toString(), start,
+                    folderId = folderId, folderTotal = total, destDir = destTreeUri.toString()
+                )
                 val result = runCatching {
-                    resolver.openOutputStream(targetUri, "wt")?.use { out ->
-                        transfer(fi, out, { _, _ -> }, { handle.cancelled.get() }, handle.socks)
-                    } ?: FileTransfer.DownloadResult(false, "无法打开输出流")
+                    if (start > 0) {
+                        java.io.RandomAccessFile(staging, "rw").use { it.setLength(start) }
+                    } else if (staging.exists()) {
+                        staging.delete()
+                    }
+                    java.io.FileOutputStream(staging, true).use { out ->
+                        // per-entry progress, throttled like a single file
+                        // (>=4 refreshes/s OR 256KB OR the final byte)
+                        var lastEmitBytes = start
+                        var lastEmitTime = android.os.SystemClock.elapsedRealtime()
+                        transfer(fi, out, start, { received, totalBytes ->
+                            val now = android.os.SystemClock.elapsedRealtime()
+                            if (received - lastEmitBytes >= 256 * 1024 ||
+                                now - lastEmitTime >= 250 ||
+                                (totalBytes > 0 && received >= totalBytes)
+                            ) {
+                                lastEmitBytes = received
+                                lastEmitTime = now
+                                _downloadStates.update {
+                                    it + (fi.fileId to DownloadState.Downloading(
+                                        percent = percentOf(received, totalBytes),
+                                        received = received,
+                                        total = totalBytes
+                                    ))
+                                }
+                            }
+                        }, { handle.cancelled.get() }, handle.socks)
+                    }
                 }.getOrElse { FileTransfer.DownloadResult(false, it.message ?: "未知错误") }
                 if (!result.ok) {
-                    // drop the partial file so a failed entry leaves no corrupt copy
-                    runCatching { DocumentsContract.deleteDocument(resolver, targetUri) }
+                    // keep the staging file and its entry: paused and resumable
+                    val received = if (staging.isFile) staging.length() else 0L
+                    if (received > 0 || handle.cancelled.get()) {
+                        paused = true
+                        rememberResume(
+                            fi, staging, targetUri.toString(), received,
+                            folderId = folderId, folderTotal = total, destDir = destTreeUri.toString()
+                        )
+                        _downloadStates.update {
+                            it + (fi.fileId to DownloadState.Paused(
+                                percent = percentOf(received, fi.fileSize),
+                                received = received,
+                                total = fi.fileSize
+                            ))
+                        }
+                    } else {
+                        DownloadResumeStore.remove(app, fi.fileId)
+                        _downloadStates.update {
+                            it + (fi.fileId to DownloadState.Failed(result.message))
+                        }
+                    }
                     failedMessage = result.message.ifBlank { "下载失败" }
                     break
+                }
+                val doneUri = finalizeToDocument(resolver, targetUri, staging)
+                if (doneUri == null) {
+                    // the entry downloaded but could not be written into the
+                    // picked tree: keep the part for a retry
+                    val received = if (staging.isFile) staging.length() else 0L
+                    if (received > 0) {
+                        paused = true
+                        rememberResume(
+                            fi, staging, targetUri.toString(), received,
+                            folderId = folderId, folderTotal = total, destDir = destTreeUri.toString()
+                        )
+                        _downloadStates.update {
+                            it + (fi.fileId to DownloadState.Paused(
+                                percent = percentOf(received, fi.fileSize),
+                                received = received,
+                                total = fi.fileSize
+                            ))
+                        }
+                    }
+                    failedMessage = "保存失败"
+                    break
+                }
+                DownloadResumeStore.remove(app, fi.fileId)
+                _downloadStates.update {
+                    it + (fi.fileId to DownloadState.Done(doneUri))
                 }
                 done++
                 _folderDownloadStates.update {
@@ -1832,13 +2171,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             activeFolderDownloads.remove(folderId)
             val cancelled = handle.cancelled.get()
+            val hasResume = DownloadResumeStore.all(app).any { it.folderId == folderId }
             _folderDownloadStates.update {
                 it + (folderId to FolderDownloadState(
                     downloading = false,
                     done = done,
                     total = total,
                     savedPath = if (failedMessage.isEmpty()) destTreeUri.toString() else "",
-                    message = if (failedMessage.isEmpty()) "" else failedMessage
+                    message = if (failedMessage.isEmpty()) "" else failedMessage,
+                    paused = failedMessage.isNotEmpty() && (paused || cancelled || hasResume)
                 ))
             }
             if (cancelled) Log.i("ChatViewModel", "folder download cancelled: $folderId")
@@ -2053,6 +2394,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // Long-term device identity for direct chats and call media (loaded
         // once; the private key never leaves app storage).
         DeviceIdentity.ensureLoaded(application)
+
+        // Interrupted downloads survive restarts: rebuild the paused states
+        // from the persisted resume entries (whose staging files still exist)
+        // so file and folder cards show 已暂停（点击续传） right away.
+        seedResumeStates()
 
         // Mirror the group list's names into the companion flow so the setup
         // screen can detect a same-name re-creation without extra wiring.
@@ -3162,12 +3508,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Download a file offer into [targetUri]; progress is surfaced via
-     * [downloadStates] keyed by the file message id. */
+     *  [downloadStates] keyed by the file message id. A paused download
+     *  resumes from its staging offset. */
     fun downloadFile(fileInfo: FileInfo, targetUri: Uri) {
         val gid = _activeGroupId.value ?: return
-        if (groupP2pMap[gid] == null) return
-        runDownload(fileInfo.fileId, targetUri) { out, onProgress, cancelled, socks ->
-            FileTransfer.download(fileInfo, out, onProgress, cancelled, socks)
+        val p2p = groupP2pMap[gid] ?: return
+        val resolver = getApplication<Application>().contentResolver
+        runDownload(
+            fileInfo,
+            targetUri.toString(),
+            finalize = { part -> finalizeToDocument(resolver, targetUri, part) }
+        ) { info, out, offset, onProgress, cancelled, socks ->
+            p2p.downloadFile(info, out, onProgress, cancelled, socks, offset)
         }
     }
 

@@ -314,21 +314,29 @@ class NetworkProtocolTest {
     }
 
     @Test
-    fun `file_download token field serializes and legacy packets parse`() {
-        // the downloader always attaches the download token; the field must
-        // round-trip and old senders/receivers that never send it stay valid
-        val packet = NetworkPacket(type = "file_download", fileId = "f-1", token = "abc+/=")
+    fun `file_download offset serializes and is validated by the server`() {
+        // the downloader always attaches the download token AND the resume
+        // offset; both must round-trip
+        val packet = NetworkPacket(
+            type = "file_download", fileId = "f-1", token = "abc+/=", offset = 4096L
+        )
         val encoded = json.encodeToString(packet)
         assertTrue(encoded.contains("\"token\":\"abc+/=\""))
+        assertTrue(encoded.contains("\"offset\":4096"))
         val decoded = json.decodeFromString<NetworkPacket>(encoded)
         assertEquals("f-1", decoded.fileId)
         assertEquals("abc+/=", decoded.token)
+        assertEquals(4096L, decoded.offset)
 
-        // legacy peer (no token field) must still parse
-        val legacy = json.decodeFromString<NetworkPacket>(
+        // a request without the offset decodes (generic packet model) but has
+        // no resume point: FileTransfer.serveFile refuses it before any bytes
+        val missing = json.decodeFromString<NetworkPacket>(
             """{"type":"file_download","fileId":"f-1"}"""
         )
-        assertNull(legacy.token)
+        assertNull(missing.offset)
+
+        // the field is only emitted when set (a plain packet stays identical)
+        assertFalse(json.encodeToString(NetworkPacket(type = "ping")).contains("offset"))
     }
 
     @Test

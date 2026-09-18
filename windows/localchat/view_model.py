@@ -13,6 +13,7 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from .call import CallManager
 from .crypto import random_password
+from .download_state import FileResumeStore
 from .hardware import get_hardware_id, get_local_ip_address
 from .models import (
     FILE_KIND_IMAGE,
@@ -149,6 +150,12 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.store = store
         self.data_dir = data_dir
         self._lock = threading.RLock()
+        # Persisted resume state for interrupted downloads (file_id -> staging
+        # path / received bytes / the offer's address+key). Kept in the
+        # encrypted settings blob so a paused download can continue after an
+        # app restart (see download_state.py).
+        self._resume_store = FileResumeStore(store)
+        self._resume_store.drop_missing_parts()
 
         # Long-term device identity for direct chats and call media (loaded
         # once; the private key never leaves this machine's data dir).
@@ -1198,10 +1205,140 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         with self._lock:
             self._download_registry.pop(key, None)
 
+    # ------------------------------------------------------ download resume
+
+    def resume_info(self, file_id: str) -> Optional[dict]:
+        """Persisted resume position for [file_id], or None when there is no
+        usable staging file. The chat card renders a paused state from this
+        (also after an app restart)."""
+        entry = self._resume_store.get(file_id)
+        if not entry:
+            return None
+        target = str(entry.get("target") or "")
+        if not target:
+            return None
+        try:
+            received = os.path.getsize(target + ".part")
+        except OSError:
+            return None
+        if received <= 0:
+            return None
+        total = int(entry.get("total") or 0)
+        percent = min(99, int(received * 100 / total)) if total > 0 else 0
+        return {
+            "target": target,
+            "received": received,
+            "total": total,
+            "percent": percent,
+        }
+
+    def folder_resume_info(self, folder_id: str) -> Optional[dict]:
+        """Destination and entry counts of a paused folder save, or None. Lets
+        the folder card resume without asking for the directory again."""
+        entries = self._resume_store.folder_entries(folder_id)
+        if not entries:
+            return None
+        dest = next(
+            (str(e.get("destDir")) for e in entries if e.get("destDir")), ""
+        )
+        if not dest:
+            return None
+        total = max(int(e.get("folderTotal") or 0) for e in entries) or len(entries)
+        return {"target": dest, "done": max(0, total - len(entries)), "total": total}
+
+    def _merged_offer(self, file_info: FileInfo) -> FileInfo:
+        """Restore the address/per-file key of a paused offer. Offers rebuilt
+        from the database blank those fields (a previous session's server may
+        be gone), but a resume entry recorded when the download was interrupted
+        still carries them, so the next tap can continue the transfer."""
+        if file_info.download_host and file_info.download_port > 0 and file_info.file_key:
+            return file_info
+        entry = self._resume_store.get(file_info.file_id)
+        if not entry:
+            return file_info
+        host = str(entry.get("host") or file_info.download_host)
+        try:
+            port = int(entry.get("port") or file_info.download_port or 0)
+        except (TypeError, ValueError):
+            port = 0
+        key = str(entry.get("key") or file_info.file_key)
+        if not host or port <= 0 or not key:
+            return file_info
+        return FileInfo(
+            file_info.file_id,
+            file_info.file_name,
+            file_info.file_size,
+            host,
+            port,
+            file_key=key,
+            kind=file_info.kind,
+            folder_id=file_info.folder_id,
+            folder_name=file_info.folder_name,
+            relative_path=file_info.relative_path,
+            folder_total=file_info.folder_total,
+        )
+
+    def _resume_offset(self, file_id: str, target_path: str) -> int:
+        resume = self.resume_info(file_id)
+        if resume is None:
+            return 0
+        if resume["target"] == target_path:
+            return int(resume["received"])
+        # a different save location was chosen: the old staging file is stale
+        self._discard_resume(file_id)
+        return 0
+
+    def _sync_resume(
+        self,
+        file_info: FileInfo,
+        target_path: str,
+        folder_id: str = "",
+        folder_total: int = 0,
+        dest_dir: str = "",
+        keep_empty: bool = False,
+    ) -> None:
+        """Record (or clear) the staging state after an attempt: a surviving
+        ".part" becomes a resumable pause; a renamed-away one means success and
+        the entry is dropped. [keep_empty] records the entry even before any
+        byte arrived, so a process death mid-transfer still leaves the target
+        and address available for the next start."""
+        try:
+            received = os.path.getsize(target_path + ".part")
+        except OSError:
+            received = 0
+        if received <= 0 and not keep_empty:
+            self._resume_store.remove(file_info.file_id)
+            return
+        self._resume_store.put(
+            file_info.file_id,
+            target=target_path,
+            received=max(0, int(received)),
+            total=int(file_info.file_size),
+            host=file_info.download_host,
+            port=int(file_info.download_port),
+            key=file_info.file_key,
+            folderId=folder_id,
+            folderTotal=int(folder_total),
+            destDir=dest_dir,
+        )
+
+    def _discard_resume(self, file_id: str) -> None:
+        """Drop a resume entry and its staging file (save location changed or
+        the part can never complete)."""
+        entry = self._resume_store.get(file_id)
+        self._resume_store.remove(file_id)
+        if entry and entry.get("target"):
+            try:
+                os.remove(str(entry["target"]) + ".part")
+            except OSError:
+                pass
+
     def cancel_download(self, group_id: str, message_id: str) -> None:
-        """Abort a running download: set its cancel event and shut the held
-        socket down (a blocked read returns at once). The worker then reports
-        "下载已取消" via file_download_finished and the .part file is removed."""
+        """Pause a running download: set its cancel event and shut the held
+        socket down (a blocked read returns at once). The worker reports
+        "下载已取消" via file_download_finished, and the ".part" staging file
+        plus the resume entry are KEPT so the next tap continues from the
+        received offset (Android parity: 取消 = 保留断点)."""
         key = (group_id, message_id)
         with self._lock:
             entry = self._download_registry.pop(key, None)
@@ -1217,14 +1354,16 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
 
     def download_direct_file(self, peer_id: str, file_id: str, target_path: str) -> None:
         """Download a direct-chat file offer by file_id on a worker thread;
-        file_download_finished(file_id, ok, message) fires on completion."""
+        file_download_finished(file_id, ok, message) fires on completion. A
+        paused download resumes from its staged offset; after an app restart
+        the address and per-file key come from the persisted resume entry."""
         msg = next(
             (m for m in self.direct.messages_for(peer_id) if m.id == file_id), None
         )
         if msg is None or msg.file_info is None:
             self.file_download_finished.emit(file_id, False, "文件消息不存在")
             return
-        file_info = msg.file_info
+        file_info = self._merged_offer(msg.file_info)
         if not file_info.download_host or file_info.download_port <= 0:
             self.file_download_finished.emit(file_id, False, "文件已过期，请对方重新发送")
             return
@@ -1235,14 +1374,24 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         except OSError:
             self.file_download_finished.emit(file_id, False, "无法创建保存目录")
             return
+        offset = self._resume_offset(file_id, target_path)
         # cancel entry + throttled progress for the worker thread
         event, socks = self._register_download((peer_id, file_id))
         progress = self._make_file_progress(file_id)
 
         def run() -> None:
+            # remember the target/address before the first byte: a process
+            # death mid-transfer then still leaves a resumable entry
+            self._sync_resume(file_info, target_path, keep_empty=True)
             ok, message = self.direct.download_file(
-                file_info, target_path, progress=progress, cancel=event, sock_holder=socks
+                file_info,
+                target_path,
+                progress=progress,
+                cancel=event,
+                sock_holder=socks,
+                offset=offset,
             )
+            self._sync_resume(file_info, target_path)
             self._finish_download((peer_id, file_id))
             self.file_download_finished.emit(file_id, ok, message)
 
@@ -2498,7 +2647,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
 
     def download_file(self, file_id: str, target_path: str) -> None:
         """Download a file offer by file_id to target_path on a worker thread;
-        file_download_finished(file_id, ok, message) fires on completion."""
+        file_download_finished(file_id, ok, message) fires on completion. A
+        paused download resumes from its staged offset; after an app restart
+        the address and per-file key come from the persisted resume entry."""
         gid = self.active_group_id
         if gid is None:
             self.file_download_finished.emit(file_id, False, "未连接到群组")
@@ -2511,7 +2662,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         if msg is None or msg.file_info is None:
             self.file_download_finished.emit(file_id, False, "文件消息不存在")
             return
-        file_info = msg.file_info
+        file_info = self._merged_offer(msg.file_info)
+        if not file_info.download_host or file_info.download_port <= 0:
+            self.file_download_finished.emit(file_id, False, "文件已过期，请对方重新发送")
+            return
         # media targets live in the app media dir; ensure it exists before the
         # worker thread opens the output file
         try:
@@ -2519,14 +2673,24 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         except OSError:
             self.file_download_finished.emit(file_id, False, "无法创建保存目录")
             return
+        offset = self._resume_offset(file_id, target_path)
         # cancel entry + throttled progress for the worker thread
         event, socks = self._register_download((gid, file_id))
         progress = self._make_file_progress(file_id)
 
         def run() -> None:
+            # remember the target/address before the first byte: a process
+            # death mid-transfer then still leaves a resumable entry
+            self._sync_resume(file_info, target_path, keep_empty=True)
             ok, message = p2p.download_file(
-                file_info, target_path, progress=progress, cancel=event, sock_holder=socks
+                file_info,
+                target_path,
+                progress=progress,
+                cancel=event,
+                sock_holder=socks,
+                offset=offset,
             )
+            self._sync_resume(file_info, target_path)
             self._finish_download((gid, file_id))
             self.file_download_finished.emit(file_id, ok, message)
 
@@ -2594,11 +2758,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 ok_all = False
                 message = "下载已取消"
                 break
-            fi = m.file_info
-            if not fi.download_host or fi.download_port <= 0:
-                ok_all = False
-                message = "部分文件已过期，请对方重新发送"
-                break
+            fi = self._merged_offer(m.file_info)
             rel = fi.relative_path or fi.file_name
             target = os.path.abspath(os.path.join(root_abs, *rel.split("/")))
             try:
@@ -2612,15 +2772,56 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 ok_all = False
                 message = "无效的文件路径"
                 continue
+            # a resumed folder run skips entries that already landed complete
+            try:
+                complete = (
+                    fi.file_size > 0
+                    and os.path.isfile(target)
+                    and os.path.getsize(target) == fi.file_size
+                )
+            except OSError:
+                complete = False
+            if complete:
+                self._resume_store.remove(m.id)
+                self.folder_progress.emit(folder_id, index + 1, total)
+                continue
+            if not fi.download_host or fi.download_port <= 0:
+                ok_all = False
+                message = "部分文件已过期，请对方重新发送"
+                break
             try:
                 os.makedirs(os.path.dirname(target) or root_abs, exist_ok=True)
             except OSError:
                 ok_all = False
                 message = "无法创建保存目录"
                 continue
+            offset = self._resume_offset(m.id, target)
             progress = self._make_file_progress(m.id)
+            # record before the first byte: a process death mid-entry still
+            # leaves a resumable state for this folder run
+            self._sync_resume(
+                fi,
+                target,
+                folder_id=folder_id,
+                folder_total=total,
+                dest_dir=dest_dir,
+                keep_empty=True,
+            )
             ok, entry_message = downloader(
-                fi, target, progress=progress, cancel=event, sock_holder=socks
+                fi,
+                target,
+                progress=progress,
+                cancel=event,
+                sock_holder=socks,
+                offset=offset,
+            )
+            # keep/clear the per-entry resume state ("<target>.part")
+            self._sync_resume(
+                fi,
+                target,
+                folder_id=folder_id,
+                folder_total=total,
+                dest_dir=dest_dir,
             )
             if not ok:
                 ok_all = False

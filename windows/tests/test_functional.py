@@ -1239,6 +1239,117 @@ class ViewModelFlowTest(unittest.TestCase):
             if os.path.exists(p):
                 os.remove(p)
 
+    def test_file_download_pause_resume_across_restart(self):
+        """Cancel mid-download keeps the .part and the persisted resume state;
+        after restarting the downloading side the same offer resumes from that
+        offset and the finished bytes match the source exactly."""
+        port = 10023
+        network_module.TCP_PORT = port
+        dba = _fresh_db("lc_test_resume_host.db")
+        dbc = _fresh_db("lc_test_resume_member.db")
+        host = make_vm(dba)
+        host.create_group("\u4e3b\u673aR", "\u7eed\u4f20\u6d4b\u8bd5")  # 主机R / 续传测试
+        gid = host.active_group_id
+        password = host.active_group_password
+        join_id = host.active_group_numeric_id()
+
+        member = make_vm(dbc)
+        self._vms = [host, member]
+        joined = []
+        member.join_successful.connect(lambda: joined.append(True))
+        member.query_group("\u6210\u5458R", join_id, "127.0.0.1", port=port, password=password)
+        self.assertTrue(wait_until(lambda: member.queried_group_info() is not None, pump=self.pump))
+        member.confirm_join()
+        self.assertTrue(wait_until(lambda: joined, pump=self.pump))
+
+        payload = b"resume payload block " * 20000  # several 64KB chunks
+        fpath = os.path.join(tempfile.gettempdir(), "kilo", "lc_test_resume_src.bin")
+        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        with open(fpath, "wb") as f:
+            f.write(payload)
+        self.assertTrue(member.send_file(fpath), "send_file must succeed")
+        self.assertTrue(
+            wait_until(
+                lambda: any(m.file_info is not None for m in host.active_messages()),
+                pump=self.pump,
+            ),
+            "host must receive the file offer",
+        )
+        offer = next(m for m in host.active_messages() if m.file_info is not None)
+        target = os.path.join(tempfile.gettempdir(), "kilo", "lc_test_resume_dst.bin")
+        for p in (target, target + ".part"):
+            if os.path.exists(p):
+                os.remove(p)
+
+        finished = []
+        host.file_download_finished.connect(
+            lambda fid, ok, message: finished.append((fid, ok, message))
+        )
+        # cancel from INSIDE the progress callback (worker thread): the cancel
+        # lands exactly after the first written chunk instead of racing the
+        # transfer through the Qt event queue
+        cancelled = {"done": False}
+        original_factory = host._make_file_progress
+
+        def progress_factory(fid):
+            report = original_factory(fid)
+
+            def wrapped(received, total):
+                report(received, total)
+                if not cancelled["done"]:
+                    cancelled["done"] = True
+                    host.cancel_download(gid, fid)
+
+            return wrapped
+
+        host._make_file_progress = progress_factory
+        host.download_file(offer.id, target)
+        self.assertTrue(wait_until(lambda: finished, pump=self.pump), "cancel must finish")
+        fid, ok, message = finished[0]
+        self.assertEqual(fid, offer.id)
+        self.assertFalse(ok)
+        self.assertIn("\u53d6\u6d88", message)  # 取消
+        part_path = target + ".part"
+        self.assertTrue(os.path.exists(part_path), "cancel must keep the .part file")
+        info = host.resume_info(offer.id)
+        self.assertIsNotNone(info, "a resumable state must be persisted")
+        self.assertGreater(info["received"], 0)
+        self.assertEqual(info["received"], os.path.getsize(part_path))
+        self.assertLess(info["received"], len(payload))
+
+        # restart the downloading side: the .part and the resume entry (which
+        # carries the sender address and per-file key) survive in the database
+        host.shutdown()
+        host2 = make_vm(dba)
+        self._vms.append(host2)
+        host2.switch_to_group(gid)
+        self.assertTrue(
+            wait_until(
+                lambda: any(m.id == offer.id for m in host2.active_messages()),
+                pump=self.pump,
+            ),
+            "the offer must be restored",
+        )
+        info2 = host2.resume_info(offer.id)
+        self.assertIsNotNone(info2, "the resume state must survive a restart")
+        self.assertEqual(info2["received"], info["received"])
+
+        done2 = []
+        host2.file_download_finished.connect(
+            lambda fid, ok, message: done2.append((fid, ok, message))
+        )
+        host2.download_file(offer.id, target)
+        self.assertTrue(wait_until(lambda: done2, pump=self.pump), "resume must finish")
+        _fid, ok2, message2 = done2[0]
+        self.assertTrue(ok2, message2)
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), payload, "resumed bytes must match the source")
+        self.assertFalse(os.path.exists(part_path))
+        self.assertIsNone(host2.resume_info(offer.id))
+        for p in (fpath, target):
+            if os.path.exists(p):
+                os.remove(p)
+
     def test_folder_protocol_fields_and_traversal_safety(self):
         """Folder offers reuse FileInfo with optional folderId/folderName/
         relativePath/folderTotal. A crafted relative path must never escape the

@@ -291,12 +291,14 @@ class FileDownloadTokenTest(unittest.TestCase):
 
     def test_models_tolerates_token_field(self):
         raw = json.dumps(
-            {"type": "file_download", "fileId": "f1", "token": "abc123"}
+            {"type": "file_download", "fileId": "f1", "token": "abc123", "offset": 0}
         )
         pkt = NetworkPacket.from_json(raw)
         self.assertEqual(pkt.token, "abc123")
         self.assertEqual(json.loads(pkt.to_json())["token"], "abc123")
-        legacy = NetworkPacket.from_json('{"type":"file_download","fileId":"f1"}')
+        legacy = NetworkPacket.from_json(
+            '{"type":"file_download","fileId":"f1","offset":0}'
+        )
         self.assertIsNone(legacy.token)
         self.assertNotIn("token", legacy.to_json())
 
@@ -342,7 +344,10 @@ class FileDownloadTokenTest(unittest.TestCase):
         the meta line or any stream byte."""
         sock = socket.create_connection(("127.0.0.1", self.port), timeout=6)
         bad = NetworkPacket(
-            type="file_download", file_id=self.FILE_ID, token=to_b64(b"\x00" * 32)
+            type="file_download",
+            file_id=self.FILE_ID,
+            token=to_b64(b"\x00" * 32),
+            offset=0,
         )
         sock.sendall((bad.to_json() + "\n").encode("utf-8"))
         sock.settimeout(2)
@@ -365,7 +370,9 @@ class FileDownloadTokenTest(unittest.TestCase):
         `!= null`), not a legacy peer: the Windows check used truthiness and
         served the file. Parity regression."""
         sock = socket.create_connection(("127.0.0.1", self.port), timeout=6)
-        empty = NetworkPacket(type="file_download", file_id=self.FILE_ID, token="")
+        empty = NetworkPacket(
+            type="file_download", file_id=self.FILE_ID, token="", offset=0
+        )
         sock.sendall((empty.to_json() + "\n").encode("utf-8"))
         sock.settimeout(2)
         buf = bytearray()
@@ -392,7 +399,9 @@ class FileDownloadTokenTest(unittest.TestCase):
         try:
             sock.sendall(
                 (
-                    NetworkPacket(type="file_download", file_id=self.FILE_ID).to_json()
+                    NetworkPacket(
+                        type="file_download", file_id=self.FILE_ID, offset=0
+                    ).to_json()
                     + "\n"
                 ).encode("utf-8")
             )
@@ -485,8 +494,9 @@ class FileDownloadTokenTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "never.bin.part")))
 
     def test_cancel_mid_download(self):
-        """Cancelling after the first chunk aborts promptly and removes the
-        partial .part file."""
+        """Cancelling after the first chunk aborts promptly and KEEPS the
+        partial .part file (cancel = pause with a resume point, Android
+        parity: 取消 = 保留断点); the target itself is never created."""
         cancel = threading.Event()
         holder = []
 
@@ -500,7 +510,9 @@ class FileDownloadTokenTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(message, "\u4e0b\u8f7d\u5df2\u53d6\u6d88")  # 下载已取消
         self.assertFalse(os.path.exists(target))
-        self.assertFalse(os.path.exists(target + ".part"))
+        self.assertTrue(
+            os.path.exists(target + ".part"), "cancel must keep the staging file"
+        )
 
 
 class TombstoneIntakeTest(unittest.TestCase):

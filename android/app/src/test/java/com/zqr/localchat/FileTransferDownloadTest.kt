@@ -90,7 +90,15 @@ class FileTransferDownloadTest {
                 )
                 val writer = java.io.PrintWriter(client.getOutputStream(), true)
                 writer.println(metaLine)
-                writeChunk(client.getOutputStream(), fileKey, payload)
+                // honor the resume offset: stream only what the receiver miss
+                val start = (req?.offset ?: 0L).toInt().coerceIn(0, payload.size)
+                val remaining = payload.copyOfRange(start, payload.size)
+                var pos = 0
+                while (pos < remaining.size) {
+                    val n = minOf(1024, remaining.size - pos)
+                    writeChunk(client.getOutputStream(), fileKey, remaining.copyOfRange(pos, pos + n))
+                    pos += n
+                }
                 client.getOutputStream().write(byteArrayOf(0, 0, 0, 0))
                 client.getOutputStream().flush()
                 // give the client a moment to drain, then close
@@ -129,12 +137,14 @@ class FileTransferDownloadTest {
             assertEquals(payload.toList(), out.toByteArray().toList())
             assertTrue("progress must fire", progress.isNotEmpty())
             assertEquals("200/200", progress.last())
-            // the request line MUST carry the lc-file-dl-v1 token
+            // the request line MUST carry the lc-file-dl-v1 token and the
+            // (mandatory) resume offset; a fresh download sends 0
             val sent = request.get()
             assertNotNull(sent)
             val req = json.decodeFromString<NetworkPacket>(sent!!)
             assertEquals("file_download", req.type)
             assertEquals("file-1", req.fileId)
+            assertEquals(0L, req.offset)
             assertEquals(
                 FileTransfer.downloadToken("file-1", key),
                 req.token
@@ -146,7 +156,88 @@ class FileTransferDownloadTest {
     }
 
     @Test
-    fun `cancelled download aborts`() {
+    fun `download sends the offset and appends from the staging point`() {
+        val key = Crypto.randomBytes(32)
+        val payload = ByteArray(5000) { (it * 3).toByte() }
+        val staged = 2048L
+        val server = ServerSocket(0)
+        val request = AtomicReference<String?>()
+        val done = CountDownLatch(1)
+        serveOnce(server, key, payload, request, done)
+        try {
+            // the caller pre-fills its staging output with the received bytes
+            val out = ByteArrayOutputStream()
+            out.write(payload, 0, staged.toInt())
+            val progress = ArrayList<String>()
+            val result = FileTransfer.download(
+                offer("file-resume", key, server.localPort, payload.size.toLong()),
+                out,
+                onProgress = { received, total -> progress.add("$received/$total") },
+                cancelled = { false },
+                offset = staged
+            )
+            assertTrue("download must succeed: ${result.message}", result.ok)
+            assertEquals(payload.toList(), out.toByteArray().toList())
+            val req = json.decodeFromString<NetworkPacket>(request.get()!!)
+            assertEquals(staged, req.offset)
+            // cumulative progress: the resumed offset is included
+            assertTrue(progress.isNotEmpty())
+            assertTrue(
+                "first progress sample must include the offset: ${progress.first()}",
+                progress.first().substringBefore("/").toLong() >= staged
+            )
+            assertEquals("${payload.size}/${payload.size}", progress.last())
+        } finally {
+            assertTrue(done.await(15, TimeUnit.SECONDS))
+            server.close()
+        }
+    }
+
+    @Test
+    fun `negative offset is rejected before connecting`() {
+        val key = Crypto.randomBytes(32)
+        val result = FileTransfer.download(
+            offer("file-neg", key, 1, 64),
+            ByteArrayOutputStream(),
+            cancelled = { false },
+            offset = -1
+        )
+        assertFalse("a negative resume offset must not connect", result.ok)
+        assertEquals("断点位置无效", result.message)
+    }
+
+    @Test
+    fun `offset past the declared size fails before streaming`() {
+        val key = Crypto.randomBytes(32)
+        val payload = ByteArray(200) { 1 }
+        val server = ServerSocket(0)
+        val request = AtomicReference<String?>()
+        val done = CountDownLatch(1)
+        serveOnce(server, key, payload, request, done)
+        try {
+            val out = ByteArrayOutputStream()
+            val result = FileTransfer.download(
+                // offer declares 100 bytes; the meta agrees on 200, the
+                // smaller bound (100) governs and a 150-byte resume is
+                // impossible
+                offer("file-over", key, server.localPort, 100),
+                out,
+                cancelled = { false },
+                offset = 150
+            )
+            assertFalse("an oversized resume offset must fail", result.ok)
+            assertEquals("断点数据损坏，请重新下载", result.message)
+        } finally {
+            assertTrue(done.await(15, TimeUnit.SECONDS))
+            server.close()
+        }
+    }
+
+    @Test
+    fun `cancel keeps the staging output untouched`() {
+        // the caller (ViewModel) owns the ".part" file: the transfer must never
+        // delete or truncate what was already staged, so a cancel leaves the
+        // bytes in place for the next resume
         val key = Crypto.randomBytes(32)
         val payload = ByteArray(64) { 7 }
         val server = ServerSocket(0)
@@ -163,6 +254,7 @@ class FileTransferDownloadTest {
             )
             assertFalse("a cancelled download must not succeed", result.ok)
             assertTrue("cancellation must be visible in the message", result.message.contains("取消"))
+            assertEquals(0, out.size())
         } finally {
             assertTrue(done.await(15, TimeUnit.SECONDS))
             server.close()
