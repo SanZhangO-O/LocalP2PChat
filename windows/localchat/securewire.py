@@ -170,8 +170,18 @@ class Wire:
         # fails — there is no eviction window a replay could slip through
         # (TCP ordering plus the send lock make 1,2,3,... the only legal
         # stream). Relay hops re-stamp on their own outgoing wire.
+        #
+        # Compatibility: peers built BEFORE the seq field exists never stamp
+        # it (README: chat/file/group must keep working across versions).
+        # An unstamped stream is therefore accepted until the first stamped
+        # packet proves the peer seq-capable; from then on a missing seq is
+        # treated like a replay. Senders NEVER clear the flag for their own
+        # direction: an honest peer cannot alternate between stamped and
+        # unstamped lines, and an attacker cannot strip seq without breaking
+        # the GCM authentication.
         self._send_seq = 0
         self._recv_seq = 0
+        self._recv_seq_enforced = False
         # Seen packet nonces of THIS connection (LRU): a repeated nonce is a
         # replayed line and aborts the connection like a decrypt failure.
         # Defense in depth next to the seq guard; also bounds nonce reuse.
@@ -218,7 +228,16 @@ class Wire:
             raise WireException("malformed packet JSON") from e
         # session-sequence guard: only the exact next packet of THIS stream
         # is legal — a replayed, reordered or attacker-injected line fails
-        # here even after the nonce LRU forgot its nonce
+        # here even after the nonce LRU forgot its nonce. Legacy (pre-seq)
+        # peers are exempt until they stamp their first packet, so version
+        # skew cannot break chats (see the __init__ comment).
+        if packet.seq is None:
+            if self._recv_seq_enforced:
+                raise WireException(
+                    "packet sequence violation (missing seq after enforcement "
+                    "began; replayed, reordered or injected)"
+                )
+            return packet
         expected = self._recv_seq + 1
         if packet.seq != expected:
             raise WireException(
@@ -226,6 +245,7 @@ class Wire:
                 "replayed, reordered or injected)"
             )
         self._recv_seq = packet.seq
+        self._recv_seq_enforced = True
         return packet
 
     def recv_packet_text(self) -> Optional[str]:

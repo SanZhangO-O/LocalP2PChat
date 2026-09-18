@@ -135,9 +135,18 @@ class Wire(val lineIn: LineIn, val writer: PrintWriter) {
      *  replayed, reordered or injected encrypted line fails even after the
      *  nonce LRU evicted its nonce. Guarded by [seenNonces]' monitor on
      *  recv (single read loop) and by the PrintWriter's serialization on
-     *  send. */
+     *  send.
+     *
+     *  Compatibility: peers built BEFORE the seq field exists never stamp it
+     *  (README: chat/file/group must keep working across versions). An
+     *  unstamped stream is accepted until the first stamped packet proves
+     *  the peer seq-capable; from then on a missing seq is treated like a
+     *  replay. An honest peer cannot alternate between stamped and
+     *  unstamped lines, and an attacker cannot strip seq without breaking
+     *  the GCM authentication. */
     private var sendSeq: Long = 0
     private var recvSeq: Long = 0
+    private var recvSeqEnforced = false
 
     /** Nonce replay guard: raw 12-byte nonces already seen on THIS
      *  connection, insertion-ordered, oldest evicted past
@@ -201,14 +210,26 @@ class Wire(val lineIn: LineIn, val writer: PrintWriter) {
         val packet = runCatching { wireJson.decodeFromString<NetworkPacket>(plain.toString(Charsets.UTF_8)) }
             .getOrElse { throw WireException("malformed packet JSON", it) }
         synchronized(seenNonces) {
-            val expected = recvSeq + 1
-            if (packet.seq != expected) {
-                Log.w(TAG, "packet sequence violation (got ${packet.seq}, want $expected)")
-                throw WireException(
-                    "packet sequence violation (replayed, reordered or injected)"
-                )
+            val seq = packet.seq
+            if (seq == null) {
+                // legacy (pre-seq) peer: accepted until it proves otherwise
+                if (recvSeqEnforced) {
+                    Log.w(TAG, "packet missing seq after enforcement began")
+                    throw WireException(
+                        "packet sequence violation (missing seq; replayed, reordered or injected)"
+                    )
+                }
+            } else {
+                val expected = recvSeq + 1
+                if (seq != expected) {
+                    Log.w(TAG, "packet sequence violation (got $seq, want $expected)")
+                    throw WireException(
+                        "packet sequence violation (replayed, reordered or injected)"
+                    )
+                }
+                recvSeq = seq
+                recvSeqEnforced = true
             }
-            recvSeq = packet.seq
         }
         return packet
     }

@@ -273,10 +273,31 @@ class SecureWireTest {
     }
 
     @Test
-    fun `packet without a sequence number is rejected`() {
+    fun `legacy unstamped stream is accepted`() {
+        // pre-seq peers never stamp the field: their whole stream must keep
+        // working (README: chat/file/group are unaffected by version skew)
+        val key = Crypto.randomBytes(32)
+        val lines = ArrayDeque(
+            (1..3).map {
+                Crypto.toB64(Crypto.aesGcmEncrypt(key, """{"type":"ping"}""".toByteArray(Charsets.UTF_8)))
+            }
+        )
+        val wire = Wire(
+            com.zqr.localchat.network.LineIn { lines.removeFirstOrNull() },
+            PrintWriter(java.io.StringWriter(), true)
+        )
+        wire.activate(key)
+        repeat(3) { assertNotNull(wire.recvPacket()) }
+    }
+
+    @Test
+    fun `packet without a sequence number is rejected after enforcement`() {
+        // once a stamped packet proves the peer seq-capable, an unstamped
+        // line is a forged/replayed line and must be rejected
         val key = Crypto.randomBytes(32)
         val lines = ArrayDeque(
             listOf(
+                Crypto.toB64(Crypto.aesGcmEncrypt(key, """{"type":"ping","seq":1}""".toByteArray(Charsets.UTF_8))),
                 Crypto.toB64(Crypto.aesGcmEncrypt(key, """{"type":"ping"}""".toByteArray(Charsets.UTF_8)))
             )
         )
@@ -285,8 +306,25 @@ class SecureWireTest {
             PrintWriter(java.io.StringWriter(), true)
         )
         wire.activate(key)
+        assertNotNull(wire.recvPacket())
         val ex = assertThrows(WireException::class.java) { wire.recvPacket() }
         assertTrue(ex.message!!.contains("sequence"))
+    }
+
+    @Test
+    fun `replayed unstamped line is still rejected`() {
+        // legacy compatibility must not open a replay hole: the same
+        // unstamped line delivered twice still dies on the nonce cache
+        val key = Crypto.randomBytes(32)
+        val line = Crypto.toB64(Crypto.aesGcmEncrypt(key, """{"type":"ping"}""".toByteArray(Charsets.UTF_8)))
+        val lines = ArrayDeque(listOf(line, line))
+        val wire = Wire(
+            com.zqr.localchat.network.LineIn { lines.removeFirstOrNull() },
+            PrintWriter(java.io.StringWriter(), true)
+        )
+        wire.activate(key)
+        assertNotNull(wire.recvPacket())
+        assertThrows(WireException::class.java) { wire.recvPacket() }
     }
 
     @Test

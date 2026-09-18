@@ -3,8 +3,11 @@
 1. SecureWire anti-replay: a line replayed WITHIN one connection must abort
    the wire (per-session ECDH keys already make cross-session replay fail),
    and the per-direction packet sequence ("seq", stamped inside the
-   GCM-protected JSON) rejects replayed/reordered/injected lines even after
-   the nonce LRU evicted them; a relay hop restamps seq on its own wire.
+    GCM-protected JSON) rejects replayed/reordered/injected lines even after
+    the nonce LRU evicted them; a relay hop restamps seq on its own wire.
+    Pre-seq peers (older builds) stay compatible: an unstamped stream is
+    accepted until the peer stamps its first packet, after which a missing
+    seq is rejected like a replay.
 3. file_download token: MANDATORY on every request — the downloader always
    attaches base64(HMAC-SHA256(fileKey, "lc-file-dl-v1:" + fileId)); the
    sender verifies it in constant time and serves NOTHING on mismatch or
@@ -127,12 +130,36 @@ class WireReplayTest(unittest.TestCase):
 
         return to_b64(aes_gcm_encrypt(self.KEY, payload.encode("utf-8")))
 
-    def test_missing_seq_rejected(self):
-        """An attacker-crafted line (valid GCM under a stolen key scenario,
-        or any non-compliant peer) without the sequence field is rejected."""
-        lines = [self._raw_line('{"type":"ping"}')]
+    def test_legacy_unstamped_stream_accepted(self):
+        """A pre-seq peer never stamps the field: its whole stream must keep
+        working (README: chat/file/group are unaffected by version skew)."""
+        lines = [self._raw_line('{"type":"ping"}') for _ in range(3)]
         receiver = Wire(lambda: lines.pop(0) if lines else None, None)
         receiver.activate(self.KEY)
+        for _ in range(3):
+            self.assertIsNotNone(receiver.recv_packet())
+
+    def test_missing_seq_rejected_after_enforcement(self):
+        """Once a stamped packet proves the peer seq-capable, an unstamped
+        line is a forged/replayed line and must be rejected."""
+        lines = [
+            self._raw_line('{"type":"ping","seq":1}'),
+            self._raw_line('{"type":"ping"}'),
+        ]
+        receiver = Wire(lambda: lines.pop(0) if lines else None, None)
+        receiver.activate(self.KEY)
+        self.assertIsNotNone(receiver.recv_packet())
+        with self.assertRaises(WireException):
+            receiver.recv_packet()
+
+    def test_replayed_unstamped_line_rejected(self):
+        """Legacy compatibility must not open a replay hole: the same
+        unstamped line delivered twice still dies on the nonce cache."""
+        line = self._raw_line('{"type":"ping"}')
+        lines = [line, line]
+        receiver = Wire(lambda: lines.pop(0) if lines else None, None)
+        receiver.activate(self.KEY)
+        self.assertIsNotNone(receiver.recv_packet())
         with self.assertRaises(WireException):
             receiver.recv_packet()
 
