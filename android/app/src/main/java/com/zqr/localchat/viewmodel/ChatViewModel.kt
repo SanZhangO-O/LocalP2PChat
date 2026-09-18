@@ -88,7 +88,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val lastMessageTime: Long = 0L,
         val unreadCount: Int = 0,
         val muted: Boolean = false,
-        val connected: Boolean = false
+        val connected: Boolean = false,
+        /** Owner-published group announcement (group_update), shown as a lobby
+         *  banner and kept across restarts / while the host is offline. */
+        val announcement: String = ""
     )
 
     private val groupP2pMap = mutableMapOf<String, P2PManager>()
@@ -264,6 +267,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Transient direct-chat events surfaced as toasts. */
     val directEvents: SharedFlow<String> = DirectChatManager.events
+
+    /** Transient group-management events surfaced as toasts (kicked out,
+     *  member removed). Buffered so an emit without a collector is not lost. */
+    private val _groupEvents = MutableSharedFlow<String>(extraBufferCapacity = 8)
+    val groupEvents: SharedFlow<String> = _groupEvents.asSharedFlow()
 
     /**
      * Start a video call with a direct-chat member. Signaling rides the 1:1
@@ -1026,6 +1034,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             groupId = groupId,
                             members = members,
                             host = host,
+                            // the owner's current announcement (the sponsor
+                            // mirrors it, like the host itself would)
+                            announcement = p2p.currentGroupAnnouncement.ifEmpty { null },
                             deletedIds = deletedIdsFor(groupId).ifEmpty { null }
                         )
                     )
@@ -1696,6 +1707,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // history_reply tombstone sync: the provider is read on mesh worker
         // threads when a link's history is pushed (see GroupMeshManager).
         GroupMeshManager.deletedIdsProvider = { groupId -> deletedIdsFor(groupId) }
+        // Owner management packets (group_update / kick_member) are only
+        // accepted on a mesh link when senderId is the group's creator.
+        GroupMeshManager.creatorIdProvider = { groupId ->
+            ChatApp.savedGroupCreatorId(getApplication(), groupId)
+        }
+        // Mesh-received owner commands apply like the relayed ones: refresh the
+        // metadata, or run the kicked member's teardown.
+        GroupMeshManager.onGroupAdmin = { groupId, packet ->
+            applyGroupAdminPacket(groupId, packet)
+        }
         // join_ack tombstone sync: tombstones learned from a peer's ack are
         // persisted so a history replay cannot resurrect the deleted rows.
         // Global callbacks (one shared database), set before any join runs.
@@ -1859,6 +1880,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     val hostPeer = p2p.connectedHost
                     val hostIp = hostPeer?.let { "${it.ipAddress}:${it.port}" } ?: pendingHostIp
                     val hostPort = hostPeer?.port ?: pendingHostPort
+                    // Remember the creator (owner) device id: only owner
+                    // packets (group_update / kick_member) whose senderId
+                    // matches it are accepted. A sponsor join reveals the host
+                    // in the ack; a direct join has the host at the address we
+                    // dialed; the query response carries creatorId.
+                    val creatorId = hostPeer?.id
+                        ?: p2p.queriedGroupInfo.value?.creatorId?.takeIf { it.isNotBlank() }
+                        ?: run {
+                            val dialHost = parseHostPort(pendingHostIp).host
+                            p2p.peers.value.values.firstOrNull {
+                                it.ipAddress == dialHost && it.port == hostPort
+                            }?.id
+                        } ?: ""
+                    if (creatorId.isNotBlank()) {
+                        ChatApp.saveGroupCreatorId(getApplication(), groupId, creatorId)
+                    }
+                    val announcement = p2p.currentGroupAnnouncement
                     registerGroupP2p(groupId, p2p)
                     startMonitoringGroup(groupId, p2p)
                     setupGroupMesh(groupId, p2p)
@@ -1868,7 +1906,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         if (exists) {
                             groups.map { g ->
                                 if (g.groupId == groupId) {
-                                    g.copy(isHost = false, hostIp = hostIp, hostPort = hostPort, connected = true)
+                                    g.copy(
+                                        isHost = false,
+                                        hostIp = hostIp,
+                                        hostPort = hostPort,
+                                        connected = true,
+                                        announcement = announcement
+                                    )
                                 } else g
                             }
                         } else {
@@ -1880,7 +1924,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                     hostIp = hostIp,
                                     hostPort = hostPort,
                                     muted = ChatApp.isGroupMuted(getApplication(), groupId),
-                                    connected = true
+                                    connected = true,
+                                    announcement = announcement
                                 )
                             ) + groups
                         }
@@ -1907,7 +1952,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             isHost = false,
                             hostIp = hostIp,
                             hostPort = hostPort,
-                            myName = p2p.myNameValue
+                            myName = p2p.myNameValue,
+                            announcement = announcement
                         ))
                     }
                     loadAndReplayMessages(groupId, p2p)
@@ -1940,6 +1986,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun registerGroupP2p(groupId: String, p2p: P2PManager) {
         groupP2pMap[groupId] = p2p
         p2p.callSignalListener = { packet -> CallManager.handleSignal(p2p, packet) }
+        // Owner management: refresh/persist after a host-side update or an
+        // applied member-side group_update; tear the group down when kicked.
+        p2p.adminNotify = { refreshGroupAdmin(groupId, p2p) }
+        p2p.kickedNotify = { onKickedFromGroup(groupId, p2p) }
         p2p.serverErrorNotify = { message ->
             _groups.update { list ->
                 list.map { g ->
@@ -1948,6 +1998,101 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         _groupP2pVersion.value++
+    }
+
+    /** Reflect an owner group_update (name/announcement) into the group list
+     *  and the database. Called from relay or mesh worker threads. */
+    private fun refreshGroupAdmin(groupId: String, p2p: P2PManager?) {
+        val name = p2p?.currentGroupName
+            ?: _groups.value.find { it.groupId == groupId }?.groupName
+            ?: return
+        val announcement = p2p?.currentGroupAnnouncement
+            ?: _groups.value.find { it.groupId == groupId }?.announcement
+            ?: ""
+        _groups.update { list ->
+            list.map { g ->
+                if (g.groupId == groupId) g.copy(groupName = name, announcement = announcement) else g
+            }
+        }
+        if (_activeGroupId.value == groupId) _activeGroupName.value = name
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { chatDao.updateGroupAdminInfo(groupId, name, announcement) }
+        }
+    }
+
+    /** Apply an owner management packet received over the group mesh. */
+    private fun applyGroupAdminPacket(groupId: String, packet: NetworkPacket) {
+        val p2p = groupP2pMap[groupId]
+        when (packet.type) {
+            "group_update" -> {
+                p2p?.applyRemoteGroupUpdate(
+                    packet.groupName?.trim()?.takeIf { it.isNotEmpty() },
+                    packet.announcement
+                )
+                refreshGroupAdmin(groupId, p2p)
+            }
+            "kick_member" -> {
+                val target = packet.targetId ?: return
+                if (p2p != null && target == p2p.myIdValue) {
+                    onKickedFromGroup(groupId, p2p)
+                    return
+                }
+                p2p?.removePeerLocally(target)
+                refreshGroupAdmin(groupId, p2p)
+            }
+        }
+    }
+
+    /** The owner removed this device: tear every connection of the group down,
+     *  keep the local history, hide the group and tell the user. Hopped to the
+     *  main thread: the map/job state is also mutated there. */
+    private fun onKickedFromGroup(groupId: String, p2p: P2PManager) {
+        viewModelScope.launch {
+            if (groupP2pMap[groupId] !== p2p) return@launch
+            val name = _groups.value.find { it.groupId == groupId }?.groupName
+                ?: p2p.currentGroupName
+            groupP2pMap.remove(groupId)
+            monitoringJobs.remove(groupId)?.forEach { it.cancel() }
+            p2p.stop()
+            teardownGroupMesh(groupId)
+            persistedPeerCounts.remove(groupId)
+            _groups.update { list -> list.filter { it.groupId != groupId } }
+            if (_activeGroupId.value == groupId) {
+                _activeGroupId.value = null
+                _activeGroupName.value = ""
+                _activeMyName.value = ""
+                _activeIsHost.value = false
+                _activeGroupPassword.value = null
+            }
+            // the row (and its message history via the FK) stays; kickedAt hides it
+            runCatching { chatDao.markGroupKicked(groupId, System.currentTimeMillis()) }
+            _groupEvents.tryEmit("你已被移出群组「$name」")
+            if (_groups.value.isEmpty()) ChatApp.stopChatService(getApplication())
+        }
+    }
+
+    /** Owner action: publish a new group name and/or announcement. */
+    fun updateGroupInfo(groupName: String?, announcement: String?) {
+        val gid = _activeGroupId.value ?: return
+        val p2p = groupP2pMap[gid] ?: return
+        if (!p2p.isHostNode) return
+        val name = groupName?.trim()?.take(20)
+        if (name.isNullOrEmpty() && announcement == null) return
+        if (p2p.sendGroupUpdate(name, announcement)) {
+            refreshGroupAdmin(gid, p2p)
+        }
+    }
+
+    /** Owner action: remove a member from the active group. */
+    fun kickMember(peerId: String) {
+        val gid = _activeGroupId.value ?: return
+        val p2p = groupP2pMap[gid] ?: return
+        if (!p2p.isHostNode) return
+        val name = p2p.peers.value[peerId]?.name ?: peerId
+        if (p2p.kickMember(peerId)) {
+            refreshGroupAdmin(gid, p2p)
+            _groupEvents.tryEmit("已将 $name 移出群组")
+        }
     }
 
     /**
@@ -1981,6 +2126,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 lastMessage = if (keepOldSummary) StoreCipher.protect(old.lastMessage) else persistedSummary,
                 lastMessageTime = if (keepOldSummary) old.lastMessageTime else group.lastMessageTime
             )
+            // updateGroup never writes the management columns (a metadata
+            // refresh must not revert a rename), so write a non-empty
+            // announcement explicitly
+            if (group.announcement.isNotEmpty()) {
+                chatDao.updateGroupAdminInfo(group.groupId, group.groupName, group.announcement)
+            }
         }
         // the group row now exists: tombstones that arrived during the join
         // (join_ack deletedIds) can finally be written — they were buffered
@@ -2030,6 +2181,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         // direct chats live under a synthetic "direct:..." key
                         // in the same table; never surface them as groups
                         .filter { !it.groupId.startsWith("direct:") }
+                        // a group this member was kicked out of keeps its
+                        // history row but must never reappear in the list
+                        .filter { it.kickedAt == 0L }
                         .map { sg ->
                             GroupMeta(
                                 groupId = sg.groupId,
@@ -2040,7 +2194,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 memberCount = sg.memberCount,
                                 lastMessage = StoreCipher.unprotect(sg.lastMessage),
                                 lastMessageTime = sg.lastMessageTime,
-                                muted = ChatApp.isGroupMuted(getApplication(), sg.groupId)
+                                muted = ChatApp.isGroupMuted(getApplication(), sg.groupId),
+                                announcement = sg.announcement
                             )
                         }
                         .filter { it.groupId !in currentIds && it.groupId !in removedGroupIds }
@@ -2187,6 +2342,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val password = Crypto.randomPassword(8)
         val p2p = P2PManager(getApplication(), port, hostServer)
         p2p.initializeAsHost(nick, name, password)
+        // Freeze the numeric join id at creation: a later owner rename
+        // (group_update) must not change the id members saved to rejoin.
+        p2p.setJoinId(p2p.numericGroupId)
+        saveGroupJoinId(p2p.currentGroupId, p2p.joinIdValue)
         p2p.startAsHost()
 
         val groupId = p2p.currentGroupId
@@ -2222,6 +2381,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 hostPort = port,
                 myName = nick
             ))
+            // a re-created same-id group is a fresh one: no announcement, and
+            // a previous kick marker must not keep it hidden
+            runCatching {
+                chatDao.updateGroupAdminInfo(groupId, name, "")
+                chatDao.markGroupKicked(groupId, 0L)
+            }
         }
     }
 
@@ -2341,7 +2506,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val nick = persistedMyNames[groupId]?.ifBlank { null } ?: "用户"
                 val password = ChatApp.savedGroupPassword(getApplication(), groupId)
                 val newP2p = P2PManager(getApplication(), port, hostServer)
-                newP2p.initializeAsHost(nick, meta.groupName, password.ifBlank { null })
+                // re-host under the ORIGINAL group id and numeric join id: a
+                // rename (group_update) changed only the display name
+                newP2p.initializeAsHost(nick, meta.groupName, password.ifBlank { null }, groupId = groupId)
+                val storedJoinId = savedGroupJoinId(groupId)
+                newP2p.setJoinId(storedJoinId.ifBlank { newP2p.numericGroupId })
+                if (storedJoinId.isBlank()) saveGroupJoinId(groupId, newP2p.joinIdValue)
                 newP2p.startAsHost()
                 _activeGroupPassword.value = password.ifBlank { null }
                 registerGroupP2p(groupId, newP2p)

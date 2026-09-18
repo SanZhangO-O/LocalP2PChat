@@ -135,6 +135,18 @@ class HostGroupServer(port: Int) {
     /** Stop the listener for good (app teardown). */
     fun shutdown() = stop()
 
+    /** Re-key a host group after the owner renamed it (group_update): the
+     *  registration key is the display name, and a stale entry under the old
+     *  name would keep resolving joins to a dead key. */
+    fun renameRegistration(p2p: P2PManager, oldName: String) {
+        synchronized(lock) {
+            if (groups[oldName] === p2p) groups.remove(oldName)
+            if (groups[p2p.currentGroupName] == null || groups[p2p.currentGroupName] === p2p) {
+                groups[p2p.currentGroupName] = p2p
+            }
+        }
+    }
+
     /** Make sure the shared port is being listened on (direct chats need it
      *  even on devices with no host group). */
     fun ensureRunning() {
@@ -446,6 +458,26 @@ class P2PManager(
     private var joinId: String = ""
     private var isHost: Boolean = false
 
+    /** Owner-published announcement (group_update), mirrored by members and
+     *  persisted by the ViewModel. */
+    @Volatile
+    private var groupAnnouncement: String = ""
+
+    /** Invoked after a host-side management action (group_update / kick_member)
+     *  so the ViewModel can refresh and persist the group metadata. */
+    @Volatile
+    var adminNotify: (() -> Unit)? = null
+
+    /** Invoked when the owner kicked this device out: the ViewModel tears every
+     *  connection down, hides the group and tells the user (exactly once). */
+    @Volatile
+    var kickedNotify: (() -> Unit)? = null
+
+    /** Once this device was kicked the teardown must run exactly once even
+     *  when the packet arrives over both the relay and the mesh. */
+    @Volatile
+    private var kickedFromGroup = false
+
     /** One connected group member on the host side: its socket plus the
      *  per-connection encrypted wire (each join negotiated its own key). */
     private class MemberConn(val socket: Socket, val wire: Wire)
@@ -513,10 +545,12 @@ class P2PManager(
         data class Error(val message: String) : ConnectionResult()
     }
 
-    fun initializeAsHost(userName: String, group: String, password: String? = null) {
+    fun initializeAsHost(userName: String, group: String, password: String? = null, groupId: String? = null) {
         myName = userName.trim()
         groupName = group.trim()
-        groupId = "${groupName}@${hardwareId}"
+        // a re-host keeps the ORIGINAL group id (a rename changed only the
+        // display name; the id keys history + password)
+        this.groupId = groupId ?: "${groupName}@${hardwareId}"
         myIpAddress = getLocalIpAddress()
         if (password != null) groupPassword = password
     }
@@ -537,11 +571,84 @@ class P2PManager(
         get() = joinId
 
     /** Stable 8-digit group ID derived from the machine fingerprint and the
-     *  group name — the join identifier, separate from the display name. */
+     *  group name — the join identifier, separate from the display name. A
+     *  join id set with [setJoinId] wins: the owner may RENAME the group
+     *  (group_update) and the numeric id must stay the same, or every
+     *  member's saved join id would stop matching. */
     val numericGroupId: String
-        get() = numericGroupIdOf(groupName, hardwareId)
+        get() = joinId.ifBlank { numericGroupIdOf(groupName, hardwareId) }
 
     val currentGroupPassword: String get() = groupPassword
+
+    val currentGroupAnnouncement: String get() = groupAnnouncement
+
+    /** Owner-only: publish a new display name and/or announcement. Applies
+     *  locally, re-registers the renamed host group, broadcasts a group_update
+     *  and notifies the ViewModel to persist. */
+    fun sendGroupUpdate(newName: String?, announcement: String?): Boolean {
+        if (!isHost) return false
+        val name = newName?.trim().orEmpty()
+        if (name.isEmpty() && announcement == null) return false
+        val oldName = groupName
+        if (name.isNotEmpty()) groupName = name
+        if (announcement != null) groupAnnouncement = announcement
+        if (groupName != oldName) hostServer.renameRegistration(this, oldName)
+        val packet = NetworkPacket(
+            type = "group_update",
+            groupId = groupId,
+            senderId = myId,
+            groupName = name.ifEmpty { null },
+            announcement = announcement
+        )
+        sendScope.launch {
+            try {
+                broadcastToClients(packet)
+            } catch (e: Exception) {
+                Log.w(TAG, "sendGroupUpdate failed", e)
+            }
+        }
+        adminNotify?.invoke()
+        return true
+    }
+
+    /** Owner-only: remove a member. The target gets a directed kick_member
+     *  (then its connection is closed); everyone else gets the broadcast so it
+     *  drops the target. Returns false when the target is not connected. */
+    fun kickMember(targetId: String): Boolean {
+        if (!isHost || targetId.isBlank()) return false
+        val conn = connectedClients.remove(targetId) ?: return false
+        _peers.update { it - targetId }
+        val packet = NetworkPacket(
+            type = "kick_member",
+            groupId = groupId,
+            senderId = myId,
+            targetId = targetId
+        )
+        sendScope.launch {
+            try {
+                conn.wire.sendPacket(packet)
+                // give the directed packet a moment to flush, then detach
+                broadcastToClients(packet, exclude = targetId)
+                delay(500)
+                runCatching { conn.socket.close() }
+            } catch (e: Exception) {
+                Log.w(TAG, "kickMember failed", e)
+                runCatching { conn.socket.close() }
+            }
+        }
+        adminNotify?.invoke()
+        return true
+    }
+
+    /** The group creator (owner) device id: the host is the creator, a member
+     *  learned it when joining. Empty means unknown -> owner packets are
+     *  refused (fail-closed). */
+    private fun creatorId(): String {
+        val gid = groupId
+        if (gid.isEmpty()) return ""
+        if (isHost) return myId
+        return ChatApp.savedGroupCreatorId(context, gid)
+    }
 
     val currentPort: Int get() = port
 
@@ -667,6 +774,7 @@ class P2PManager(
                         when {
                             response.type == "join_ack" && response.members != null -> {
                                 groupId = response.groupId ?: groupId
+                                response.announcement?.let { groupAnnouncement = it }
                                 response.members.forEach { peer ->
                                     if (peer.id != myId) {
                                         _peers.update { it + (peer.id to peer) }
@@ -767,6 +875,7 @@ class P2PManager(
                 )
                 val response = wire.recvPacket() ?: throw IllegalStateException("no ack")
                 if (response.type == "join_ack") {
+                    response.announcement?.let { groupAnnouncement = it }
                     response.members?.forEach { peer ->
                         if (peer.id != myId) {
                             _peers.update { it + (peer.id to peer) }
@@ -873,6 +982,9 @@ class P2PManager(
             type = "join_ack",
             groupId = groupId,
             members = allMembers,
+            // the owner's current announcement so a newcomer sees it at once
+            // (omitted when empty, matching kotlinx.serialization defaults)
+            announcement = groupAnnouncement.ifEmpty { null },
             deletedIds = deletedIdsProvider?.invoke(groupId).orEmpty().ifEmpty { null }
         )
         wire.sendPacket(ack)
@@ -956,6 +1068,8 @@ class P2PManager(
             "peer_left" -> packet.peer?.id?.let { peerId ->
                 _peers.update { it - peerId }
             }
+            "group_update" -> handleGroupUpdateAsClient(packet)
+            "kick_member" -> handleKickAsClient(packet)
             "delete_message" -> {
                 val id = packet.messageId
                 val sender = packet.senderId
@@ -997,7 +1111,76 @@ class P2PManager(
         }
     }
 
+    /** A relayed owner packet whose senderId is not the creator (or an unknown
+     *  creator) is ignored and the host connection dropped (fail-closed). */
+    private fun handleGroupUpdateAsClient(packet: NetworkPacket) {
+        val creator = creatorId()
+        if (creator.isEmpty() || packet.senderId != creator) {
+            Log.w(TAG, "reject group_update from ${packet.senderId}: not the group owner ($creator)")
+            disconnectFromHost()
+            return
+        }
+        var changed = false
+        val name = packet.groupName?.trim().orEmpty()
+        if (name.isNotEmpty() && name != groupName) {
+            groupName = name
+            changed = true
+        }
+        packet.announcement?.let {
+            groupAnnouncement = it
+            changed = true
+        }
+        if (changed) adminNotify?.invoke()
+        // forward to members whose own host relay is down (no re-forward there)
+        GroupMeshManager.broadcastAdmin(groupId, packet)
+    }
+
+    private fun handleKickAsClient(packet: NetworkPacket) {
+        val creator = creatorId()
+        if (creator.isEmpty() || packet.senderId != creator) {
+            Log.w(TAG, "reject kick_member from ${packet.senderId}: not the group owner ($creator)")
+            disconnectFromHost()
+            return
+        }
+        val target = packet.targetId ?: return
+        if (target == myId) {
+            if (!kickedFromGroup) {
+                kickedFromGroup = true
+                kickedNotify?.invoke()
+            }
+            return
+        }
+        _peers.update { it - target }
+        GroupMeshManager.broadcastAdmin(groupId, packet)
+        adminNotify?.invoke()
+    }
+
+    /** Drop the host relay after a protocol violation: the read loop's cleanup
+     *  then publishes connectionLost so the UI can reconnect. */
+    private fun disconnectFromHost() {
+        runCatching { hostConnection?.close() }
+    }
+
+    /** Detach one member after a protocol violation and tell the others. */
+    private fun dropClient(peerId: String) {
+        val conn = connectedClients.remove(peerId)
+        _peers.update { it - peerId }
+        runCatching { conn?.socket?.close() }
+        broadcastToClients(
+            NetworkPacket(type = "peer_left", peer = Peer(peerId, "", "", 0)),
+            exclude = peerId
+        )
+    }
+
     private fun processPacketFromClient(packet: NetworkPacket, senderId: String) {
+        if (packet.type == "group_update" || packet.type == "kick_member") {
+            // only the group owner (creator) may send management packets; the
+            // owner is this host, so a member sending one is a protocol
+            // violation: drop it and detach that member
+            Log.w(TAG, "reject ${packet.type} from member $senderId: only the group owner may send it")
+            dropClient(senderId)
+            return
+        }
         when (packet.type) {
             "chat", "file_message" -> packet.message?.let { msg ->
                 if (msg.senderId != senderId || !isValidContent(msg.content)) {
@@ -1183,6 +1366,19 @@ class P2PManager(
     private fun broadcastPeerLeft(peerId: String) {
         val packet = NetworkPacket(type = "peer_left", peer = Peer(id = peerId, name = "", ipAddress = "", port = 0))
         broadcastToClients(packet, exclude = peerId)
+    }
+
+    /** Apply an owner group_update received over the mesh (the mesh layer
+     *  already validated senderId against the creator). No rebroadcast: the
+     *  mesh is a complete graph. */
+    fun applyRemoteGroupUpdate(newName: String?, announcement: String?) {
+        if (!newName.isNullOrEmpty()) groupName = newName
+        if (announcement != null) groupAnnouncement = announcement
+    }
+
+    /** Drop a member locally after receiving the owner's kick broadcast. */
+    fun removePeerLocally(peerId: String) {
+        _peers.update { it - peerId }
     }
 
     /** Remove a message locally because a delete arrived over the group mesh

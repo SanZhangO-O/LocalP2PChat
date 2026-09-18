@@ -50,7 +50,10 @@ fun PeerListScreen(
     onLeave: () -> Unit,
     onBack: () -> Unit,
     onOpenChat: () -> Unit,
-    onCallPeer: (String) -> Unit = {}
+    onCallPeer: (String) -> Unit = {},
+    announcement: String = "",
+    onUpdateGroupInfo: (String?, String?) -> Unit = { _, _ -> },
+    onKickMember: (String) -> Unit = {}
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     val clipboard = LocalClipboard.current
@@ -68,6 +71,8 @@ fun PeerListScreen(
     }
 
     var showLeaveDialog by remember { mutableStateOf(false) }
+    var showGroupSettings by remember { mutableStateOf(false) }
+    var pendingKick by remember { mutableStateOf<String?>(null) }
     // the group password is masked by default: it is a join secret, and
     // screenshots/overlays should not leak it
     var showPassword by remember { mutableStateOf(false) }
@@ -96,6 +101,15 @@ fun PeerListScreen(
                     }
                 },
                 actions = {
+                    if (isHost) {
+                        IconButton(onClick = { showGroupSettings = true }) {
+                            Icon(
+                                Icons.Filled.Edit,
+                                contentDescription = "群设置",
+                                tint = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
                     IconButton(onClick = onOpenChat) {
                         Icon(
                             Icons.AutoMirrored.Filled.Chat,
@@ -123,6 +137,32 @@ fun PeerListScreen(
                 .fillMaxSize()
                 .padding(padding)
         ) {
+            if (announcement.isNotBlank()) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer
+                    )
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                        Text(
+                            text = "群公告",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = announcement,
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                    }
+                }
+            }
             if (isHost) {
                 Card(
                     modifier = Modifier
@@ -363,7 +403,10 @@ fun PeerListScreen(
                             peer = entry.value,
                             onCall = {
                                 if (!connectionLost) onCallPeer(entry.value.id)
-                            }
+                            },
+                            onKick = if (isHost) {
+                                { pendingKick = entry.value.id }
+                            } else null
                         )
                     }
                 }
@@ -393,13 +436,81 @@ fun PeerListScreen(
             }
         )
     }
+
+    pendingKick?.let { peerId ->
+        val name = peers[peerId]?.name ?: peerId
+        AlertDialog(
+            onDismissRequest = { pendingKick = null },
+            title = { Text("移出成员") },
+            text = { Text("确定要将 $name 移出群组吗？\n对方将立即断开连接，且无法再收到本群消息。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingKick = null
+                        onKickMember(peerId)
+                    }
+                ) {
+                    Text("移出", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingKick = null }) { Text("取消") }
+            }
+        )
+    }
+
+    if (showGroupSettings) {
+        var nameText by remember { mutableStateOf(groupName) }
+        var announcementText by remember { mutableStateOf(announcement) }
+        AlertDialog(
+            onDismissRequest = { showGroupSettings = false },
+            title = { Text("群设置") },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = nameText,
+                        onValueChange = { nameText = it.take(20) },
+                        singleLine = true,
+                        label = { Text("群名称") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = announcementText,
+                        onValueChange = { announcementText = it },
+                        label = { Text("群公告") },
+                        placeholder = { Text("留空则清除公告") },
+                        minLines = 3,
+                        maxLines = 5,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (nameText.isNotBlank()) {
+                            showGroupSettings = false
+                            onUpdateGroupInfo(nameText.trim(), announcementText.trim())
+                        }
+                    }
+                ) {
+                    Text("保存")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showGroupSettings = false }) { Text("取消") }
+            }
+        )
+    }
 }
 
 @Composable
 private fun PeerItem(
     peer: com.zqr.localchat.data.Peer,
     isSelf: Boolean = false,
-    onCall: (() -> Unit)? = null
+    onCall: (() -> Unit)? = null,
+    onKick: (() -> Unit)? = null
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -463,6 +574,15 @@ private fun PeerItem(
                         Icons.Filled.Videocam,
                         contentDescription = "视频通话",
                         tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+            if (!isSelf && onKick != null) {
+                IconButton(onClick = onKick) {
+                    Icon(
+                        Icons.Filled.PersonRemove,
+                        contentDescription = "移出群组",
+                        tint = MaterialTheme.colorScheme.error
                     )
                 }
             }

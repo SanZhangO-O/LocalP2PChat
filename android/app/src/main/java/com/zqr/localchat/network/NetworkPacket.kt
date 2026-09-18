@@ -58,5 +58,10 @@ data class NetworkPacket(
      *  direction, strictly 1,2,3,...) INSIDE the GCM-protected JSON, so the
      *  receiver can reject replayed/reordered/injected lines. Never set by
      *  application code; null is omitted on the wire. */
-    val seq: Long? = null
+    val seq: Long? = null,
+    /** group_update (owner-only): a new display name and/or announcement.
+     *  Both optional; null means "unchanged" and is omitted on the wire, so
+     *  the bytes match the Windows peer's output. */
+    val groupName: String? = null,
+    val announcement: String? = null
 )
