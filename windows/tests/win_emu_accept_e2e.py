@@ -226,6 +226,24 @@ def main() -> int:
     screenshot("accept_emu_received_win")
     log(f"Android UI shows {MSG_WIN}: PASS")
 
+    # ---- 6b) read_receipt: the phone acknowledges the plain chat it just
+    #          received, so the PC's own message must flip to 已读 — the
+    #          cross-platform check of the new read_receipt packet ----
+    log("== waiting for the phone's read_receipt ==")
+    own_msg = None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.2)
+        own_msg = next(
+            (m for m in vm.direct_messages(peer_id) if m.content == MSG_WIN), None
+        )
+        if own_msg is not None and own_msg.read:
+            break
+    if own_msg is None or not own_msg.read:
+        raise RuntimeError("the phone's read_receipt never marked the PC message read")
+    log("phone read_receipt flips the PC bubble to \u5df2\u8bfb: PASS")
+
     # ---- 6) Android replies; Windows chat page must render it ----
     log(f"== Android replies {MSG_EMU} ==")
     back_to_member_list()
