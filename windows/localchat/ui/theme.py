@@ -33,6 +33,51 @@ QWidget {{
     font-family: {FONT_FAMILY};
     font-size: 14px;
 }}
+QLabel#chatTitle {{
+    font-size: 17px;
+    font-weight: 700;
+    color: {TEXT};
+}}
+QLabel#chatStatus {{
+    font-size: 12px;
+    color: {TEXT_SUBTLE};
+}}
+QFrame#chatHeader {{
+    background: {SURFACE};
+    border-bottom: 1px solid #ECEAF1;
+}}
+QFrame#composer {{
+    background: {SURFACE};
+    border-top: 1px solid #ECEAF1;
+}}
+QPushButton#composerAction {{
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    padding: 0px;
+    font-size: 18px;
+    color: {TEXT};
+}}
+QPushButton#composerAction:hover {{
+    background: rgba(103, 80, 164, 0.08);
+}}
+QPushButton#composerAction:disabled {{
+    color: {TEXT_FAINT};
+}}
+QPushButton#composerText {{
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    padding: 0 10px;
+    font-size: 13px;
+    color: {TEXT};
+}}
+QPushButton#composerText:hover {{
+    background: rgba(103, 80, 164, 0.08);
+}}
+QPushButton#composerText:disabled {{
+    color: {TEXT_FAINT};
+}}
 QLabel#pageTitle {{
     font-size: 24px;
     font-weight: 600;
@@ -149,7 +194,7 @@ QLineEdit:disabled {{
 QTextEdit {{
     background: {SURFACE};
     border: 1px solid {OUTLINE};
-    border-radius: 16px;
+    border-radius: 12px;
     padding: 8px 12px;
     selection-background-color: {PRIMARY};
     selection-color: white;

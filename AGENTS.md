@@ -75,6 +75,12 @@ README「版本兼容说明」承诺：**聊天、文件、群组在版本不一
   页面 `teardown()`。详见 `docs/LESSONS.md` 2026-09-19 续报 4。
 - 离屏 GUI 测试要沿真实 UI 路径操作（点击行、`page.open_chat()`）。
   直接调 `vm.open_direct_chat()` 不会设置 `page._peer_id`，页面不刷新，会造成假失败。
+- **输入框不要和按钮同排放 `AlignBottom`**：`QTextEdit` 默认 sizeHint 约 120px，
+  会把行撑高、按钮只贴底边（表现为「大方块 + 左下角一排按钮」）。聊天底部固定为
+  「输入框独占一行（`DroppableTextEdit.enable_auto_grow()`，40→120px）+ 下方
+  action row」，样式见 `theme.py` 的 `composer`/`composerAction`/`composerText`；
+  改按钮结构同步更新 `windows/tests/_real_gui_win.py`、`_real_exe_gui.py` 的坐标点击。
+  详见 `docs/LESSONS.md` 2026-09-19 续报 6。
 
 ## 5. 安全校验不要为兼容放宽
 

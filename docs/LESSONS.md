@@ -261,3 +261,23 @@
   `android/tools/emulator_e2e.py`（以及 `windows/tests` 里任何 adb 驱动脚本）里的
   desc；底部输入行只放高频三件套，其余动作一律进「+」面板。
 
+## 2026-09-19 续报 6：Windows 输入框不约束高度，按钮贴着底边漂在左下角
+
+- 现象: 群聊/直聊底部把 通话/语音/📎/😀/🎤 与 `QTextEdit` 放进同一个
+  `QHBoxLayout`，按钮全部 `AlignmentFlag.AlignBottom`。QTextEdit 默认 sizeHint
+  约 120px，输入框变成一个半空的大方块，按钮只贴到它的底边，视觉上像浮在
+  输入框左下方，和发送按钮基线也对不齐。
+- 根因: `AlignBottom` 只决定按钮在行内的位置，不会让行高收敛到按钮高度；
+  QTextEdit 不设约束就按 sizeHint（含滚动区）占高。
+- 修复: 输入框独占一整行并 `DroppableTextEdit.enable_auto_grow()`
+  （`widgets.py`：起步 40px、随文档长到 120px，`resizeEvent` 重算以处理换行），
+  动作按钮移到下方独立 action row，发送按钮固定在行尾；底部容器改为
+  `QFrame#composer`、头部 `QFrame#chatHeader`（白底 + 1px 分隔线），新增
+  `composerAction` / `composerText` 按钮样式（`theme.py`）。
+- 验证: 离屏渲染 `DirectChatPage` / `ChatPage`（920x680）确认空输入 42px、6 行
+  草稿长到 122px、清空回落 42px，按钮与发送同一基线；
+  `windows/tests/_real_gui_win.py`、`_real_exe_gui.py` 的坐标点击已同步为
+  输入行 `b-72`、发送 `b-28`。
+- 防再犯: 输入框不要和按钮同排放 `AlignBottom` 对齐；底部动作统一走 composer
+  的独立 action row，输入框高度由 `enable_auto_grow` 管理。
+

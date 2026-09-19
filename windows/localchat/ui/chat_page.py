@@ -1374,14 +1374,15 @@ class ChatPage(QWidget):
         layout.setSpacing(0)
 
         header = QFrame()
+        header.setObjectName("chatHeader")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(16, 12, 16, 8)
+        header_layout.setContentsMargins(16, 10, 16, 10)
         back_btn = QPushButton("← 返回")
         back_btn.setObjectName("ghost")
         back_btn.clicked.connect(self.on_back)
         header_layout.addWidget(back_btn)
         self.title_label = QLabel("")
-        self.title_label.setStyleSheet("font-size: 16px; font-weight: 700;")
+        self.title_label.setObjectName("chatTitle")
         header_layout.addWidget(self.title_label, 1)
         layout.addWidget(header)
 
@@ -1389,7 +1390,8 @@ class ChatPage(QWidget):
         # composing; hidden otherwise.
         self.typing_label = QLabel("")
         self.typing_label.setStyleSheet(
-            "font-size: 11px; color: #6B6875; padding: 0 16px 4px 16px;"
+            "font-size: 11px; color: #6B6875; padding: 2px 16px 6px 16px;"
+            "background: #FFFFFF;"
         )
         self.typing_label.hide()
         layout.addWidget(self.typing_label)
@@ -1485,9 +1487,10 @@ class ChatPage(QWidget):
         layout.addWidget(self.list_view, 1)
 
         bottom = QFrame()
+        bottom.setObjectName("composer")
         bottom_layout = QVBoxLayout(bottom)
-        bottom_layout.setContentsMargins(14, 8, 14, 12)
-        bottom_layout.setSpacing(2)
+        bottom_layout.setContentsMargins(14, 8, 14, 10)
+        bottom_layout.setSpacing(6)
         # Reply/quote bar: hidden until the user picks 回复 on a message; shows
         # what will be quoted and lets the user cancel it.
         self.reply_bar = QFrame()
@@ -1514,8 +1517,16 @@ class ChatPage(QWidget):
         reply_layout.addWidget(self.reply_cancel_btn)
         self.reply_bar.hide()
         bottom_layout.addWidget(self.reply_bar)
-        input_row = QHBoxLayout()
-        input_row.setSpacing(8)
+
+        # Compose on its own full-width line, with a single action row under
+        # it: the buttons then share one baseline instead of being
+        # bottom-aligned against a tall, half-empty text box.
+        self.input_edit = ChatInput(self._send_input, self._send_files)
+        self.input_edit.enable_auto_grow()
+        bottom_layout.addWidget(self.input_edit)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(6)
         self.file_btn = QPushButton()
         if getattr(sys, "_MEIPASS", None):
             icon_path = os.path.join(
@@ -1527,17 +1538,17 @@ class ChatPage(QWidget):
             )
         self.file_btn.setIcon(QIcon(icon_path))
         self.file_btn.setIconSize(QSize(20, 20))
-        self.file_btn.setObjectName("ghost")
-        self.file_btn.setFixedSize(40, 40)
+        self.file_btn.setObjectName("composerAction")
+        self.file_btn.setFixedSize(36, 36)
         self.file_btn.setToolTip("发送文件")
         self.file_btn.clicked.connect(self._pick_file)
-        input_row.addWidget(self.file_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        action_row.addWidget(self.file_btn)
         self.emoji_btn = QPushButton("😀")
-        self.emoji_btn.setObjectName("ghost")
-        self.emoji_btn.setFixedSize(40, 40)
+        self.emoji_btn.setObjectName("composerAction")
+        self.emoji_btn.setFixedSize(36, 36)
         self.emoji_btn.setToolTip("表情")
         self.emoji_btn.clicked.connect(self._toggle_emoji_panel)
-        input_row.addWidget(self.emoji_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        action_row.addWidget(self.emoji_btn)
         # Voice-message recording: press to start, press again to send (a
         # long-press would fight the button semantics, so the state is shown
         # on the button itself). Hidden entirely without sounddevice.
@@ -1548,26 +1559,25 @@ class ChatPage(QWidget):
         self._voice_timer.setInterval(250)
         self._voice_timer.timeout.connect(self._tick_voice_recording)
         self.voice_btn = QPushButton("🎤")
-        self.voice_btn.setObjectName("ghost")
-        self.voice_btn.setFixedSize(40, 40)
+        self.voice_btn.setObjectName("composerAction")
+        self.voice_btn.setFixedSize(36, 36)
         self.voice_btn.setToolTip("按住状态录制语音消息：点击开始，再点发送")
         self.voice_btn.clicked.connect(self._toggle_voice_recording)
         if audio_note.audio_available():
-            input_row.addWidget(self.voice_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+            action_row.addWidget(self.voice_btn)
         else:
             self.voice_btn.hide()
-        self.input_edit = ChatInput(self._send_input, self._send_files)
-        input_row.addWidget(self.input_edit, 1)
-        self.send_btn = QPushButton("发送")
-        self.send_btn.setMinimumSize(80, 40)
-        self.send_btn.clicked.connect(self._send_input)
-        input_row.addWidget(self.send_btn, alignment=Qt.AlignmentFlag.AlignBottom)
-        bottom_layout.addLayout(input_row)
+        action_row.addStretch(1)
         self.count_label = QLabel("")
         self.count_label.setObjectName("faint")
         self.count_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.count_label.hide()
-        bottom_layout.addWidget(self.count_label)
+        action_row.addWidget(self.count_label)
+        self.send_btn = QPushButton("发送")
+        self.send_btn.setMinimumSize(84, 36)
+        self.send_btn.clicked.connect(self._send_input)
+        action_row.addWidget(self.send_btn)
+        bottom_layout.addLayout(action_row)
         layout.addWidget(bottom)
 
         self.input_edit.textChanged.connect(self._on_input_changed)

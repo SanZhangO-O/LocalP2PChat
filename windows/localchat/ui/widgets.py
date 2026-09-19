@@ -67,6 +67,36 @@ class DroppableTextEdit(QTextEdit):
         self.on_send = on_send
         self.on_files_dropped = on_files_dropped
         self.setAcceptDrops(True)
+        self._grow_min = None
+        self._grow_max = None
+
+    def enable_auto_grow(self, min_height: int = 40, max_height: int = 120) -> None:
+        """Start compact at [min_height] and grow with the document up to
+        [max_height], then scroll. A plain QTextEdit claims a ~120px sizeHint,
+        which left the composer half empty and bottom-aligned the action
+        buttons beside it."""
+        self._grow_min = min_height
+        self._grow_max = max_height
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.document().contentsChanged.connect(self._apply_auto_grow)
+        self._apply_auto_grow()
+
+    def _apply_auto_grow(self) -> None:
+        if self._grow_min is None:
+            return
+        layout = self.document().documentLayout()
+        content_h = int(layout.documentSize().height()) if layout is not None else 0
+        # padding (8px top + 8px bottom) + the 1px frame on each side
+        target = max(self._grow_min, min(self._grow_max, content_h + 18))
+        if target != self.height():
+            self.setFixedHeight(target)
+
+    def resizeEvent(self, event):
+        # a width change re-wraps the document, so the grown height must be
+        # recomputed (this also settles the height once the composer gets its
+        # real width after the first layout pass)
+        super().resizeEvent(event)
+        self._apply_auto_grow()
 
     @staticmethod
     def _local_paths(mime) -> list:
