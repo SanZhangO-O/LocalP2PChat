@@ -18,8 +18,10 @@ CHANNELS = 1
 SAMPWIDTH = 2
 
 try:  # optional dependency (windows/README.md): absent -> features degrade
+    import numpy as _np  # sounddevice callbacks deliver numpy buffers
     import sounddevice as _sd
 except Exception:  # pragma: no cover - depends on the environment
+    _np = None
     _sd = None
 
 
@@ -243,15 +245,18 @@ class VoicePlayer:
                 outdata.fill(0)
                 raise _sd.CallbackStop
             data = f.readframes(frames)
-            size = len(data)
-            if size == 0:
+            done = len(data) // (SAMPWIDTH * CHANNELS)
+            if done <= 0:
                 outdata.fill(0)
                 raise _sd.CallbackStop
-            if size < len(outdata):
-                outdata[:size] = data
-                outdata[size:] = b"\x00" * (len(outdata) - size)
+            # outdata is a numpy int16 buffer: raw bytes must be decoded
+            # via frombuffer (same as call.py), not assigned directly.
+            outdata[: done * CHANNELS] = _np.frombuffer(
+                data, dtype=_np.int16, count=done * CHANNELS
+            )
+            if done < frames:
+                outdata[done * CHANNELS :] = 0
                 raise _sd.CallbackStop
-            outdata[:] = data
 
         stream = None
         try:

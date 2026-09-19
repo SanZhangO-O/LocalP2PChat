@@ -734,6 +734,80 @@ class VoiceHelpersTest(unittest.TestCase):
         self.assertEqual(rec.stop(), "")
         self.assertEqual(rec.elapsed_seconds(), 0)
 
+    def test_playback_callback_decodes_pcm_bytes(self):
+        """Regression: VoicePlayer's callback assigned raw WAV bytes straight
+        into the numpy int16 outdata buffer, so every PortAudio callback died
+        with "invalid literal for int() with base 10" and inline voice
+        playback never produced sound. Frames must be decoded via frombuffer
+        (same pattern as call.py) and the tail padded with zeros."""
+        import wave as _wave
+
+        import numpy as np
+
+        from localchat import audio_note
+
+        if audio_note._np is None:  # pragma: no cover - optional dependency
+            self.skipTest("numpy unavailable")
+
+        class CallbackStop(Exception):
+            pass
+
+        captured = {}
+
+        class FakeStream:
+            active = True
+
+            def __init__(self, **kwargs):
+                captured["callback"] = kwargs["callback"]
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeSd:
+            CallbackStop = CallbackStop
+            OutputStream = FakeStream
+
+        # three non-trivial little-endian int16 samples
+        pcm = bytes((0x34, 0x12, 0x78, 0x56, 0x00, 0xFF))
+        path = os.path.join(self.dir.name, "play.wav")
+        with _wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(pcm)
+
+        orig_sd = audio_note._sd
+        audio_note._sd = FakeSd()
+        try:
+            player = audio_note.VoicePlayer()
+            self.assertTrue(player.play(path))
+        finally:
+            audio_note._sd = orig_sd
+
+        try:
+            callback = captured["callback"]
+            expected = np.frombuffer(pcm, dtype=np.int16)
+
+            # short read: pad the tail and stop the stream
+            out = np.zeros(8, dtype=np.int16)
+            with self.assertRaises(CallbackStop):
+                callback(out.reshape(-1, 1), 8, None, None)
+            np.testing.assert_array_equal(out[:3], expected)
+            self.assertTrue((out[3:] == 0).all())
+
+            # exact read: buffer full, no CallbackStop
+            out_full = np.zeros(3, dtype=np.int16)
+            callback(out_full.reshape(-1, 1), 3, None, None)
+            np.testing.assert_array_equal(out_full, expected)
+        finally:
+            player.stop()
+
 
 if __name__ == "__main__":
     unittest.main()
