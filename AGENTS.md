@@ -113,6 +113,11 @@ README「版本兼容说明」承诺：**聊天、文件、群组在版本不一
   `RandomAccessFile(file, "rw")`（或 `FileOutputStream(fd).getChannel()`）。
   曾导致录音 WAV 长度字段恒为 0，Windows 端 `wave` 读 0 帧、时长 0:00、播放无声。
   详见 `docs/LESSONS.md` 2026-09-19 续报 1。
+- **聊天底部输入行只有 `ChatInputBar`**（`ui/screen/ChatInputBar.kt`，群聊与直聊共用）：
+  行内只放「+ / 输入框 / 发送」，媒体、表情、语音都收在「+」面板里——
+  6 个动作按钮摊在同一行会把输入框挤没。改按钮结构/按钮 desc 时同步更新
+  `android/tools/emulator_e2e.py`（它按 `content-desc` 找节点，折叠后要先点
+  `更多发送选项`）。详见 `docs/LESSONS.md` 2026-09-19 续报 5。
 
 ## 7. 测试与验证
 

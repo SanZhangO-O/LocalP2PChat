@@ -1,15 +1,10 @@
 package com.zqr.localchat.ui.screen
 
-import android.Manifest
 import android.content.ClipData
-import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.media.ThumbnailUtils
 import android.provider.MediaStore
 import android.widget.Toast
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.core.content.ContextCompat
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -23,24 +18,18 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Forward
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
-import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.EmojiEmotions
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Reply
 import androidx.compose.material.icons.filled.Search
@@ -60,7 +49,6 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -311,22 +299,7 @@ fun ChatScreen(
             ).show()
         }
     }
-    // RECORD_AUDIO is a runtime permission: voice messages must ask for it
-    // like the call flow does — a fresh install that never placed a call has
-    // no grant, and AudioRecord then stays silent (an empty clip).
-    val recordPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            startVoiceRecording()
-        } else {
-            Toast.makeText(
-                context,
-                "未授予麦克风权限，无法录制语音（可在系统设置中开启）",
-                Toast.LENGTH_LONG
-            ).show()
-        }
-    }
+    // RECORD_AUDIO is a runtime permission, requested by ChatInputBar.
     // Leaving the screen must not keep the microphone capturing or the
     // MediaPlayer playing (both are native resources). onFinished is bound in
     // an effect (not the composition body) and unbound on dispose.
@@ -538,107 +511,25 @@ fun ChatScreen(
                     replyTarget?.let { target ->
                         ReplyComposeBar(target = target, onCancel = { replyTarget = null })
                     }
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.Bottom
-                    ) {
-                    IconButton(
-                        onClick = onPickFile,
-                        enabled = !connectionLost
-                    ) {
-                        Icon(
-                            Icons.Default.AttachFile,
-                            contentDescription = "发送文件",
-                            tint = if (!connectionLost)
-                                MaterialTheme.colorScheme.primary
-                            else
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    IconButton(
-                        onClick = onPickImage,
-                        enabled = !connectionLost
-                    ) {
-                        Icon(
-                            Icons.Default.Image,
-                            contentDescription = "发送图片",
-                            tint = if (!connectionLost)
-                                MaterialTheme.colorScheme.primary
-                            else
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    IconButton(
-                        onClick = onPickVideo,
-                        enabled = !connectionLost
-                    ) {
-                        Icon(
-                            Icons.Default.Movie,
-                            contentDescription = "发送视频",
-                            tint = if (!connectionLost)
-                                MaterialTheme.colorScheme.primary
-                            else
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    IconButton(
-                        onClick = onPickFolder,
-                        enabled = !connectionLost
-                    ) {
-                        Icon(
-                            Icons.Default.Folder,
-                            contentDescription = "发送文件夹",
-                            tint = if (!connectionLost)
-                                MaterialTheme.colorScheme.primary
-                            else
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(4.dp))
-                    IconButton(onClick = { emojiPickerOpen = true }) {
-                        Icon(
-                            Icons.Filled.EmojiEmotions,
-                            contentDescription = "表情",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                    IconButton(
-                        onClick = {
-                            if (voiceRecording) {
-                                finishVoiceRecording()
-                            } else if (!connectionLost) {
-                                val granted = ContextCompat.checkSelfPermission(
-                                    context, Manifest.permission.RECORD_AUDIO
-                                ) == PackageManager.PERMISSION_GRANTED
-                                if (granted) {
-                                    startVoiceRecording()
-                                } else {
-                                    recordPermissionLauncher.launch(
-                                        Manifest.permission.RECORD_AUDIO
-                                    )
-                                }
-                            }
-                        },
-                        enabled = !connectionLost || voiceRecording
-                    ) {
-                        Text(
-                            text = if (voiceRecording) "${voiceSeconds}s" else "🎤",
-                            fontSize = if (voiceRecording) 11.sp else 18.sp
-                        )
-                    }
-                    OutlinedTextField(
+                    ChatInputBar(
                         value = inputText,
                         onValueChange = {
                             inputText = it
                             if (it.text.isNotBlank()) onTyping()
                             mentionPickerOpen = it.text.endsWith("@") && members.isNotEmpty()
                         },
-                        placeholder = { Text("输入消息...") },
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(20.dp),
-                        minLines = 1,
+                        canSend = inputText.text.isNotBlank() && !contentTooLong && !connectionLost,
+                        onSend = { sendInput() },
+                        actionsEnabled = !connectionLost,
+                        onPickFile = onPickFile,
+                        onPickImage = onPickImage,
+                        onPickVideo = onPickVideo,
+                        onPickFolder = onPickFolder,
+                        onEmoji = { emojiPickerOpen = true },
+                        onVoiceStart = { startVoiceRecording() },
+                        onVoiceStop = { finishVoiceRecording() },
+                        voiceRecording = voiceRecording,
+                        voiceSeconds = voiceSeconds,
                         maxLines = 5,
                         isError = contentTooLong,
                         supportingText = if (contentTooLong) {
@@ -647,25 +538,8 @@ fun ChatScreen(
                             { Text("${inputText.text.length}/${P2PManager.MAX_CONTENT_LENGTH}") }
                         } else {
                             null
-                        },
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                        keyboardActions = KeyboardActions(onSend = { sendInput() })
+                        }
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    IconButton(
-                        onClick = { sendInput() },
-                        enabled = inputText.text.isNotBlank() && !contentTooLong && !connectionLost
-                    ) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.Send,
-                            contentDescription = "发送",
-                            tint = if (inputText.text.isNotBlank() && !contentTooLong && !connectionLost)
-                                MaterialTheme.colorScheme.primary
-                            else
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
             }
         }
     }

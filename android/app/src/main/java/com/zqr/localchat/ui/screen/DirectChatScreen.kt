@@ -1,11 +1,6 @@
 package com.zqr.localchat.ui.screen
 
-import android.Manifest
-import android.content.pm.PackageManager
 import android.widget.Toast
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.core.content.ContextCompat
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -17,14 +12,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.EmojiEmotions
-import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Reply
 import androidx.compose.material.icons.filled.Search
@@ -38,6 +27,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -163,21 +153,7 @@ fun DirectChatScreen(
             ).show()
         }
     }
-    // RECORD_AUDIO is a runtime permission: voice messages must ask for it
-    // like the call flow does, or a fresh install silently records nothing.
-    val recordPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            startVoiceRecording()
-        } else {
-            Toast.makeText(
-                context,
-                "未授予麦克风权限，无法录制语音（可在系统设置中开启）",
-                Toast.LENGTH_LONG
-            ).show()
-        }
-    }
+    // RECORD_AUDIO is a runtime permission, requested by ChatInputBar.
     // Leaving the screen must not keep the microphone capturing or the
     // MediaPlayer playing (both are native resources). onFinished is bound in
     // an effect (not the composition body) and unbound on dispose.
@@ -529,110 +505,43 @@ fun DirectChatScreen(
             replyTarget?.let { target ->
                 ReplyComposeBar(target = target, onCancel = { replyTarget = null })
             }
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp)
-                    .imePadding(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(onClick = onPickFile, enabled = connected) {
-                    Icon(
-                        Icons.Filled.AttachFile,
-                        contentDescription = "发送文件",
-                        tint = if (connected) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                IconButton(onClick = onPickImage, enabled = connected) {
-                    Icon(
-                        Icons.Filled.Image,
-                        contentDescription = "发送图片",
-                        tint = if (connected) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                IconButton(onClick = onPickVideo, enabled = connected) {
-                    Icon(
-                        Icons.Filled.Movie,
-                        contentDescription = "发送视频",
-                        tint = if (connected) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                IconButton(onClick = onPickFolder, enabled = connected) {
-                    Icon(
-                        Icons.Filled.Folder,
-                        contentDescription = "发送文件夹",
-                        tint = if (connected) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                Spacer(modifier = Modifier.width(4.dp))
-                IconButton(onClick = { emojiPickerOpen = true }) {
-                    Icon(
-                        Icons.Filled.EmojiEmotions,
-                        contentDescription = "表情",
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                }
-                IconButton(
-                    onClick = {
-                        if (voiceRecording) {
-                            finishVoiceRecording()
-                        } else if (connected) {
-                            val granted = ContextCompat.checkSelfPermission(
-                                context, Manifest.permission.RECORD_AUDIO
-                            ) == PackageManager.PERMISSION_GRANTED
-                            if (granted) {
-                                startVoiceRecording()
-                            } else {
-                                recordPermissionLauncher.launch(
-                                    Manifest.permission.RECORD_AUDIO
-                                )
-                            }
+            ChatInputBar(
+                value = input,
+                onValueChange = {
+                    input = it
+                    if (it.text.isNotBlank()) onTyping()
+                },
+                canSend = input.text.isNotBlank() && !tooLong,
+                onSend = {
+                    if (input.text.isNotBlank() && !tooLong) {
+                        if (onSend(input.text, replyTarget)) {
+                            input = TextFieldValue("")
+                            replyTarget = null
+                        } else {
+                            Toast.makeText(context, "发送失败", Toast.LENGTH_SHORT).show()
                         }
-                    },
-                    enabled = connected || voiceRecording
-                ) {
-                    Text(
-                        text = if (voiceRecording) "${voiceSeconds}s" else "🎤",
-                        fontSize = if (voiceRecording) 11.sp else 18.sp
-                    )
-                }
-                OutlinedTextField(
-                    value = input,
-                    onValueChange = {
-                        input = it
-                        if (it.text.isNotBlank()) onTyping()
-                    },
-                    placeholder = { Text("输入消息...") },
-                    modifier = Modifier.weight(1f),
-                    maxLines = 4,
-                    isError = tooLong,
-                    supportingText = if (tooLong) {
-                        { Text("消息过长（最多 ${P2PManager.MAX_CONTENT_LENGTH} 字）") }
-                    } else {
-                        null
                     }
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                FilledIconButton(
-                    onClick = {
-                        if (input.text.isNotBlank() && !tooLong) {
-                            if (onSend(input.text, replyTarget)) {
-                                input = TextFieldValue("")
-                                replyTarget = null
-                            } else {
-                                Toast.makeText(context, "发送失败", Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                    },
-                    enabled = input.text.isNotBlank() && !tooLong
-                ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
-                }
-            }
+                },
+                actionsEnabled = connected,
+                onPickFile = onPickFile,
+                onPickImage = onPickImage,
+                onPickVideo = onPickVideo,
+                onPickFolder = onPickFolder,
+                onEmoji = { emojiPickerOpen = true },
+                onVoiceStart = { startVoiceRecording() },
+                onVoiceStop = { finishVoiceRecording() },
+                voiceRecording = voiceRecording,
+                voiceSeconds = voiceSeconds,
+                maxLines = 4,
+                imeAction = ImeAction.Default,
+                isError = tooLong,
+                supportingText = if (tooLong) {
+                    { Text("消息过长（最多 ${P2PManager.MAX_CONTENT_LENGTH} 字）") }
+                } else {
+                    null
+                },
+                modifier = Modifier.imePadding()
+            )
         }
         if (searchActive) {
             ChatSearchOverlay(

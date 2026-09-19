@@ -498,7 +498,10 @@ def test_file_transfer(serial_a: str, serial_b: str) -> None:
     tap_node_wait(serial_b, contains=GROUP_NAME)
     tap_node_wait(serial_b, desc="聊天")
     # A: file picker -> Downloads -> testfile.txt (pushed early in --test so the
-    # media index already knows it; wait for each picker state before tapping)
+    # media index already knows it; wait for each picker state before tapping).
+    # Media actions live behind the "+" panel since the row only keeps the
+    # attach toggle / input / send (six inline buttons squeezed the input off).
+    tap_node_wait(serial_a, desc="更多发送选项")
     tap_node_wait(serial_a, desc="发送文件")
     wait_node(serial_a, desc="Show roots", timeout=30)
     time.sleep(2)

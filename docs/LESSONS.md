@@ -247,3 +247,17 @@
   hide/teardown 路径显式停止；「60 秒后自动发送」这类延迟动作要绑定发起时的
   目标，页面切换时中止而不是让它落到当前会话。
 
+## 2026-09-19 续报 5：Android 输入行 6 个动作按钮与输入框同排，输入框被挤没
+
+- 现象: 群聊/直聊底部把 文件/图片/视频/文件夹/表情/语音 6 个 48dp IconButton
+  与 OutlinedTextField 放进同一个 Row，360dp 宽屏上输入框被压到几乎没有宽度。
+- 修复: 新增共用组件 `ui/screen/ChatInputBar.kt`（群聊与直聊都换用它）：行内只留
+  「+ 切换 / 输入框 / 发送」，6 个动作折叠进「+」面板（带文字标签 + 原
+  content-desc）；录音中「+」变成红色停止按钮并显示秒数，面板收起也能停止发送。
+- 验证: 同步改 `android/tools/emulator_e2e.py` 文件发送分支——先点
+  `desc="更多发送选项"` 再点 `desc="发送文件"`（折叠后按钮不在初始树上）；
+  建议 `cd android; .\gradlew.bat compileDebugKotlin`，再跑 `emulator_e2e.py`。
+- 防再犯: Android 自动化按 `content-desc` 找节点，挪动/折叠按钮必须同步更新
+  `android/tools/emulator_e2e.py`（以及 `windows/tests` 里任何 adb 驱动脚本）里的
+  desc；底部输入行只放高频三件套，其余动作一律进「+」面板。
+
