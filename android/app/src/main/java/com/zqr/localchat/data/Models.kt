@@ -163,9 +163,13 @@ data class ChatMessage(
 const val MAX_REPLY_PREVIEW = 120
 
 /** The quote snippet for replying to this message: newlines flattened and
- *  capped at [MAX_REPLY_PREVIEW] (Windows parity). */
-fun ChatMessage.replyPreviewText(): String =
-    content.replace('\n', ' ').trim().take(MAX_REPLY_PREVIEW)
+ *  capped at [MAX_REPLY_PREVIEW] (Windows parity); a file message with no
+ *  text falls back to the file name (same as the reply bar shows). */
+fun ChatMessage.replyPreviewText(): String {
+    val base = content.replace('\n', ' ').trim()
+    val preview = if (base.isNotEmpty() || fileInfo == null) base else fileInfo.fileName
+    return preview.take(MAX_REPLY_PREVIEW)
+}
 
 /** Inbound advisory metadata must never be trusted: a forged folderTotal (a
  *  display-only entry count) decodes to 0 = unknown once it exceeds the cap —

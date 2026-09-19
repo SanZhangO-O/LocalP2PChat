@@ -150,6 +150,11 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.store = store
         self.data_dir = data_dir
         self._lock = threading.RLock()
+        # set by shutdown(): afterwards every main-thread slot becomes a
+        # no-op, so a queued signal delivered by a LATER event pump (a
+        # subsequent test, a stale singleton callback) can never re-arm this
+        # ViewModel's timers or touch the closed store
+        self._shutdown_done = False
         # Persisted resume state for interrupted downloads (file_id -> staging
         # path / received bytes / the offer's address+key). Kept in the
         # encrypted settings blob so a paused download can continue after an
@@ -391,8 +396,11 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
 
     def _on_raw_tray(self, gid: str, sender_name: str, body: str) -> None:
         """Aggregate raw tray notifications arriving within the burst window.
+
         Runs on the main thread via the queued signal connection, so the
         QTimer is only ever touched from the main thread."""
+        if self._shutdown_done:
+            return
         if self._tray_accum is not None and self._tray_accum["gid"] != gid:
             # another group arrived mid-window: flush the accumulated bubble
             # first so its count/preview never bleed into the new group's
@@ -676,11 +684,16 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         TYPING_ACTIVE_INTERVAL, and active=false after TYPING_STOP_DELAY with
         no further activity. [send] receives the boolean active flag (kept in
         the state so the delayed stop reaches the same channel)."""
+        if self._shutdown_done:
+            return
         state = self._typing_out.get(scope_key)
         if state is None:
             timer = QTimer(self)
             timer.setSingleShot(True)
-            timer.timeout.connect(lambda key=scope_key: self._stop_typing(key))
+            # zero-parameter closure: a default-arg lambda connected to a
+            # signal is arity-fragile across PyQt's slot introspection (the
+            # "missing 1 required positional argument: 'key'" phantom)
+            timer.timeout.connect(lambda: self._stop_typing(scope_key))
             state = {"last": 0.0, "timer": timer, "send": send}
             self._typing_out[scope_key] = state
         else:
@@ -738,6 +751,8 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
 
     def _ensure_typing_timer(self) -> None:
         """Run the 1s expiry tick only while some indicator is live."""
+        if self._shutdown_done:
+            return
         with self._lock:
             has_any = bool(self._direct_typing) or bool(self._group_typing)
         if has_any and not self._typing_timer.isActive():
@@ -1244,7 +1259,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         if not dest:
             return None
         total = max(int(e.get("folderTotal") or 0) for e in entries) or len(entries)
-        return {"target": dest, "done": max(0, total - len(entries)), "total": total}
+        # the persisted counter only knows files this app actually saved;
+        # never present more than exist
+        done = min(total, max(0, self._resume_store.folder_done_count(folder_id)))
+        return {"target": dest, "done": done, "total": total}
 
     def _merged_offer(self, file_info: FileInfo) -> FileInfo:
         """Restore the address/per-file key of a paused offer. Offers rebuilt
@@ -1679,10 +1697,11 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         p2p = self._active_p2p()
         if p2p is None or not p2p.is_host:
             return False
-        if not p2p.kick_member(peer_id):
-            return False
+        # take the display name BEFORE the kick: kick_member pops the peer
         peer = p2p.peers.get(peer_id)
         name = peer.name if peer is not None else peer_id
+        if not p2p.kick_member(peer_id):
+            return False
         self.status_message.emit(f"已将 {name} 移出群组")
         return True
 
@@ -2750,6 +2769,12 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         root = os.path.join(dest_dir, sanitize_file_name(root_name)) if root_name else dest_dir
         root_abs = os.path.abspath(root)
         total = len(entries)
+        # a FRESH run counts completions from zero; a resume run (pending
+        # entries for this folder exist) keeps the persisted count — its
+        # already-saved files were counted by the run that saved them
+        resuming = bool(self._resume_store.folder_entries(folder_id))
+        if not resuming:
+            self._resume_store.reset_folder_done(folder_id)
         event, socks = self._register_download(key)
         ok_all = True
         message = ""
@@ -2783,6 +2808,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 complete = False
             if complete:
                 self._resume_store.remove(m.id)
+                if not resuming:
+                    # a fresh run found the file already on disk: count it
+                    # (a resume run counted it in the run that saved it)
+                    self._resume_store.bump_folder_done(folder_id)
                 self.folder_progress.emit(folder_id, index + 1, total)
                 continue
             if not fi.download_host or fi.download_port <= 0:
@@ -2827,6 +2856,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 ok_all = False
                 message = entry_message or "下载失败"
                 break
+            self._resume_store.bump_folder_done(folder_id)
             self.folder_progress.emit(folder_id, index + 1, total)
         self._finish_download(key)
         self.folder_download_finished.emit(folder_id, ok_all, root_abs if ok_all else message)
@@ -3211,6 +3241,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.join_ui_state_changed.emit()
 
     def shutdown(self) -> None:
+        self._shutdown_done = True
         self.call_manager.hangup()
         if self.pending_p2p is not None:
             self.pending_p2p.stop()
@@ -3220,6 +3251,17 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.direct.shutdown()
         self.mesh.shutdown()
         self.host_server.shutdown()
+        # stop every timer this ViewModel owns: a ViewModel that outlives its
+        # window (a test teardown that drops it, a future leak) must never
+        # have its slots fire from a later event pump in the same process
+        self._typing_timer.stop()
+        for state in self._typing_out.values():
+            state["timer"].stop()
+        self._typing_out.clear()
+        self._direct_typing.clear()
+        self._group_typing.clear()
+        self._tray_timer.stop()
+        self._tray_accum = None
         try:
             self.store.close()
         except Exception:

@@ -86,7 +86,8 @@ class DirectChatPage(QWidget):
         # folderId -> (status, detail) for folder cards
         self._folder_states: dict = {}
         # a search jump whose message is not in the list yet: retried on the
-        # next refresh
+        # next refresh. Carries (peer_id, message_id) so a re-activation of
+        # the SAME chat keeps the pending target.
         self._pending_reveal = None
         self._emoji_panel = None
         # folderId -> chosen destination directory (paused folder resume)
@@ -269,12 +270,18 @@ class DirectChatPage(QWidget):
         self._file_rates.clear()
         self._folder_states.clear()
         self._clear_reply()
-        self._pending_reveal = None
         self._folder_targets.clear()
         # use the real member id returned by the handshake so messages and the
         # session line up (a manually added contact starts with a placeholder)
         peer_id = self.vm.open_direct_chat(contact)
         self._peer_id = peer_id or contact.id
+        # a jump target belongs to the conversation it was requested from:
+        # drop it only when a DIFFERENT chat is opened
+        if (
+            self._pending_reveal is not None
+            and self._pending_reveal[0] != self._peer_id
+        ):
+            self._pending_reveal = None
         self._refresh()
 
     def _on_back(self):
@@ -341,11 +348,15 @@ class DirectChatPage(QWidget):
 
     def _reply_payload(self):
         """(reply_to, reply_preview, reply_sender) for the armed reply, or
-        (None, None, None) when not replying (Android parity cap)."""
+        (None, None, None) when not replying. The preview is capped like the
+        wire field (Android parity) and falls back to the file name for a
+        file message (same as the reply bar shows)."""
         target = self._reply_target
         if target is None:
             return None, None, None
         preview = (target.content or "").replace("\n", " ").strip()
+        if target.file_info is not None and not preview:
+            preview = target.file_info.file_name
         if len(preview) > MAX_REPLY_PREVIEW:
             preview = preview[:MAX_REPLY_PREVIEW]
         return target.id, preview, target.sender_name
@@ -431,7 +442,10 @@ class DirectChatPage(QWidget):
             else:
                 item.setData(payload, MSG_ROLE)
             self.model.appendRow(item)
-        if self._pending_reveal is not None and self.reveal_message(self._pending_reveal):
+        if (
+            self._pending_reveal is not None
+            and self.reveal_message(self._pending_reveal[1])
+        ):
             return
         self.list_view.scrollToBottom()
 
@@ -443,7 +457,7 @@ class DirectChatPage(QWidget):
         the list yet, so the next refresh retries."""
         row = self._find_row(message_id)
         if row is None:
-            self._pending_reveal = message_id
+            self._pending_reveal = (self._peer_id, message_id)
             return False
         self._pending_reveal = None
         self.list_view.scrollTo(

@@ -504,4 +504,22 @@ class NetworkProtocolTest {
             ChatMessage("m2", "  plain  ", 1L, "a", "A").replyPreviewText()
         )
     }
+
+    @Test
+    fun `replyPreviewText falls back to the file name`() {
+        // a file message has no text body: the quote header must not be blank
+        // (Windows chat_page._reply_payload parity)
+        val file = ChatMessage(
+            "m3", "", 1L, "a", "A",
+            fileInfo = FileInfo("f1", "报告.pdf", 10L, "", 0)
+        )
+        assertEquals("报告.pdf", file.replyPreviewText())
+        assertEquals(
+            "报告.pdf",
+            ChatMessage(
+                "m4", "  ", 1L, "a", "A",
+                fileInfo = FileInfo("f2", "报告.pdf", 10L, "", 0)
+            ).replyPreviewText()
+        )
+    }
 }

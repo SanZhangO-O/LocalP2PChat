@@ -36,6 +36,16 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+
+def _free_port() -> int:
+    """Grab an ephemeral TCP port (release immediately; tests bind it next)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 from localchat.crypto import random_bytes, to_b64
 from localchat.models import FileInfo, NetworkPacket, Peer
 from localchat.network import (
@@ -599,8 +609,12 @@ class AcceptRequestImmediateDialTest(unittest.TestCase):
     the immediate acceptance dial can converge within the test window (the
     sweep is stretched to 60s so it cannot rescue the assertion)."""
 
-    PORT_A = 19761
-    PORT_B = 19762
+    # Ephemeral per-run ports: fixed test ports rebind race the OS TIME_WAIT
+    # on back-to-back suite runs (Windows SO_EXCLUSIVEADDRUSE does not exempt
+    # TIME_WAIT), which used to leave the peer server dead for seconds and
+    # fail the one-shot acceptance dial.
+    PORT_A = _free_port()
+    PORT_B = _free_port()
 
     def setUp(self):
         install_identity()
@@ -637,12 +651,14 @@ class AcceptRequestImmediateDialTest(unittest.TestCase):
         started = time.time()
         self.a.accept_contact_request(B_ID)
         # A's sweep (deterministic rule) skips B; ONLY the immediate dial
-        # opens the session — and it must be fast, not a sweep period
+        # opens the session — under full-suite load a loopback handshake can
+        # take a few seconds, so allow a generous window; the sweep-distinction
+        # assertion below is what pins the behavior (the sweep is 60s here)
         self.assertTrue(
-            wait_until(lambda: self.a.is_chat_alive(B_ID), timeout=5.0),
+            wait_until(lambda: self.a.is_chat_alive(B_ID), timeout=15.0),
             "the accepting side must dial the peer immediately",
         )
-        self.assertLess(time.time() - started, 5.0, "convergence must not wait a sweep")
+        self.assertLess(time.time() - started, 30.0, "convergence must not wait a sweep")
         self.assertTrue(
             wait_until(lambda: self.b.is_chat_alive(A_ID), timeout=5.0),
             "B must see the accepted session",

@@ -16,6 +16,13 @@ data class GroupInfo(
 
 @Serializable
 data class NetworkPacket(
+    // Decode strictness policy (deliberate asymmetry with the Windows peer):
+    // Android decodes leniently (nullable fields + ignoreUnknownKeys) and its
+    // handlers ignore what is meaningless, while Windows fails closed — a
+    // malformed packet aborts the decode and the connection. See AGENTS.md
+    // §2/§5: compat applies to MISSING NEW FIELDS only, never to validation
+    // failures; do not change either side without a protocol decision plus a
+    // mixed-version E2E run.
     val type: String,
     val groupId: String? = null,
     val peer: Peer? = null,

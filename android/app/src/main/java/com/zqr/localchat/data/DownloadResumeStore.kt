@@ -5,6 +5,7 @@ import com.zqr.localchat.crypto.StoreCipher
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Persisted resume state for an interrupted file download (Windows parity).
@@ -21,6 +22,12 @@ import kotlinx.serialization.json.Json
  * Values are Keystore-wrapped via [StoreCipher] ("enc1:..." at rest): the
  * per-file AES key never sits in the prefs file in the clear. Entries are
  * removed on success and pruned oldest-first beyond [MAX_ENTRIES].
+ *
+ * Decoded entries are memoized in [cache]: every [StoreCipher] round trip is
+ * a Keystore + Cipher operation, and [put] runs [prune] → [all] on each
+ * progress write, so re-decoding the whole store per put is prohibitively
+ * expensive (the prefs file itself stays the source of truth; the cache is
+ * lazily filled and re-synced against the pref keys on every [all]).
  */
 @Serializable
 data class DownloadResumeEntry(
@@ -51,16 +58,25 @@ object DownloadResumeStore {
     private const val MAX_ENTRIES = 200
     private val json = Json { ignoreUnknownKeys = true }
 
+    private val cache = ConcurrentHashMap<String, DownloadResumeEntry>()
+
     private fun prefs(ctx: Context) =
         ctx.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    fun get(ctx: Context, fileId: String): DownloadResumeEntry? {
-        if (fileId.isEmpty()) return null
-        val raw = prefs(ctx).getString(PREFIX + fileId, null) ?: return null
+    private fun decode(fileId: String, raw: String): DownloadResumeEntry? {
         val entry = runCatching {
             json.decodeFromString<DownloadResumeEntry>(StoreCipher.unprotect(raw))
         }.getOrNull() ?: return null
         return if (entry.fileId == fileId) entry else null
+    }
+
+    fun get(ctx: Context, fileId: String): DownloadResumeEntry? {
+        if (fileId.isEmpty()) return null
+        cache[fileId]?.let { return it }
+        val raw = prefs(ctx).getString(PREFIX + fileId, null) ?: return null
+        val entry = decode(fileId, raw) ?: return null
+        cache[fileId] = entry
+        return entry
     }
 
     fun put(ctx: Context, entry: DownloadResumeEntry) {
@@ -68,18 +84,31 @@ object DownloadResumeStore {
         val stored = entry.copy(updatedAt = System.currentTimeMillis())
         val raw = StoreCipher.protect(json.encodeToString(stored))
         prefs(ctx).edit().putString(PREFIX + entry.fileId, raw).apply()
+        cache[entry.fileId] = stored
         prune(ctx)
     }
 
     fun remove(ctx: Context, fileId: String) {
         if (fileId.isEmpty()) return
         prefs(ctx).edit().remove(PREFIX + fileId).apply()
+        cache.remove(fileId)
     }
 
-    fun all(ctx: Context): List<DownloadResumeEntry> =
-        prefs(ctx).all.keys
+    fun all(ctx: Context): List<DownloadResumeEntry> {
+        val ids = prefs(ctx).all.keys
             .filter { it.startsWith(PREFIX) }
-            .mapNotNull { get(ctx, it.removePrefix(PREFIX)) }
+            .map { it.removePrefix(PREFIX) }
+            .toSet()
+        // drop evicted/removed ids, then decode only the misses (once per
+        // process lifetime per entry)
+        cache.keys.retainAll(ids)
+        for (id in ids) {
+            if (cache.containsKey(id)) continue
+            val raw = prefs(ctx).getString(PREFIX + id, null) ?: continue
+            decode(id, raw)?.let { cache[id] = it }
+        }
+        return cache.values.toList()
+    }
 
     private fun prune(ctx: Context) {
         val entries = all(ctx)

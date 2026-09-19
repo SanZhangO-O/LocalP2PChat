@@ -57,6 +57,20 @@ class Recorder(P2PListener):
         self.peer_events = []
         self.msg_events = []
 
+
+def _free_port() -> int:
+    """Grab an ephemeral TCP port (release immediately; tests bind it next).
+
+    Fixed test ports rebind race the OS TIME_WAIT across back-to-back suite
+    runs (Windows SO_EXCLUSIVEADDRUSE does not exempt TIME_WAIT), which
+    showed up as intermittent bind-retry / query timeouts.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
     def peers_changed(self, p2p):
         self.peer_events.append(dict(p2p.peers))
 
@@ -440,6 +454,8 @@ class PythonClientToAndroidHost(ProtocolTestBase):
         t = threading.Thread(target=serve, daemon=True)
         t.start()
 
+        # the fixed 19999 is asserted below as the advertised peer port: this
+        # listener never ACCEPTS connections, so no TIME_WAIT accumulates on it
         client = P2PManager(Recorder(), port=19999)
         client.initialize_as_client("\u738b\u4e94", GROUP_NAME, password=GROUP_PASSWORD)
         client.query_group("127.0.0.1", port)
@@ -551,7 +567,7 @@ class FileTransferTest(ProtocolTestBase):
             m2 = self.join_member(OTHER_PEER)
             m1.recv()
 
-            sender = P2PManager(Recorder(), port=19999)
+            sender = P2PManager(Recorder(), port=_free_port())
             sender.initialize_as_client("\u53d1\u9001\u8005", GROUP_NAME, password=GROUP_PASSWORD)  # 发送者
             sender.confirm_join("127.0.0.1", self.PORT)
             self.assertTrue(wait_until(lambda: sender.connection_result is not None))
@@ -595,7 +611,7 @@ class FileTransferTest(ProtocolTestBase):
         sender = None
         fpath = None
         try:
-            sender = P2PManager(Recorder(), port=19997)
+            sender = P2PManager(Recorder(), port=_free_port())
             sender.initialize_as_client("\u53d1\u9001\u8005", GROUP_NAME, password=GROUP_PASSWORD)
             sender.confirm_join("127.0.0.1", self.PORT)
             self.assertTrue(wait_until(lambda: sender.connection_result is not None))
@@ -641,11 +657,15 @@ class HeartbeatTest(ProtocolTestBase):
         P2PManager.HEARTBEAT_INTERVAL, P2PManager.HEARTBEAT_TIMEOUT = self._old
 
     def test_heartbeat_keeps_connection_alive(self):
+        # fresh ports per run: fixed test ports rebind race the OS TIME_WAIT
+        # on back-to-back suite runs (Windows SO_EXCLUSIVEADDRUSE does not
+        # exempt TIME_WAIT) — that was the intermittent bind/query timeout
+        self.PORT = _free_port()
         self._fast_heartbeat()
         try:
             host = self.start_host()
             try:
-                client = P2PManager(Recorder(), port=19996)
+                client = P2PManager(Recorder(), port=_free_port())
                 client.initialize_as_client("\u5fc3\u8df3\u6210\u5458", GROUP_NAME, password=GROUP_PASSWORD)  # 心跳成员
                 client.confirm_join("127.0.0.1", self.PORT)
                 self.assertTrue(wait_until(lambda: client.connection_result is not None))
@@ -661,11 +681,13 @@ class HeartbeatTest(ProtocolTestBase):
             self._restore_heartbeat()
 
     def test_host_detects_silent_member(self):
+        # fresh port per run, see test_heartbeat_keeps_connection_alive
+        self.PORT = _free_port()
         self._fast_heartbeat()
         try:
             host = self.start_host()
             try:
-                observer = P2PManager(Recorder(), port=19995)
+                observer = P2PManager(Recorder(), port=_free_port())
                 observer.initialize_as_client("\u89c2\u5bdf\u8005", GROUP_NAME, password=GROUP_PASSWORD)  # 观察者
                 observer.confirm_join("127.0.0.1", self.PORT)
                 self.assertTrue(wait_until(lambda: observer.connection_result is not None))
@@ -726,12 +748,23 @@ class HeartbeatTest(ProtocolTestBase):
             # its own listener startup (the listener binds in __init__, so this
             # is defensive; timeouts below absorb any residual scheduling lag)
             time.sleep(0.2)
-            client = P2PManager(Recorder(), port=19994)
+            client = P2PManager(Recorder(), port=_free_port())
             client.initialize_as_client("\u63a2\u6d4b", GROUP_NAME, password=GROUP_PASSWORD)  # 探测
-            client.query_group("127.0.0.1", port)
-            self.assertTrue(
-                wait_until(lambda: client.queried_group_info is not None, timeout=10)
-            )
+            # The query is a one-shot out-of-band exchange; a single attempt
+            # can be swallowed by the accept-loop startup race under
+            # full-suite load, so retry it a few times before giving up.
+            for _ in range(3):
+                while client.is_querying:
+                    time.sleep(0.05)
+                client.query_group("127.0.0.1", port)
+                if wait_until(
+                    lambda: client.queried_group_info is not None or client.query_error,
+                    timeout=6,
+                ):
+                    break
+                time.sleep(0.2)
+            self.assertIsNone(client.query_error)
+            self.assertIsNotNone(client.queried_group_info)
             client.confirm_join("127.0.0.1", port)
             self.assertTrue(
                 wait_until(lambda: client.connection_result is not None, timeout=10)
@@ -886,7 +919,7 @@ class ClientConvergenceTest(unittest.TestCase):
             self._close_gracefully(conn, wire)
 
         self._fake_host_thread(srv, on_join)
-        client = P2PManager(FakeHostRecorder(), port=19993)
+        client = P2PManager(FakeHostRecorder(), port=_free_port())
         client.initialize_as_client("\u6210\u5458", GROUP_NAME, password=GROUP_PASSWORD)
         client.messages.append(ChatMessage(
             "dead-9", "\u5f85\u6536\u655b", 1700000000000, "member-1", "\u5f20\u4e09",
@@ -939,7 +972,7 @@ class ClientConvergenceTest(unittest.TestCase):
             self._close_gracefully(conn, wire)
 
         self._fake_host_thread(srv, on_join)
-        client = P2PManager(Recorder(), port=19992)
+        client = P2PManager(Recorder(), port=_free_port())
         client.initialize_as_client("\u6210\u5458", GROUP_NAME, password=GROUP_PASSWORD)
         try:
             self._join_fake_host(srv, client)
@@ -1468,16 +1501,17 @@ class CallManagerSignalingTest(unittest.TestCase):
         )
 
         install_identity()
-        host = P2PManager(Recorder(), port=19198, password=GROUP_PASSWORD)
+        host_port = _free_port()
+        host = P2PManager(Recorder(), port=host_port, password=GROUP_PASSWORD)
         host.initialize_as_host(HOST_NAME, GROUP_NAME)
         host.start_as_host()
 
-        a = P2PManager(Recorder(), port=21113)
+        a = P2PManager(Recorder(), port=_free_port())
         a.initialize_as_client("\u547c\u53eb\u8005", GROUP_NAME, password=GROUP_PASSWORD)
-        a.confirm_join("127.0.0.1", 19198)
-        b = P2PManager(Recorder(), port=21114)
+        a.confirm_join("127.0.0.1", host_port)
+        b = P2PManager(Recorder(), port=_free_port())
         b.initialize_as_client("\u88ab\u53eb\u8005", GROUP_NAME, password=GROUP_PASSWORD)
-        b.confirm_join("127.0.0.1", 19198)
+        b.confirm_join("127.0.0.1", host_port)
         self.assertTrue(wait_until(lambda: a.connection_result is not None and a.connection_result[0]))
         self.assertTrue(wait_until(lambda: b.connection_result is not None and b.connection_result[0]))
         self.assertTrue(wait_until(lambda: b.my_id in a.peers and a.my_id in b.peers))

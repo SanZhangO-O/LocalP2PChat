@@ -1058,6 +1058,31 @@ class ViewModelFlowTest(unittest.TestCase):
         )
         self._vms = [vm]
 
+    def test_shutdown_stops_every_owned_timer(self):
+        # Regression for the leaked-ViewModel phantom: a ViewModel dropped
+        # after shutdown() used to keep armed timers whose slots fired from a
+        # LATER test's Qt event pump, crashing unrelated network tests.
+        # shutdown() must stop every timer the ViewModel owns.
+        network_module.TCP_PORT = 10112
+        db = _fresh_db("lc_test_shutdown_timers.db")
+        vm = make_vm(db)
+        self._vms = [vm]
+        # arm each timer family: the 1s typing-expiry tick, an outbound
+        # typing stop timer, and the tray aggregation timer
+        vm._on_direct_typing("peer-1", True)
+        vm.notify_direct_typing("peer-1")
+        vm._on_raw_tray("g", "alice", "hello")
+        from PyQt6.QtCore import QTimer
+
+        armed = [t for t in vm.findChildren(QTimer) if t.isActive()]
+        self.assertTrue(armed, "typing/tray activity must arm timers")
+        vm.shutdown()
+        self.assertEqual(
+            [t for t in vm.findChildren(QTimer) if t.isActive()],
+            [],
+            "shutdown must stop every timer the ViewModel owns",
+        )
+
     def test_leave_client_group_keeps_group_and_rejoins(self):
         port = 10007
         network_module.TCP_PORT = port
@@ -2271,6 +2296,41 @@ class ViewModelFlowTest(unittest.TestCase):
         self.assertEqual(page.input_edit.toPlainText(), "")
         page.deleteLater()
 
+    def test_reply_payload_falls_back_to_file_name(self):
+        """Replying to a file message (empty text body) must quote the file
+        name, matching what the reply bar shows — an empty replyPreview on the
+        wire renders a blank quote header on the receiver."""
+        from localchat.models import ChatMessage, FileInfo
+        from localchat.ui.direct_chat_page import DirectChatPage
+
+        network_module.TCP_PORT = 10056
+        vm = make_vm(_fresh_db("lc_ui_reply_file.db"))
+        self._vms = [vm]
+        page = DirectChatPage(vm, lambda: None)
+        page._peer_id = "dev-2"
+
+        target = ChatMessage(
+            id="f0",
+            content="",
+            timestamp=1700000000000,
+            sender_id="dev-2",
+            sender_name="\u5c0f\u4e59",
+            file_info=FileInfo(
+                file_id="f0",
+                file_name="\u62a5\u544a.pdf",
+                file_size=10,
+                download_host="",
+                download_port=0,
+            ),
+        )
+        page._set_reply_target(target)
+        self.assertIn("\u62a5\u544a.pdf", page.reply_label.text())
+        rid, preview, sender = page._reply_payload()
+        self.assertEqual(rid, "f0")
+        self.assertEqual(preview, "\u62a5\u544a.pdf")
+        self.assertEqual(sender, "\u5c0f\u4e59")
+        page.deleteLater()
+
     def test_group_page_shows_typing_names(self):
         """ChatPage renders 群成员正在输入 from the ViewModel's live indicator
         set and hides it once the set empties."""
@@ -2420,8 +2480,12 @@ class ViewModelFlowTest(unittest.TestCase):
 
         page.keyword_edit.setText("\u627e\u5230\u6211")
         page._run_search()
-        self.pump()
-        self.assertEqual(page.results.count(), 1, "the hit must be listed")
+        # the search runs on a worker thread and lands via a queued signal:
+        # pump until the result is rendered
+        self.assertTrue(
+            wait_until(lambda: page.results.count() == 1, pump=self.pump),
+            "the hit must be listed",
+        )
         card_text = message_preview(
             page.results.item(0).data(Qt.ItemDataRole.UserRole)["message"]
         )

@@ -619,10 +619,14 @@ class P2PManager(
 
     /** Owner-only: remove a member. The target gets a directed kick_member
      *  (then its connection is closed); everyone else gets the broadcast so it
-     *  drops the target. Returns false when the target is not connected. */
+     *  drops the target. An offline member (known but not connected) is kicked
+     *  too — only the broadcast goes out — matching the Windows behavior.
+     *  Returns false when the target is unknown. */
     fun kickMember(targetId: String): Boolean {
         if (!isHost || targetId.isBlank()) return false
-        val conn = connectedClients.remove(targetId) ?: return false
+        val known = targetId in _peers.value
+        val conn = connectedClients.remove(targetId)
+        if (!known && conn == null) return false
         _peers.update { it - targetId }
         val packet = NetworkPacket(
             type = "kick_member",
@@ -631,14 +635,20 @@ class P2PManager(
             targetId = targetId
         )
         sendScope.launch {
-            try {
-                conn.wire.sendPacket(packet)
+            // the broadcast must not depend on the directed send: a target
+            // that dropped mid-kick would otherwise keep the kicked peer in
+            // every other member's list/mesh
+            if (conn != null) {
+                try {
+                    conn.wire.sendPacket(packet)
+                } catch (e: Exception) {
+                    Log.w(TAG, "kickMember directed send failed", e)
+                }
+            }
+            broadcastToClients(packet, exclude = targetId)
+            if (conn != null) {
                 // give the directed packet a moment to flush, then detach
-                broadcastToClients(packet, exclude = targetId)
                 delay(500)
-                runCatching { conn.socket.close() }
-            } catch (e: Exception) {
-                Log.w(TAG, "kickMember failed", e)
                 runCatching { conn.socket.close() }
             }
         }

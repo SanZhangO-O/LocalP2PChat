@@ -13,6 +13,7 @@ import java.io.PrintWriter
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
 /**
@@ -122,6 +123,13 @@ object GroupMeshManager {
      *  is a complete graph). */
     @Volatile
     var onGroupAdmin: ((String, NetworkPacket) -> Unit)? = null
+
+    /** Shared single writer for the high-frequency advisory broadcasts
+     *  (typing / admin relay): one daemon thread instead of one thread per
+     *  packet. Sends are serialized, which socket writes tolerate. */
+    private val sendExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "mesh-send").apply { isDaemon = true }
+    }
 
     // ------------------------------------------------------------ lifecycle
 
@@ -243,7 +251,7 @@ object GroupMeshManager {
         )
         val links = state.links.values.toList()
         if (links.isEmpty()) return
-        thread(name = "mesh-typing") {
+        sendExecutor.execute {
             links.forEach { link ->
                 runCatching { link.wire.sendPacket(packet) }
             }
@@ -257,7 +265,7 @@ object GroupMeshManager {
     fun broadcastAdmin(groupId: String, packet: NetworkPacket) {
         val state = groups[groupId] ?: return
         val links = state.links.values.toList()
-        thread(name = "mesh-admin") {
+        sendExecutor.execute {
             links.forEach { link ->
                 runCatching { link.wire.sendPacket(packet) }
             }

@@ -493,11 +493,16 @@ fun LocalChatApp(
                 requireLocalNetworkPermission {
                     viewModel.openDirectChat(contact)
                     activeDirectPeerId = contact.id
+                    currentScreenName = Screen.DirectChat.name
                 }
             }
+    }
 
+    LaunchedEffect(Unit) {
         // notification tap on a 1:1 chat: open it once the contact is known
-        // (a cold start loads the contact list asynchronously)
+        // (a cold start loads the contact list asynchronously). Kept in its
+        // own effect: collect never returns, so two collectors cannot share
+        // one LaunchedEffect — the second would never start.
         snapshotFlow { openDirectId.value }
             .filterNotNull()
             .collect { peerId ->

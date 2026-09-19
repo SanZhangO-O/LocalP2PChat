@@ -2259,11 +2259,10 @@ class P2PManager:
             group_name=new_name or None,
             announcement=announcement,
         )
-        try:
-            if self.is_host:
-                self._broadcast_to_clients(packet)
-        except Exception:
-            pass
+        if self.is_host:
+            # socket writes go to a worker thread: a slow member must not
+            # block the GUI thread that runs this owner action
+            self._spawn(self._broadcast_to_clients, packet)
         self.listener.group_info_changed(self)
         return True
 
@@ -2288,21 +2287,42 @@ class P2PManager:
             sender_id=self.my_id,
             target_id=target_id,
         )
-        if conn is not None:
-            try:
-                conn["wire"].send_packet(packet)
-            except Exception:
-                pass
         try:
-            self._broadcast_to_clients(packet, exclude=target_id)
+            # all socket writes go to a worker thread: a slow/stalled member
+            # must not freeze the GUI thread that runs this owner action
+            self._spawn(
+                self._send_kick_packet,
+                packet,
+                conn["wire"] if conn is not None else None,
+                target_id,
+            )
         except Exception:
             pass
         if conn is not None:
             # give the directed packet a moment to flush before the socket
             # dies; the close is what actually detaches the kicked member
+            # (detached on purpose: the closer must not hold the conn/socket
+            # across the grace window)
             self._spawn(self._delayed_close, conn["sock"], 0.5)
         self.listener.peers_changed(self)
         return True
+
+    def _send_kick_packet(
+        self,
+        packet: NetworkPacket,
+        wire,
+        target_id: str,
+    ) -> None:
+        """Owner kick delivery off the GUI thread: the directed packet to the
+        target (best effort — a dropped member must not skip the broadcast),
+        then the broadcast to the remaining members. Holds no socket beyond
+        the sends themselves."""
+        if wire is not None:
+            try:
+                wire.send_packet(packet)
+            except Exception:
+                pass
+        self._broadcast_to_clients(packet, exclude=target_id)
 
     @staticmethod
     def _delayed_close(sock, delay: float) -> None:

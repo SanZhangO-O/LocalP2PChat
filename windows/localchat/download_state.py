@@ -30,11 +30,16 @@ class FileResumeStore:
     """file_id -> {target, received, total, host, port, key, folderId,...}."""
 
     SECRET_KEY = "file_download_resume_v1"
+    # folder_id -> files known completed (persisted separately: a resume entry
+    # is REMOVED when its file lands, so the entry set alone cannot tell how
+    # many files of the folder were already saved before an interruption)
+    FOLDER_DONE_KEY = "folder_download_done_v1"
 
     def __init__(self, store) -> None:
         self._store = store
         self._lock = threading.RLock()
         self._entries: Dict[str, dict] = self._load()
+        self._folder_done: Dict[str, int] = self._load_folder_done()
 
     # ------------------------------------------------------------- load/save
 
@@ -128,3 +133,55 @@ class FileResumeStore:
                 del self._entries[file_id]
             if stale:
                 self._save_locked()
+
+    # ------------------------------------------------- folder done counters
+
+    def _load_folder_done(self) -> Dict[str, int]:
+        try:
+            raw = self._store.get_secret(self.FOLDER_DONE_KEY, "")
+        except Exception:
+            raw = ""
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(k): int(v)
+            for k, v in data.items()
+            if isinstance(v, int) and v >= 0
+        }
+
+    def _save_folder_done_locked(self) -> None:
+        try:
+            self._store.set_secret(
+                self.FOLDER_DONE_KEY,
+                json.dumps(self._folder_done, ensure_ascii=False, separators=(",", ":")),
+            )
+        except Exception:
+            pass
+
+    def folder_done_count(self, folder_id: str) -> int:
+        if not folder_id:
+            return 0
+        with self._lock:
+            return int(self._folder_done.get(folder_id, 0))
+
+    def bump_folder_done(self, folder_id: str, n: int = 1) -> None:
+        """Count [n] more files of [folder_id] as saved (persists)."""
+        if not folder_id:
+            return
+        with self._lock:
+            self._folder_done[folder_id] = int(self._folder_done.get(folder_id, 0)) + n
+            self._save_folder_done_locked()
+
+    def reset_folder_done(self, folder_id: str) -> None:
+        """A fresh (non-resume) folder run restarts the completed count."""
+        if not folder_id:
+            return
+        with self._lock:
+            if self._folder_done.pop(folder_id, None) is not None:
+                self._save_folder_done_locked()

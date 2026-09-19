@@ -149,6 +149,17 @@ fun DirectChatScreen(
             onRevealHandled()
         }
     }
+    LaunchedEffect(revealMessageId) {
+        // The target may never appear (deleted between the search hit and the
+        // jump): drop the pending jump after a bounded wait so the autoscroll
+        // in the block below resumes for new messages.
+        if (revealMessageId == null || revealConsumed) return@LaunchedEffect
+        delay(8000)
+        if (!revealConsumed) {
+            revealConsumed = true
+            onRevealHandled()
+        }
+    }
     LaunchedEffect(highlightId) {
         if (highlightId != null) {
             delay(1800)

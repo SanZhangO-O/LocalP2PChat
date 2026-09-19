@@ -320,15 +320,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     ): List<SearchHit> {
         val kw = keyword.trim()
         if (kw.isEmpty()) return emptyList()
-        val rows = runCatching {
-            val nameHits = chatDao.searchByNameColumns(
-                scopeGroupId, MessageSearch.likePattern(kw), MessageSearch.MAX_RESULTS
-            )
-            val bodyHits = chatDao.searchScopeRows(scopeGroupId).filter { row ->
-                MessageSearch.matches(row, StoreCipher.unprotect(row.content), kw)
-            }
-            MessageSearch.merge(nameHits, bodyHits)
-        }.getOrElse { emptyList() }
+        // The body pass decrypts every row in scope (Keystore load + Cipher
+        // per row): keep it off the caller's (Main) dispatcher so a large
+        // history cannot jank the UI.
+        val rows = withContext(Dispatchers.Default) {
+            runCatching {
+                val nameHits = chatDao.searchByNameColumns(
+                    scopeGroupId, MessageSearch.likePattern(kw), MessageSearch.MAX_RESULTS
+                )
+                val bodyHits = chatDao.searchScopeRows(scopeGroupId).filter { row ->
+                    MessageSearch.matches(row, StoreCipher.unprotect(row.content), kw)
+                }
+                MessageSearch.merge(nameHits, bodyHits)
+            }.getOrElse { emptyList() }
+        }
         return rows.map { toSearchHit(it) }
     }
 
@@ -1092,7 +1097,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                         folderTotal = msg.fileInfo?.folderTotal ?: 0,
                                         pending = msg.pending,
                                         replyTo = msg.replyTo ?: "",
-                                        replyPreview = msg.replyPreview ?: "",
+                                        // the quote snippet is conversation content too
+                                        replyPreview = StoreCipher.protect(msg.replyPreview ?: ""),
                                         replySender = msg.replySender ?: "",
                                         read = msg.read
                                     )
@@ -2901,11 +2907,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    /** DB boundary for message bodies: persisted rows carry the content
-     *  Keystore-encrypted ("enc1:...", see [StoreCipher]); decryption happens
-     *  exactly here, on the read path. */
+    /** DB boundary for message bodies: persisted rows carry the content and
+     *  the reply quote snippet (conversation content too) Keystore-encrypted
+     *  ("enc1:...", see [StoreCipher]); decryption happens exactly here, on
+     *  the read path. */
     private fun SavedChatMessage.withPlainContent(): SavedChatMessage =
-        copy(content = StoreCipher.unprotect(content))
+        copy(content = StoreCipher.unprotect(content), replyPreview = StoreCipher.unprotect(replyPreview))
 
     private fun loadPersistedGroups() {
         viewModelScope.launch(Dispatchers.IO) {
@@ -3765,7 +3772,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                         folderId = msg.fileInfo?.folderId ?: "",
                                         folderName = msg.fileInfo?.folderName ?: "",
                                         relativePath = msg.fileInfo?.relativePath ?: "",
-                                        folderTotal = msg.fileInfo?.folderTotal ?: 0
+                                        folderTotal = msg.fileInfo?.folderTotal ?: 0,
+                                        replyTo = msg.replyTo ?: "",
+                                        // the quote snippet is conversation content too
+                                        replyPreview = StoreCipher.protect(msg.replyPreview ?: ""),
+                                        replySender = msg.replySender ?: ""
                                     )
                                 }
                                 val inserted = runCatching { chatDao.insertMessages(saved) }.isSuccess
@@ -3943,6 +3954,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         DirectChatManager.onChatMigrated = null
         DirectChatManager.onCallSignal = null
         DirectChatManager.onRemovedMarksChanged = null
+        DirectChatManager.onTypingChanged = null
+        GroupMeshManager.onGroupTyping = null
+        GroupMeshManager.onGroupAdmin = null
+        GroupMeshManager.creatorIdProvider = null
         // drop the quick-reply hook: a cleared ViewModel must never be invoked
         // by the reply receiver (a stale sink would send on dead managers)
         setQuickReplySink(null)

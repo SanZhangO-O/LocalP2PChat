@@ -64,6 +64,15 @@ class MessageSearchTest {
     }
 
     @Test
+    fun `matches are case-insensitive like the SQL LIKE prefilter`() {
+        val row = text("m1", "g1", "Hello World", 1, sender = "Alice")
+        assertTrue(MessageSearch.matches(row, "Hello World", "hello"))
+        assertTrue(MessageSearch.matches(row, "Hello World", "WORLD"))
+        assertTrue(MessageSearch.matches(row, "Hello World", "alice"))
+        assertFalse(MessageSearch.matches(row, "Hello World", "bye"))
+    }
+
+    @Test
     fun `preview prefixes file kinds and truncates`() {
         val plain = text("m1", "g1", "你好", 1)
         assertEquals("你好", MessageSearch.preview(plain, "你好"))

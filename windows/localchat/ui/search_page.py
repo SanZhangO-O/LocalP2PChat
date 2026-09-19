@@ -7,7 +7,9 @@ the conversation and asks the chat page to scroll to and highlight that
 message.
 """
 
-from PyQt6.QtCore import Qt
+import threading
+
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -81,11 +83,17 @@ class SearchResultCard(QFrame):
 
 
 class SearchPage(QWidget):
+    # (token, result): result is the hits list, or the Exception on failure.
+    # Queued across threads, so the worker below can safely emit it.
+    search_finished = pyqtSignal(int, object)
+
     def __init__(self, vm: ChatViewModel, on_activate, on_back):
         super().__init__()
         self.vm = vm
         self.on_activate = on_activate
         self.on_back = on_back
+        self._search_seq = 0
+        self.search_finished.connect(self._on_search_finished)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -160,11 +168,30 @@ class SearchPage(QWidget):
             self.status_label.setText("请输入关键词")
             return
         scope_id = self.scope_combo.currentData()
+        self._search_seq += 1
+        token = self._search_seq
+        self.status_label.setText("搜索中…")
+        # the body pass decrypts every row in the scope: keep it off the GUI
+        # thread so a large history cannot freeze the window
+        threading.Thread(
+            target=self._search_worker, args=(token, keyword, scope_id), daemon=True
+        ).start()
+
+    def _search_worker(self, token: int, keyword: str, scope_id) -> None:
         try:
             hits = self.vm.search_history(keyword, scope_id)
         except Exception as exc:  # never let a search crash the window
-            self.status_label.setText(f"搜索失败：{exc}")
+            self.search_finished.emit(token, exc)
             return
+        self.search_finished.emit(token, hits)
+
+    def _on_search_finished(self, token: int, result) -> None:
+        if token != self._search_seq:
+            return  # a newer search superseded this one
+        if isinstance(result, Exception):
+            self.status_label.setText(f"搜索失败：{result}")
+            return
+        hits = result
         if not hits:
             self.status_label.setText("没有找到匹配的消息")
             return

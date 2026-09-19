@@ -28,13 +28,14 @@ object MessageSearch {
     fun likePattern(keyword: String): String = "%" + escapeLike(keyword) + "%"
 
     /** True when one row matches [keyword]; [plainContent] is the DECRYPTED
-     *  body (the stored column is ciphertext). */
+     *  body (the stored column is ciphertext). Case-insensitive like the SQL
+     *  LIKE prefilter, so both passes agree. */
     fun matches(row: SavedChatMessage, plainContent: String, keyword: String): Boolean {
         if (keyword.isEmpty()) return false
-        return plainContent.contains(keyword) ||
-            row.senderName.contains(keyword) ||
-            row.relativePath.contains(keyword) ||
-            row.folderName.contains(keyword)
+        return plainContent.contains(keyword, ignoreCase = true) ||
+            row.senderName.contains(keyword, ignoreCase = true) ||
+            row.relativePath.contains(keyword, ignoreCase = true) ||
+            row.folderName.contains(keyword, ignoreCase = true)
     }
 
     /** One-line preview of a hit: media/file rows get a bracketed kind prefix,

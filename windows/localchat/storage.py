@@ -841,7 +841,9 @@ class ChatStore:
             key = (r["groupId"], r["id"])
             if key in found:
                 continue
-            if kw in self._dec(self._raw_content(r)):
+            # case-insensitive like the SQL LIKE prefilter above (SQLite LIKE
+            # is ASCII-case-insensitive, so the two passes must agree)
+            if kw.lower() in self._dec(self._raw_content(r)).lower():
                 rows.append(r)
         rows.sort(key=lambda r: r["timestamp"], reverse=True)
         return [self._row_to_message(r) for r in rows[:limit]]
@@ -868,6 +870,11 @@ class ChatStore:
             relative_path=r["relativePath"] if "relativePath" in keys else "",
             folder_total=r["folderTotal"] if "folderTotal" in keys else 0,
             pending=bool(r["pending"]) if "pending" in keys else False,
+            reply_to=r["replyTo"] if "replyTo" in keys else "",
+            # the quote snippet is conversation content too (encrypted at rest)
+            reply_preview=self._dec(r["replyPreview"]) if "replyPreview" in keys else "",
+            reply_sender=r["replySender"] if "replySender" in keys else "",
+            read=bool(r["read"]) if "read" in keys else False,
         )
 
     def get_setting(self, key: str, default: str = "") -> str:

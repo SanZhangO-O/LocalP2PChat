@@ -679,6 +679,13 @@ class NetworkPacket:
                 raise ValueError("file_download offset must be non-negative")
         if pkt_type == "delete_message" and not pkt.message_id:
             raise ValueError("delete_message packet missing required field: messageId")
+        # Decode strictness policy (deliberate asymmetry with the Android
+        # peer): Windows fails closed — a malformed packet aborts the decode
+        # and the connection — while Android's kotlinx model declares these
+        # fields nullable and its handlers ignore what is meaningless. See
+        # AGENTS.md §2/§5: compat applies to MISSING NEW FIELDS only, never
+        # to validation failures; do not loosen these without a protocol
+        # decision plus a mixed-version E2E run.
         if pkt_type == "read_receipt" and (not pkt.up_to_id or not pkt.reader_id):
             raise ValueError("read_receipt packet missing required field: upToId or readerId")
         if pkt_type == "typing" and (not pkt.sender_id or pkt.active is None):

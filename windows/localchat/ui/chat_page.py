@@ -1019,7 +1019,10 @@ class ChatPage(QWidget):
         # The message being replied to (None when not replying).
         self._reply_target = None
         # a search jump whose message is not in the list yet (the history may
-        # still be replaying): re-attempted on the next rebuild
+        # still be replaying): re-attempted on the next rebuild. Carries the
+        # (group_id, message_id) so a same-group re-activation (an offline
+        # client group's async rejoin re-fires active_group_changed) does not
+        # drop the pending target — only a real group switch does.
         self._pending_reveal = None
         self._emoji_panel = None
         # folderId -> chosen destination directory, kept so a paused save can
@@ -1170,8 +1173,15 @@ class ChatPage(QWidget):
         self._file_rates.clear()
         self._folder_states.clear()
         self._clear_reply()
-        # a jump target belongs to the conversation it was requested from
-        self._pending_reveal = None
+        # a jump target belongs to the conversation it was requested from:
+        # drop it only when the active group actually changed — the same
+        # group re-fires this signal on an offline client group's async
+        # rejoin, and the target must survive until its history replays
+        if (
+            self._pending_reveal is not None
+            and self._pending_reveal[0] != self.vm.active_group_id
+        ):
+            self._pending_reveal = None
         self._clear_highlight()
         self._folder_targets.clear()
         self._stick_to_bottom = True
@@ -1200,11 +1210,14 @@ class ChatPage(QWidget):
     def _reply_payload(self):
         """(reply_to, reply_preview, reply_sender) for the armed reply, or
         (None, None, None) when not replying. The preview is capped like the
-        wire field (Android parity)."""
+        wire field (Android parity) and falls back to the file name for a
+        file message (same as the reply bar shows)."""
         target = self._reply_target
         if target is None:
             return None, None, None
         preview = (target.content or "").replace("\n", " ").strip()
+        if target.file_info is not None and not preview:
+            preview = target.file_info.file_name
         if len(preview) > MAX_REPLY_PREVIEW:
             preview = preview[:MAX_REPLY_PREVIEW]
         return target.id, preview, target.sender_name
@@ -1267,7 +1280,10 @@ class ChatPage(QWidget):
                 item.setData(payload, MSG_ROLE)
             self.model.appendRow(item)
         self._building = False
-        if self._pending_reveal is not None and self.reveal_message(self._pending_reveal):
+        if (
+            self._pending_reveal is not None
+            and self.reveal_message(self._pending_reveal[1])
+        ):
             return
         if self._stick_to_bottom and msgs:
             self.list_view.scrollToBottom()
@@ -1281,7 +1297,7 @@ class ChatPage(QWidget):
         rebuild retries."""
         row = self._find_row(message_id)
         if row is None:
-            self._pending_reveal = message_id
+            self._pending_reveal = (self.vm.active_group_id, message_id)
             return False
         self._pending_reveal = None
         self.list_view.scrollTo(

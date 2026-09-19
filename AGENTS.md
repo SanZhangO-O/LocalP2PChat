@@ -59,6 +59,11 @@ README「版本兼容说明」承诺：**聊天、文件、群组在版本不一
 - 列表页用 `setItemWidget`：刷新要重建条目并 `item.setSizeHint(widget.sizeHint())`；
   数据变化一律通过 ViewModel 的 `pyqtSignal` 触发 `refresh()`。
 - 后台线程不碰 UI，全部经信号回到主线程。
+- **连到 Qt 信号的 lambda 不要带默认参数**（PyQt 槽 arity 探测脆弱，曾造成全量测试中漂移
+  出现的 `TypeError: () missing 1 required positional argument: 'key'` 幽灵）；持有 QTimer
+  的对象必须在 shutdown/teardown 中停止定时器（回归：
+  `windows/tests/test_functional.py::ViewModelFlowTest::test_shutdown_stops_every_owned_timer`，
+  详见 `docs/LESSONS.md` 2026-09-19 续报）。
 - 离屏 GUI 测试要沿真实 UI 路径操作（点击行、`page.open_chat()`）。
   直接调 `vm.open_direct_chat()` 不会设置 `page._peer_id`，页面不刷新，会造成假失败。
 
