@@ -11,7 +11,7 @@ import os
 import sys
 import time
 
-from PyQt6.QtCore import QSize, QTimer, QUrl, Qt
+from PyQt6.QtCore import QSize, QTimer, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QIcon, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListView,
     QMenu,
@@ -28,10 +29,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .. import audio_note
 from ..models import (
     MAX_CONTENT_LENGTH,
     MAX_FOLDER_FILES,
     MAX_REPLY_PREVIEW,
+    FILE_KIND_AUDIO,
     MEDIA_AUDIO,
     MEDIA_KINDS,
     Peer,
@@ -40,6 +43,7 @@ from ..view_model import ChatViewModel
 from .chat_page import (
     HEADER_ROLE,
     MSG_ROLE,
+    REACTION_CHOICES,
     CallLogEntry,
     FolderGroup,
     MessageDelegate,
@@ -69,6 +73,9 @@ class DirectChatInput(DroppableTextEdit):
 
 
 class DirectChatPage(QWidget):
+    # Voice playback ended (player's monitor thread -> main thread hop).
+    voice_finished = pyqtSignal()
+
     def __init__(self, vm: ChatViewModel, on_back):
         super().__init__()
         self.vm = vm
@@ -92,6 +99,13 @@ class DirectChatPage(QWidget):
         self._emoji_panel = None
         # folderId -> chosen destination directory (paused folder resume)
         self._folder_targets: dict = {}
+        # Voice-message recorder (shown only with sounddevice available).
+        self._voice_recorder = audio_note.VoiceRecorder(
+            os.path.join(self.vm.data_dir, "voice")
+        )
+        self._voice_timer = QTimer(self)
+        self._voice_timer.setInterval(250)
+        self._voice_timer.timeout.connect(self._tick_voice_recording)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -125,9 +139,55 @@ class DirectChatPage(QWidget):
         self.banner_label.hide()
         layout.addWidget(self.banner_label)
 
+        # Pinned-message banner: shows the newest pin of this 1:1 chat (both
+        # sides may pin; without a banner a pin had no visible effect).
+        self._pinned_msg_id = None
+        self.pin_bar = QFrame()
+        self.pin_bar.setObjectName("replyBar")
+        self.pin_bar.setStyleSheet(
+            "QFrame#replyBar { background-color: #F2F1F5; border-radius: 6px; }"
+        )
+        pin_layout = QHBoxLayout(self.pin_bar)
+        pin_layout.setContentsMargins(8, 4, 4, 4)
+        pin_layout.setSpacing(6)
+        self.pin_label = QLabel("")
+        self.pin_label.setObjectName("faint")
+        self.pin_label.setWordWrap(True)
+        pin_layout.addWidget(self.pin_label, 1)
+        pin_jump = QPushButton("查看")
+        pin_jump.setObjectName("ghost")
+        pin_jump.setFixedHeight(24)
+        # clicked injects a bool into the first lambda parameter: keep it
+        # explicit (AGENTS.md PyQt6 trap)
+        pin_jump.clicked.connect(lambda checked=False: self._jump_to_pinned())
+        pin_layout.addWidget(pin_jump)
+        pin_unpin = QPushButton("✕")
+        pin_unpin.setObjectName("ghost")
+        pin_unpin.setFixedSize(24, 24)
+        pin_unpin.setToolTip("取消置顶")
+        pin_unpin.clicked.connect(lambda checked=False: self._unpin_banner())
+        pin_layout.addWidget(pin_unpin)
+        self.pin_bar.hide()
+        layout.addWidget(self.pin_bar)
+
         self.model = QStandardItemModel(self)
         self.list_view = QListView()
         self.list_view.setModel(self.model)
+        # msg_id -> ("playing"|"idle", duration text) for voice bubbles
+        self._voice_states: dict = {}
+        self._voice_paths: dict = {}
+        # The bubble currently playing: VoicePlayer.play() replaces the clip
+        # WITHOUT firing on_finished, so the page clears the previous bubble
+        # itself (otherwise it stays "playing" forever).
+        self._playing_id = None
+        self._voice_player = audio_note.VoicePlayer(on_finished=self._on_voice_finished)
+        # msg_id -> [(emoji, actor_id), …] of the open chat, refreshed once per
+        # refresh: the delegate asks on every sizeHint/paint and must not hit
+        # SQLite from there
+        self._reaction_rows: dict = {}
+        # previous sessions' recordings can never be served again: prune
+        audio_note.prune_recordings(os.path.join(self.vm.data_dir, "voice"))
+        self.voice_finished.connect(self._on_voice_finished_ui)
         self.delegate = MessageDelegate(
             self.list_view,
             on_file_click=self._download_file,
@@ -141,6 +201,9 @@ class DirectChatPage(QWidget):
             # direct chats show 已读/未读 on own bubbles
             show_read_state=True,
             on_call_click=self._call_back,
+            reactions_provider=self._reactions_of,
+            voice_states=self._voice_states,
+            on_voice_click=self._toggle_voice,
             parent=self,
         )
         self.list_view.setItemDelegate(self.delegate)
@@ -231,6 +294,17 @@ class DirectChatPage(QWidget):
         self.emoji_btn.clicked.connect(self._toggle_emoji_panel)
         input_row.addWidget(self.emoji_btn, alignment=Qt.AlignmentFlag.AlignBottom)
 
+        # Voice-message recorder button (hidden without sounddevice).
+        self.mic_btn = QPushButton("🎤")
+        self.mic_btn.setObjectName("ghost")
+        self.mic_btn.setFixedSize(40, 40)
+        self.mic_btn.setToolTip("录制语音消息：点击开始，再点发送")
+        self.mic_btn.clicked.connect(self._toggle_voice_recording)
+        if audio_note.audio_available():
+            input_row.addWidget(self.mic_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        else:
+            self.mic_btn.hide()
+
         self.input_edit = DirectChatInput(self._send, self._send_files)
         input_row.addWidget(self.input_edit, 1)
         self.send_btn = QPushButton("发送")
@@ -260,8 +334,18 @@ class DirectChatPage(QWidget):
         self.vm.folder_download_finished.connect(self._on_folder_download_finished)
         self.vm.folder_send_finished.connect(self._on_folder_send_finished)
         self.vm.folder_send_truncated.connect(self._on_folder_send_truncated)
+        self.vm.extras_changed.connect(self._on_extras_changed)
+
+    def _on_extras_changed(self, conversation_key: str):
+        if self._peer_id is not None and conversation_key == "direct:" + self._peer_id:
+            # reactions / pins changed (locally or by the peer): the banner
+            # and the bubbles must follow
+            self._refresh()
 
     def open_chat(self, contact: Peer) -> None:
+        # switching chats abandons an in-progress recording: its 60 s
+        # auto-send would otherwise go to the NEW peer
+        self._abort_voice_recording()
         self._contact = contact
         self.title_label.setText(contact.name)
         self.input_edit.clear()
@@ -269,6 +353,8 @@ class DirectChatPage(QWidget):
         self._file_details.clear()
         self._file_rates.clear()
         self._folder_states.clear()
+        self._voice_states.clear()
+        self._voice_paths.clear()
         self._clear_reply()
         self._folder_targets.clear()
         # use the real member id returned by the handshake so messages and the
@@ -289,10 +375,26 @@ class DirectChatPage(QWidget):
         # returning must not end a video call riding this session, and a
         # session only closes on a real disconnect. Reopening the chat reuses
         # the live session.
+        self._abort_voice_recording()
         if self._peer_id is not None:
             self.vm.end_direct_typing(self._peer_id)
         self._peer_id = None
         self.on_back()
+
+    def hideEvent(self, event):
+        """Leaving the page (another stack page, or the window hidden to the
+        tray): abort a recording and stop off-screen animations/timers."""
+        self._abort_voice_recording()
+        self._reveal_timer.stop()
+        self.delegate.clear_movies()
+        super().hideEvent(event)
+
+    def teardown(self):
+        """App close: same cleanup as hide, plus disarm the delegate so a
+        queued QMovie tick can never touch a dead viewport."""
+        self._abort_voice_recording()
+        self._reveal_timer.stop()
+        self.delegate.teardown()
 
     def _on_messages_changed(self, peer_id: str) -> None:
         if peer_id == self._peer_id:
@@ -423,10 +525,15 @@ class DirectChatPage(QWidget):
         self._refresh_status()
         peer_id = self._peer_id
         if peer_id is None:
+            self._refresh_pin_banner()
             return
         msgs = self.vm.direct_messages(peer_id)
         logs = [call_log_row(log) for log in self.vm.direct_call_logs(peer_id)]
+        # one store read per refresh feeds every sizeHint/paint of this pass
+        self._reaction_rows = self.vm.reactions_for(self._conv_key())
+        self._refresh_pin_banner()
         self._seed_resume_states(msgs)
+        self._seed_voice_states(msgs)
         self.model.setRowCount(0)
         self.list_view.setVisible(bool(msgs) or bool(logs))
         self.empty_label.setVisible(not msgs and not logs)
@@ -701,13 +808,17 @@ class DirectChatPage(QWidget):
             return
         if file_offer_expired(fi):
             return
-        if fi.kind in MEDIA_KINDS:
-            # media: NO save dialog — download into the app media dir so the
-            # message renders inline; "另存为" in the context menu saves a copy
+        if fi.kind in MEDIA_KINDS or fi.kind == FILE_KIND_AUDIO:
+            # media/voice: NO save dialog — download into the app media dir so
+            # the message renders/plays inline; "另存为" in the context menu
+            # saves a copy
             target = self.vm.media_target_path(fi.file_id, fi.file_name)
             if os.path.isfile(target):
                 self._file_states[msg.id] = ("done", target, "")
-                self._open_media(target)
+                if fi.kind == FILE_KIND_AUDIO:
+                    self._toggle_voice(msg)
+                else:
+                    self._open_media(target)
                 return
             self._file_details.pop(msg.id, None)
             self._file_rates.pop(msg.id, None)
@@ -782,6 +893,14 @@ class DirectChatPage(QWidget):
             path = self._file_states.get(file_id, ("", "", ""))[1]
             self._file_states[file_id] = ("done", path, "")
             self._file_details.pop(file_id, None)
+            if path.lower().endswith(".wav"):
+                # a fetched voice message becomes playable inline
+                seconds = audio_note.wav_duration_seconds(path)
+                self._voice_states[file_id] = (
+                    "idle",
+                    audio_note.format_voice_duration(seconds) or "语音",
+                )
+                self._voice_paths[file_id] = path
             Toast(self.window()).show_message("文件已保存")
         else:
             info = self.vm.resume_info(file_id)
@@ -831,6 +950,7 @@ class DirectChatPage(QWidget):
         menu = QMenu(self.list_view)
         if msg.file_info is not None:
             is_media = msg.file_info.kind in MEDIA_KINDS
+            is_voice = msg.file_info.kind == FILE_KIND_AUDIO
             open_action = None
             if is_media:
                 local = self._media_path(msg)
@@ -839,18 +959,26 @@ class DirectChatPage(QWidget):
             download_action = None
             cancel_action = None
             dl_state = self._file_states.get(msg.id, ("idle", "", ""))[0]
-            if self._downloadable_file(msg):
+            if is_voice and self._voice_paths.get(msg.id):
+                pass  # already playable inline; no download entry
+            elif self._downloadable_file(msg):
                 if dl_state == "downloading":
                     # an in-flight download offers 取消下载 instead of starting
                     # a second one
                     cancel_action = menu.addAction("取消下载")
-                elif is_media:
+                elif is_media or is_voice:
                     download_action = menu.addAction("另存为...")
                 else:
                     download_action = menu.addAction(
                         "续传 / 另存为" if dl_state == "paused" else "下载 / 另存为"
                     )
             copy_name_action = menu.addAction("复制文件名")
+            reaction_menu = menu.addMenu("回应")
+            self._fill_reactions(reaction_menu, msg)
+            menu.addSeparator()
+            pin_action = menu.addAction(
+                "取消置顶" if self._is_pinned(msg.id) else "置顶"
+            )
             delete_action = None
             if msg.is_from_me:
                 menu.addSeparator()
@@ -864,11 +992,21 @@ class DirectChatPage(QWidget):
                 self._cancel_download(msg)
             elif chosen is copy_name_action:
                 QApplication.clipboard().setText(msg.file_info.file_name)
+            elif chosen is pin_action:
+                self.vm.toggle_direct_pin(self._peer_id, msg.id, not self._is_pinned(msg.id))
             elif chosen is delete_action:
                 self._delete(msg)
             return
         reply_action = menu.addAction("回复")
+        reaction_menu = menu.addMenu("回应")
+        self._fill_reactions(reaction_menu, msg)
         copy_action = menu.addAction("复制")
+        edit_action = None
+        if msg.is_from_me and not msg.pending and self.vm.direct_chat_alive(self._peer_id or ""):
+            edit_action = menu.addAction("编辑")
+        pin_action = menu.addAction(
+            "取消置顶" if self._is_pinned(msg.id) else "置顶"
+        )
         delete_action = None
         if msg.is_from_me:
             menu.addSeparator()
@@ -878,8 +1016,211 @@ class DirectChatPage(QWidget):
             self._set_reply_target(msg)
         elif chosen is copy_action:
             QApplication.clipboard().setText(msg.content)
+        elif edit_action is not None and chosen is edit_action:
+            self._edit_message_dialog(msg)
+        elif chosen is pin_action:
+            self.vm.toggle_direct_pin(self._peer_id, msg.id, not self._is_pinned(msg.id))
         elif chosen is delete_action:
             self._delete(msg)
+
+    # ------------------------------------------- reactions/pin/edit/voice
+
+    def _conv_key(self) -> str:
+        return "direct:" + (self._peer_id or "")
+
+    def _reactions_of(self, msg):
+        """Delegate callback: reads the per-refresh cache only (runs inside
+        sizeHint/paint)."""
+        data = self._reaction_rows.get(msg.id)
+        if not data:
+            return None
+        counts: dict = {}
+        order: list = []
+        for emoji, _actor in data:
+            if emoji not in counts:
+                counts[emoji] = 0
+                order.append(emoji)
+            counts[emoji] += 1
+        return [(emoji, counts[emoji]) for emoji in order]
+
+    def _fill_reactions(self, menu: QMenu, msg):
+        mine = set()
+        for emoji, actor in self.vm.reactions_for(self._conv_key()).get(msg.id, ()):
+            if actor == self.vm.my_device_id:
+                mine.add(emoji)
+        for emoji in REACTION_CHOICES:
+            label = f"{emoji} 取消回应" if emoji in mine else emoji
+            action = menu.addAction(label)
+            action.triggered.connect(
+                lambda checked=False, m=msg, e=emoji, on=e not in mine: self._react(m, e, on)
+            )
+
+    def _react(self, msg, emoji: str, active: bool):
+        if self._peer_id is None:
+            return
+        if not self.vm.toggle_direct_reaction(self._peer_id, msg.id, emoji, active):
+            Toast(self.window()).show_message("回应未发送：对方未在线")
+
+    def _is_pinned(self, message_id: str) -> bool:
+        return any(
+            mid == message_id
+            for mid, _at, _by in self.vm.pinned_for(self._conv_key())
+        )
+
+    def _refresh_pin_banner(self):
+        """Newest pin of this chat feeds the banner (mirrors the group page);
+        hidden when nothing is pinned."""
+        peer_id = self._peer_id
+        if peer_id is None:
+            self._pinned_msg_id = None
+            self.pin_bar.hide()
+            return
+        pins = self.vm.pinned_for("direct:" + peer_id)
+        if not pins:
+            self._pinned_msg_id = None
+            self.pin_bar.hide()
+            return
+        msg_id, _at, by = pins[-1]  # newest pin wins the banner slot
+        preview = ""
+        for m in self.vm.direct_messages(peer_id):
+            if m.id == msg_id:
+                preview = (m.content or "").replace("\n", " ").strip()
+                if m.file_info is not None and not preview:
+                    preview = m.file_info.file_name
+                break
+        if not preview:
+            preview = "（消息不在本地记录中）"
+        if len(preview) > 40:
+            preview = preview[:40] + "…"
+        who = f"{by} " if by else ""
+        self.pin_label.setText(f"📌 {who}置顶：{preview}")
+        self._pinned_msg_id = msg_id
+        self.pin_bar.show()
+
+    def _jump_to_pinned(self):
+        if self._pinned_msg_id:
+            self.reveal_message(self._pinned_msg_id)
+
+    def _unpin_banner(self):
+        peer_id = self._peer_id
+        if peer_id is not None and self._pinned_msg_id:
+            self.vm.toggle_direct_pin(peer_id, self._pinned_msg_id, False)
+
+    def _edit_message_dialog(self, msg):
+        text, ok = QInputDialog.getMultiLineText(
+            self.window(), "编辑消息", "新的内容：", msg.content
+        )
+        if not ok:
+            return
+        text = text.strip()
+        if not text:
+            return
+        if len(text) > MAX_CONTENT_LENGTH:
+            Toast(self.window()).show_message(
+                f"消息过长（最多 {MAX_CONTENT_LENGTH} 字）"
+            )
+            return
+        if not self.vm.edit_direct_message(self._peer_id, msg.id, text):
+            Toast(self.window()).show_message("编辑未发送：对方未在线")
+
+    def _toggle_voice(self, msg):
+        state = self._voice_states.get(msg.id, ("idle", ""))[0]
+        if state == "playing":
+            # stop() suppresses on_finished (generation bump), so clear the
+            # state here instead of waiting for a callback that never comes
+            self._voice_player.stop()
+            self._playing_id = None
+            self._clear_playing_states()
+            self.list_view.viewport().update()
+            return
+        path = self._voice_paths.get(msg.id)
+        if not path:
+            self._download_file(msg)
+            return
+        if not audio_note.audio_available():
+            self._open_media(path)
+            return
+        if self._voice_player.play(path):
+            # play() replaced the previous clip silently: clear the stale
+            # "playing" bubble or clicking it would kill the audible one
+            self._clear_playing_states()
+            self._playing_id = msg.id
+            self._voice_states[msg.id] = ("playing", self._voice_states.get(msg.id, ("idle", ""))[1])
+        else:
+            Toast(self.window()).show_message("无法播放语音")
+            self._open_media(path)
+        self.list_view.viewport().update()
+
+    def _clear_playing_states(self):
+        for msg_id, state in list(self._voice_states.items()):
+            if state[0] == "playing":
+                self._voice_states[msg_id] = ("idle", state[1])
+
+    def _on_voice_finished(self):
+        self.voice_finished.emit()
+
+    def _on_voice_finished_ui(self):
+        self._playing_id = None
+        self._clear_playing_states()
+        self.list_view.viewport().update()
+
+    def _seed_voice_states(self, msgs):
+        for m in msgs:
+            if m.file_info is None or m.file_info.kind != FILE_KIND_AUDIO:
+                continue
+            if m.id in self._voice_states:
+                continue
+            path = self._media_path(m)
+            if path:
+                seconds = audio_note.wav_duration_seconds(path)
+                self._voice_states[m.id] = ("idle", audio_note.format_voice_duration(seconds))
+                self._voice_paths[m.id] = path
+            else:
+                self._voice_states[m.id] = ("idle", "语音")
+
+    def _toggle_voice_recording(self):
+        if self._voice_recorder.recording:
+            self._stop_voice_recording()
+            return
+        if self._peer_id is None or not self.vm.direct_chat_alive(self._peer_id):
+            Toast(self.window()).show_message("对方未在线，语音消息需在线发送")
+            return
+        if self._voice_recorder.start():
+            self.mic_btn.setText("■")
+            self._voice_timer.start()
+
+    def _tick_voice_recording(self):
+        if not self._voice_recorder.recording:
+            self._voice_timer.stop()
+            return
+        seconds = self._voice_recorder.elapsed_seconds()
+        if seconds >= 60:
+            self._stop_voice_recording()
+            return
+        self.mic_btn.setText(f"{seconds}s")
+
+    def _stop_voice_recording(self):
+        self._voice_timer.stop()
+        path = self._voice_recorder.stop()
+        self.mic_btn.setText("🎤")
+        if not path:
+            return
+        if not self.vm.send_direct_file(self._peer_id, path):
+            Toast(self.window()).show_message("无法发送语音：对方未在线")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _abort_voice_recording(self):
+        """Abandon an in-progress recording (chat switched / page hidden):
+        stop the timer and DISCARD the clip instead of sending it to whatever
+        peer happens to be open when the 60 s cap fires."""
+        if not self._voice_timer.isActive() and not self._voice_recorder.recording:
+            return
+        self._voice_timer.stop()
+        self._voice_recorder.cancel()
+        self.mic_btn.setText("🎤")
 
     def _show_folder_menu(self, group: FolderGroup, pos):
         menu = QMenu(self.list_view)

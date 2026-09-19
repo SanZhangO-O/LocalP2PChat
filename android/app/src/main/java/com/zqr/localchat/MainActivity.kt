@@ -53,6 +53,11 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 enum class Screen { GroupList, Setup, GroupLobby, Chat, MemberList, DirectChat, Settings, Search }
 
+/** Reaction snapshot for one conversation: {msgId: [(emoji, actorId), …]}.
+ *  A typealias keeps the state declarations below off the `>>>` token, which
+ *  the newer Kotlin lexer otherwise reads as the unsigned-shift operator. */
+private typealias ReactionMap = Map<String, List<Pair<String, String>>>
+
 class MainActivity : ComponentActivity() {
 
     companion object {
@@ -239,6 +244,30 @@ fun LocalChatApp(
     val activeConnectionLost by viewModel.activeConnectionLost.collectAsState()
     val downloadStates by viewModel.downloadStates.collectAsState()
     val folderDownloadStates by viewModel.folderDownloadStates.collectAsState()
+    // message-experience extras (reactions / pins / group read receipts)
+    val extrasVersion by viewModel.extrasVersion.collectAsState()
+    var groupReactions by remember { mutableStateOf<ReactionMap>(emptyMap()) }
+    var groupPins by remember {
+        mutableStateOf<List<com.zqr.localchat.data.PinnedMessage>>(emptyList())
+    }
+    var groupReaders by remember { mutableStateOf<Map<String, List<String>>>(emptyMap()) }
+    LaunchedEffect(activeGroupId, extrasVersion) {
+        val gid = activeGroupId ?: return@LaunchedEffect
+        groupReactions = viewModel.reactionsFor(gid)
+        groupPins = viewModel.pinsFor(gid)
+        groupReaders = viewModel.groupReadersFor(gid)
+    }
+    // direct-chat reactions are keyed by "direct:<peerId>"; re-read on open
+    // and on any extras bump
+    var directReactions by remember { mutableStateOf<ReactionMap>(emptyMap()) }
+    var directPins by remember {
+        mutableStateOf<List<com.zqr.localchat.data.PinnedMessage>>(emptyList())
+    }
+    LaunchedEffect(activeDirectPeerId, extrasVersion) {
+        val pid = activeDirectPeerId ?: return@LaunchedEffect
+        directReactions = viewModel.reactionsFor("direct:$pid")
+        directPins = viewModel.pinsFor("direct:$pid")
+    }
 
     // --- video calls ---
     val callState by viewModel.callState.collectAsState()
@@ -707,7 +736,26 @@ fun LocalChatApp(
                     onOpenFile = { uriString -> openDownloadedFile(context, uriString) },
                     revealMessageId = revealTarget
                         ?.takeIf { it.first == "direct:$peerId" }?.second,
-                    onRevealHandled = { revealTarget = null }
+                    onRevealHandled = { revealTarget = null },
+                    reactions = directReactions,
+                    pins = directPins,
+                    myDeviceId = viewModel.myDeviceId,
+                    onToggleReaction = { messageId, emoji, active ->
+                        viewModel.toggleDirectReaction(peerId, messageId, emoji, active)
+                    },
+                    onTogglePin = { messageId, active ->
+                        viewModel.toggleDirectPin(peerId, messageId, active)
+                    },
+                    onEditMessage = { messageId, newContent ->
+                        viewModel.editDirectMessage(peerId, messageId, newContent)
+                    },
+                    onSendVoice = { path ->
+                        val f = java.io.File(path)
+                        viewModel.sendDirectFile(
+                            peerId,
+                            android.net.Uri.fromFile(f), f.name, f.length(), FileKind.AUDIO
+                        )
+                    }
                 )
             } else {
                 LaunchedEffect(Unit) { currentScreenName = Screen.MemberList.name }
@@ -827,15 +875,17 @@ fun LocalChatApp(
                 connectionLost = activeConnectionLost,
                 downloadStates = downloadStates,
                 typingNames = groupTyping[activeGroupId]?.values?.toList() ?: emptyList(),
-                onSendMessage = { content, reply ->
+                onSendMessage = { content, reply, mentions ->
                     viewModel.sendMessage(
                         content,
                         reply?.id,
                         reply?.replyPreviewText(),
-                        reply?.senderName
+                        reply?.senderName,
+                        mentions
                     )
                 },
                 onTyping = { viewModel.notifyGroupTyping() },
+                onVisible = { viewModel.notifyGroupReadReceipt() },
                 onForward = viewModel::sendMessageToGroup,
                 onDelete = viewModel::deleteMessage,
                 onPickFile = {
@@ -872,6 +922,33 @@ fun LocalChatApp(
                 },
                 onDeleteFolder = { group ->
                     group.entries.forEach { viewModel.deleteMessage(it.id) }
+                },
+                reactions = groupReactions,
+                pins = groupPins,
+                groupReaders = groupReaders,
+                // denominator = OTHER members, from the PERSISTED group meta
+                // (Windows member_count - 1): the live peer set shrinks as
+                // members disconnect, which made a stalled receipt show 已读
+                memberCount = (
+                    (groups.firstOrNull { it.groupId == activeGroupId }?.memberCount
+                        ?: (activePeers.size + 1)) - 1
+                    ).coerceAtLeast(1),
+                myDeviceId = viewModel.myDeviceId,
+                members = activePeers.values.map { it.id to it.name },
+                onToggleReaction = { messageId, emoji, active ->
+                    viewModel.toggleGroupReaction(messageId, emoji, active)
+                },
+                onTogglePin = { messageId, active ->
+                    viewModel.toggleGroupPin(messageId, active)
+                },
+                onEditMessage = { messageId, newContent ->
+                    viewModel.editMessage(messageId, newContent)
+                },
+                onSendVoice = { path ->
+                    val f = java.io.File(path)
+                    viewModel.sendFile(
+                        android.net.Uri.fromFile(f), f.name, f.length(), FileKind.AUDIO
+                    )
                 },
                 onDownloadMedia = { fileInfo ->
                     viewModel.downloadMedia(fileInfo, isDirect = false)

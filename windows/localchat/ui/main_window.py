@@ -312,6 +312,16 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.tray is None or self._really_quit:
+            # stop page-owned timers/animations/recordings before the VM goes
+            # down (a QMovie tick or voice recorder must not outlive the UI)
+            for page in self.pages.values():
+                teardown = getattr(page, "teardown", None)
+                if teardown is None:
+                    continue
+                try:
+                    teardown()
+                except Exception:
+                    pass
             self.vm.shutdown()
             if self.tray is not None:
                 # drop the tray icon immediately so no ghost icon lingers

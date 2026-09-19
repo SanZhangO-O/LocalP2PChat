@@ -54,5 +54,10 @@ data class SavedChatMessage(
     val replySender: String = "",
     /** Own direct-chat message read by the peer (set by a read_receipt):
      *  survives restart so "已读" does not flip back after a relaunch. */
-    val read: Boolean = false
+    val read: Boolean = false,
+    /** Message edit: content replaced by its author (edit_message), survives
+     *  restart so the 已编辑 marker stays. */
+    val edited: Boolean = false,
+    /** Mentioned peer ids (JSON list; "@" mentions), empty when none. */
+    val mentions: String = ""
 )

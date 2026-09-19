@@ -93,3 +93,157 @@
   遇原生 AV 先看 WER（`Get-WinEvent` Application 日志搜 python），再用
   stash 单文件法排除改动归因，不要凭直觉回改代码。
 
+## 2026-09-19 消息体验功能（编辑/回应/提及/置顶/群已读/语音/贴纸）三则
+
+### 1. Kotlin 嵌套泛型结尾 `>>>` 被 K2 词法器拆成 `>>` + `>`
+
+- 现象: `mutableStateOf<Map<String, List<Pair<String, String>>>>(emptyMap())`
+  报「Interface Map does not have constructors」「Unresolved compareTo」等
+  连串不知所云的错误；同文件 `List<...>>`（两级）完全正常。
+- 根因: Kotlin 2.x 引入无符号右移运算符 `>>>` 后，连续三个 `>` 的泛型收尾
+  在部分上下文按运算符 token 化，类型实参解析被打断。
+- 修复: 文件级 `private typealias ReactionMap = Map<String, List<Pair<String, String>>>`
+  绕开三连 `>`（MainActivity.kt）。
+- 验证: `.\gradlew.bat compileDebugKotlin` 通过。
+- 防再犯: 嵌套泛型两层以上时优先起 typealias；再遇泛型收尾 `>>>` 的怪错，
+  先怀疑词法而非类型系统。
+
+### 2. Python `is_big_emoji` 与 Kotlin 迭代粒度不同：UTF-16 代理对
+
+- 现象: Windows 端 `is_big_emoji("👍")` 为 True，Android 首版 `isBigEmoji`
+  对同一输入返回 False，贴纸检测单测失败。
+- 根因: Python 字符串按**码点**迭代，Kotlin/Java String 按 **UTF-16 码元**
+  迭代——高位代理对（0xD83D）不落进任何 emoji 区间，`all {}` 直接失败。
+- 修复: Kotlin 侧用 `codePointAt` + `Character.charCount` 手动按码点扫描
+  （`data/Models.kt` 的 `isBigEmoji`），上限也改为「16 个码点」而非 16 个
+  char，与 Windows `models.is_big_emoji` 逐条对齐。
+- 验证: `EmojiSupportTest`（贴纸页全部 emoji 必须被判为大 emoji）+
+  `MessageExtrasProtocolTest.isBigEmoji` 用例。
+- 防再犯: 任何按字符分类/截断/计数的跨端逻辑（emoji、长度上限、切面），
+  Python 端按码点、Kotlin 端必须显式按码点处理，不要直接迭代 Char。
+
+### 3. Python 读循环 listener 属性名不一致，异常被外层 except 吞掉
+
+- 现象: 直聊新增的 reaction/edit/pin 处理器里用了 `self.listener`（P2PManager
+  的属性名），而 `DirectChatManager` 的属性是 `self._listener`——AttributeError
+  被读循环外层 `except` 整体吞掉，表现为「包已编码并到达对端、处理器就是不执行、
+  会话悄然断开」，无任何日志。
+- 根因: 两套 manager 的回调属性命名不一致 + 读循环用粗粒度 try/except 包住
+  整个循环，处理器内的 AttributeError 终结循环而非报错。
+- 修复: 统一改用 `self._listener` 并对每个回调单独 try/except +
+  `logger.exception`（network.py 直聊读循环三处）。
+- 验证: `windows/tests/test_message_extras.py::DirectExtrasTest`（事件回调
+  断言此前全空、修复后命中）。
+- 防再犯: 给读循环加处理器时，回调访问必须带空值保护并单独捕获记录；
+  新增「包已到达但处理器未触发」类问题时，第一反应是在 wire 层打印已解码
+  包类型定位断点，而不是怀疑编码。
+
+### 4. `INSERT OR REPLACE` × 新外键级联 = 静默删数据；移动会话必须先重键子表
+
+- 现象: 消息体验上线后，代码审查复现出三处数据丢失：①Windows `insert_messages` /
+  `move_messages` 的 `INSERT OR REPLACE` 在 (groupId,id) 冲突时删除旧行，新增的
+  `message_reactions`/`pinned_messages`/`group_reads` 随外键级联一起被清空；
+  ②Android 直聊占位键迁移 `UPDATE OR REPLACE saved_messages SET groupId=...`
+  在存在子行时直接 `FOREIGN KEY constraint failed`，被 `runCatching` 吞掉后
+  表现为「会话历史消失」；③两者都让「已回应/已置顶的消息」在重插或迁移后丢失状态。
+- 根因: REPLACE 是 delete+insert（SQLite/Room 同理），而子表 FK 是
+  ON DELETE CASCADE / ON UPDATE NO ACTION；新增子表时没人回头改这些既有写路径。
+- 修复: 父行改写一律 UPSERT（`ON CONFLICT(groupId,id) DO UPDATE SET ...`），
+  绝不 REPLACE；移动会话按「复制/刷新父行 → 重键子表 → 删除源父行」顺序执行，
+  Android 用 `@Transaction` 默认方法把三步绑成一个事务（ChatDao.moveMessages）。
+- 验证: `windows/tests/test_message_extras.py` 的
+  `test_reinsert_keeps_extras` / `test_move_into_existing_target_keeps_target_extras`；
+  修复前两者都会失败（子行丢失），修复后 27 项全绿；Android 单测 + 编译通过。
+- 防再犯: 给任何表加 `ON DELETE CASCADE` 子表时，先搜出所有
+  `INSERT OR REPLACE`/`UPDATE OR REPLACE` 写路径并逐一评估级联影响；
+  跨表移动键值必须显式重键全部子表并满足 FK 顺序。
+
+### 5. 绘制回调里查数据库；群已读回执全表解密读
+
+- 现象: Windows 反应气泡的 `reactions_provider` 在 delegate 的 `sizeHint`/`paint`
+  里逐条查 SQLite（每次绘制两次查询），滚动/布局/GIF 每帧都触发；群已读回执
+  处理整表读取并逐条解密全部消息体；Android `readLabelFor` 对每个组合项做全表扫描。
+- 根因: 把「数据读取」放进了纯渲染路径；读取接口又恰好是「整会话 + 解密」级别。
+- 修复: 反应表每次重建/刷新时一次性读入页面缓存（委托只做字典查询）；回执改为
+  两条定向 SQL（`timestamp` 单行查询 + `isFromMe=1 AND timestamp<=?` 的 id 列表）；
+  Android 已读标签用 `remember(messages, groupReaders, memberCount)` 单趟排序计算。
+- 验证: 两端全量单测 + 手工核对调用点（paint/sizeHint 不再触碰 store）。
+- 防再犯: delegate 的 paint/sizeHint、Compose 的组合体只允许访问不可变缓存；
+  新增「每个对端每消息都会触发」的处理函数时，先问「这条 SQL 会不会读整表」。
+
+## 2026-09-19 续报：审查发现的四个跨端/兼容根因
+
+### 1. `FileInputStream.getChannel()` 只读：WAV 尺寸回填静默失败，Android 语音在 Windows 端 0:00
+
+- 现象: Android 录的语音在 Windows 上时长显示 0:00、点击播放无声（Android 本端
+  正常，因为它按时长=文件长度推算、MediaPlayer 宽容解析 chunk size）。
+- 根因: 录音收尾用 `FileInputStream(out.fd).getChannel()` 回填 RIFF/data 长度，
+  而该 channel 是**只读**的（`FileInputStream.getChannel()` 固定 readable=true,
+  writable=false），`write` 抛 `NonWritableChannelException`；异常被
+  `runCatching` 吞掉，header 里两个长度字段保持 0。Python `wave.open` 按 data
+  chunk size 计算 `nframes` → 0 帧、无声。
+- 修复: 新 `VoiceNotes.patchWavSizes` 用 `RandomAccessFile(file, "rw")`；header
+  构造/回填抽成纯函数（`wavHeader`/`patchWavSizes`）便于 JVM 单测。
+- 验证: `android/app/src/test/java/com/zqr/localchat/VoiceNotesTest.kt`
+  （断言 bytes 4-7 = 36+dataBytes、40-43 = dataBytes、采样率、0.5s 半上进位）；
+  JDK 实验确认 `FileInputStream(fd)` channel 写入必抛 NonWritableChannelException。
+- 防再犯: 任何「先写占位头、结束回填」的二进制格式，回填必须用可写句柄
+  （`RandomAccessFile` / `FileOutputStream(fd).getChannel()`）；回填函数禁止
+  静默吞异常——那种「写入被拒绝」的错误必须让测试失败而不是留一个坏文件。
+
+### 2. Room/SQLite UPSERT（`ON CONFLICT ... DO UPDATE`）需要 SQLite 3.24 = API 30，minSdk 24 上静默失败
+
+- 现象: 占位会话（`direct:ip:port`）迁移到真实设备 id 后历史消失——迁移语句在
+  Android 7-10 上 prepare 阶段即报语法错，被调用方 `runCatching` 吞掉，源行未删、
+  目标行未刷新。
+- 根因: 3.24（2018）才引入 UPSERT 语法；Android 11（API 30）之前内置
+  SQLite 3.9-3.22，而项目 minSdk=24 且未配置 bundled SQLite 驱动。
+- 修复: 改成可移植两步：`INSERT OR IGNORE ... SELECT` 补缺行 +
+  相关子查询 `UPDATE`（`ChatDao.refreshMovedMessages`）刷新既有行，仍由
+  `@Transaction moveMessages` 保证「父行 → 子表重键 → 删源行」顺序。
+- 验证: `.\gradlew.bat testDebugUnitTest` + `assembleDebug` 通过（Room 编译期
+  校验两条 SQL）。
+- 防再犯: 写 Room `@Query` 前先对照 **minSdk 对应 SQLite 版本**（API 24=3.9、
+  28=3.22、30=3.28）；涉及删除重建语义的父行改写一律「IGNORE + UPDATE」，
+  不要 UPSERT/REPLACE；`runCatching` 里的 DB 写路径必须能暴露失败（日志或返回
+  值），否则兼容问题会伪装成「没有变化」。
+
+### 3. edit_message 监听器不看 apply 结果：伪造编辑被写进数据库（Windows 直聊）
+
+- 现象: 对端发 `edit_message` 篡改我自己的消息：内存列表正确拒绝（气泡不变），
+  但 ViewModel 的持久化监听器照常收到通知，`update_message_content` 无作者条件，
+  重启后 DB 里的消息正文变成伪造文本。
+- 根因: 读循环里 `_edit_message(...)` 的返回值被忽略，监听器无条件回调；
+  且存储层 UPDATE 只按 (groupId,id) 定位，没有作者条件（Android 用返回值门控，
+  两端行为分叉）。
+- 修复: ①读循环 `if packet.sender_id == peer_id and self._edit_message(...)` 才
+  回调；②`ChatStore.update_message_content(..., sender_id=None)` 支持 `AND
+  senderId = ?` 作者条件（Windows），Android 加
+  `ChatDao.updateMessageContentFrom` 并在 `persistEditedContent` 传入期望作者；
+  群编辑持久化同样带上 senderId。
+- 验证: `test_message_extras.py::DirectExtrasTest::test_forged_edit_of_peer_message_is_never_persisted`
+  （正向对照：合法编辑必须到达监听器；负向：伪造包不增加回调数），
+  `ExtrasStoreTest::test_update_message_content_author_gate`；负向对照跑过
+  （去掉门控即失败 2 != 1）。
+- 防再犯: 「网络层拒绝 + 监听器照样通知」是伪造落库的经典组合——凡是
+  listener/持久化回调，先确认上游校验函数的返回值被用于门控；存储层写接口
+  对「发送者声明」类字段一律支持并优先使用作者条件。
+
+### 4. 页面隐藏/切会话不停止资源：录音继续并向新会话发送、GIF 动画不停
+
+- 现象: Windows 群聊/直聊录音中切会话或返回，麦克风继续采、60 秒上限触发时
+  `vm.send_file` 把语音发进「当前打开的会话」；GIF 动画在页面隐藏后仍每帧重绘，
+  QMovie 回调可能触碰已销毁的 viewport。
+- 根因: 页面只清了状态字典，没有生命周期钩子；栈切页隐藏不会通知页面。
+- 修复: 两端各自加「离开即清理」——Windows `hideEvent`/`teardown`（中止录音
+  cancel、停 extras/reveal/voice 定时器、`delegate.clear_movies()`），
+  `open_chat`/`_on_back`/`_on_group_changed` 显式 abort，`MainWindow.closeEvent`
+  统一调页面 `teardown()`；Android `VoiceRecorder.cancel()` 改为非阻塞（主线程
+  onDispose 只置标志，采集线程自行删文件），播放器 `onFinished` 移入
+  `DisposableEffect`；录制目录启动时 prune。
+- 验证: 全量单测（Windows 318 项、Android 单测+assembleDebug）通过；
+  `VoiceHelpersTest::test_cancel_is_safe_when_idle`。
+- 防再犯: 任何持有原生资源（麦克风、播放器、动画、定时器）的页面，必须在
+  hide/teardown 路径显式停止；「60 秒后自动发送」这类延迟动作要绑定发起时的
+  目标，页面切换时中止而不是让它落到当前会话。
+

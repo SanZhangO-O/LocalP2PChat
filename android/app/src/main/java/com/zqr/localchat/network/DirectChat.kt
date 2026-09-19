@@ -1,4 +1,4 @@
-package com.zqr.localchat.network
+﻿package com.zqr.localchat.network
 
 import android.content.ContentResolver
 import android.net.Uri
@@ -12,7 +12,7 @@ import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.data.MAX_FOLDER_FILES
 import com.zqr.localchat.data.Peer
 import com.zqr.localchat.data.sanitizeRelativePath
-import com.zqr.localchat.data.withSanitizedFileInfo
+import com.zqr.localchat.data.withSanitizedExtras
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -281,6 +281,21 @@ object DirectChatManager {
      *  session that drops clears it. Invoked on the session read thread. */
     @Volatile
     var onTypingChanged: ((peerId: String, active: Boolean) -> Unit)? = null
+
+    /** The peer edited its own message (author + session validated by the
+     *  manager): (peerId, messageId, newContent). Direct worker threads. */
+    @Volatile
+    var onMessageEdited: ((peerId: String, messageId: String, newContent: String) -> Unit)? = null
+
+    /** The peer toggled an emoji reaction on a message of this chat:
+     *  (peerId, messageId, emoji, active). Direct worker threads. */
+    @Volatile
+    var onReactionChanged: ((peerId: String, messageId: String, emoji: String, active: Boolean) -> Unit)? = null
+
+    /** The peer pinned/unpinned a message of this chat:
+     *  (peerId, messageId, active). Direct worker threads. */
+    @Volatile
+    var onPinChanged: ((peerId: String, messageId: String, active: Boolean) -> Unit)? = null
 
     /** Peers whose typing indicator is currently on (last event forwarded):
      *  dedupes notifications and lets a dropped session clear the indicator. */
@@ -963,6 +978,94 @@ object DirectChatManager {
 
     private fun clearPeerTyping(peerId: String) = setPeerTyping(peerId, false)
 
+    /** Edit one of OUR direct-chat messages on a live session. Advisory like
+     *  typing: never queued offline — the peer must be online to see the
+     *  rewrite (deletes behave the same way). Applies locally first; returns
+     *  false when there is no session or the message is not ours. */
+    fun editMessage(peerId: String, messageId: String, newContent: String): Boolean {
+        if (!P2PManager.isValidContent(newContent)) return false
+        val s = sessions[peerId]?.takeIf { it.alive } ?: return false
+        val target = messageStates[peerId]?.value?.firstOrNull { it.id == messageId }
+        if (target == null || target.senderId != myId) return false
+        applyMessageEdit(peerId, messageId, newContent, myId)
+        // mark edited even when the new text equals the old one (the user
+        // still went through the edit flow)
+        messageStates[peerId]?.update { list ->
+            list.map { if (it.id == messageId && !it.edited) it.copy(edited = true) else it }
+        }
+        runCatching {
+            putSend(
+                s,
+                NetworkPacket(
+                    type = "edit_message",
+                    groupId = "direct:$peerId",
+                    messageId = messageId,
+                    senderId = myId,
+                    newContent = newContent
+                )
+            )
+        }
+        return true
+    }
+
+    /** Toggle an emoji reaction on a live direct session. Advisory: no
+     *  outbox — reactions are only meaningful while the peer is online. */
+    fun sendDirectReaction(peerId: String, messageId: String, emoji: String, active: Boolean): Boolean {
+        val clean = com.zqr.localchat.data.sanitizeEmoji(emoji)
+        if (clean.isEmpty()) return false
+        val s = sessions[peerId]?.takeIf { it.alive } ?: return false
+        runCatching {
+            putSend(
+                s,
+                NetworkPacket(
+                    type = "reaction",
+                    groupId = "direct:$peerId",
+                    messageId = messageId,
+                    senderId = myId,
+                    emoji = clean,
+                    active = active
+                )
+            )
+        }
+        return true
+    }
+
+    /** Pin/unpin a message of a direct chat on a live session. */
+    fun sendDirectPin(peerId: String, messageId: String, active: Boolean): Boolean {
+        val s = sessions[peerId]?.takeIf { it.alive } ?: return false
+        runCatching {
+            putSend(
+                s,
+                NetworkPacket(
+                    type = "pin_message",
+                    groupId = "direct:$peerId",
+                    messageId = messageId,
+                    senderId = myId,
+                    active = active
+                )
+            )
+        }
+        return true
+    }
+
+    /** Apply an edit to the local direct-chat copy. Only the message's own
+     *  author may rewrite it; returns false (no change) otherwise. */
+    private fun applyMessageEdit(peerId: String, messageId: String, newContent: String, editorId: String): Boolean {
+        val state = messageStates[peerId] ?: return false
+        var changed = false
+        state.update { list ->
+            list.map { m ->
+                if (m.id == messageId) {
+                    if (m.senderId == editorId && (m.content != newContent || !m.edited)) {
+                        changed = true
+                        m.copy(content = newContent, edited = true)
+                    } else m
+                } else m
+            }
+        }
+        return changed
+    }
+
     /** Mark every OWN message up to the receipt's message id as read. The
      *  receipt names a peer message id, so the cut-off is that message's
      *  timestamp; an id we no longer hold (history pruned) is ignored. The
@@ -1439,7 +1542,7 @@ object DirectChatManager {
                             // drop instead of duplicating the bubble
                             Log.i(TAG, "drop duplicate message ${msg.id} on session ${s.peerId}")
                         } else {
-                            appendMessage(s.peerId, P2PManager.markFromMe(msg.withSanitizedFileInfo(), myId))
+                            appendMessage(s.peerId, P2PManager.markFromMe(msg.withSanitizedExtras(), myId))
                             if (packet.type == "chat") {
                                 // receiving a plain chat IS reading it (the
                                 // protocol defines the automatic receipt on
@@ -1474,6 +1577,34 @@ object DirectChatManager {
                         messageStates[s.peerId]?.value?.find { it.id == id }?.let { target ->
                             if (target.senderId == sender) removeMessage(s.peerId, id)
                         }
+                    }
+                    "edit_message" -> {
+                        // only the session peer may edit as itself, and only
+                        // its own message (author check in applyMessageEdit)
+                        val id = packet.messageId ?: continue
+                        val content = packet.newContent ?: continue
+                        if (packet.senderId != s.peerId ||
+                            !P2PManager.isValidContent(content)
+                        ) continue
+                        if (applyMessageEdit(s.peerId, id, content, s.peerId)) {
+                            onMessageEdited?.invoke(s.peerId, id, content)
+                        }
+                    }
+                    "reaction" -> {
+                        val id = packet.messageId ?: continue
+                        val sender = packet.senderId ?: continue
+                        // sanitize BEFORE the emptiness check: a payload of
+                        // only control/format characters sanitizes to "" and
+                        // must be dropped (Windows rejects it at decode)
+                        val emoji = com.zqr.localchat.data.sanitizeEmoji(packet.emoji)
+                        if (sender != s.peerId || emoji.isEmpty()) continue
+                        onReactionChanged?.invoke(s.peerId, id, emoji, packet.active == true)
+                    }
+                    "pin_message" -> {
+                        val id = packet.messageId ?: continue
+                        val sender = packet.senderId ?: continue
+                        if (sender != s.peerId) continue
+                        onPinChanged?.invoke(s.peerId, id, packet.active == true)
                     }
                     in CALL_PACKET_TYPES -> {
                         // 1:1 session: call signaling must involve THIS member

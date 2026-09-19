@@ -33,6 +33,7 @@ from .models import (
     Peer,
     detect_media_kind,
     is_valid_content,
+    sanitize_emoji,
     sanitize_relative_path,
 )
 from .punch import (
@@ -1099,6 +1100,28 @@ class P2PListener:
         (local history is kept)."""
         pass
 
+    # ------------------------------------------- message-experience callbacks
+
+    def message_edited(self, p2p: "P2PManager", message_id: str, new_content: str, sender_id: str) -> None:
+        """A member edited its own message (edit_message; the relay/mesh path
+        has already validated the author)."""
+        pass
+
+    def reaction_changed(
+        self, p2p: "P2PManager", message_id: str, emoji: str, sender_id: str, active: bool
+    ) -> None:
+        """A member toggled an emoji reaction on a message."""
+        pass
+
+    def pin_changed(self, p2p: "P2PManager", message_id: str, sender_id: str, active: bool) -> None:
+        """A member pinned/unpinned a message in the group."""
+        pass
+
+    def group_read_receipt(self, p2p: "P2PManager", reader_id: str, up_to_id: str) -> None:
+        """A member reported reading the group up to [up_to_id] (group-scope
+        read_receipt); the receiver marks its OWN covered messages."""
+        pass
+
 
 class P2PManager:
     # Peer-presence heartbeat: both sides send a ping every interval; a read
@@ -1917,6 +1940,21 @@ class P2PManager:
             # relay (a client's own senderId was validated by the host before
             # forwarding, so it cannot be forged here)
             self.listener.typing_changed(self, packet.sender_id, bool(packet.active))
+        elif packet.type == "edit_message" and packet.message_id and packet.new_content is not None:
+            self._apply_relayed_edit(packet)
+        elif packet.type == "reaction" and packet.message_id and packet.emoji:
+            self._apply_relayed_reaction(packet)
+        elif packet.type == "pin_message" and packet.message_id:
+            self._apply_relayed_pin(packet)
+        elif (
+            packet.type == "read_receipt"
+            and packet.up_to_id
+            and packet.reader_id
+            and packet.group_id == self.current_group_id
+        ):
+            # group-scope read receipt relayed by the host; the reader id was
+            # validated by the host against the member's connection
+            self.listener.group_read_receipt(self, packet.reader_id, packet.up_to_id)
         elif packet.type == "ping":
             wire = self._host_wire
             if wire is not None:
@@ -1944,6 +1982,59 @@ class P2PManager:
                     return
             self._dispatch_call(packet)
         # "pong": traffic only; keeps the read loop alive
+
+    # ------------------------------------------------- message-experience apply
+
+    def _apply_relayed_edit(self, packet: NetworkPacket) -> None:
+        """A relayed edit_message: the host already checked the sender's
+        identity; only the message's original author may change its content."""
+        target = None
+        with self._lock:
+            target = next(
+                (m for m in self.messages if m.id == packet.message_id), None
+            )
+        if target is None or packet.sender_id != target.sender_id:
+            logger.warning(
+                "reject edit_message %s: packet senderId=%r, message senderId=%r",
+                packet.message_id,
+                packet.sender_id,
+                target.sender_id if target is not None else None,
+            )
+            return
+        with self._lock:
+            target.content = packet.new_content
+            target.edited = True
+        self.listener.message_edited(
+            self, packet.message_id, packet.new_content, packet.sender_id
+        )
+
+    def _apply_relayed_reaction(self, packet: NetworkPacket) -> None:
+        target = None
+        with self._lock:
+            target = next(
+                (m for m in self.messages if m.id == packet.message_id), None
+            )
+        if target is None or packet.sender_id is None:
+            return
+        self.listener.reaction_changed(
+            self,
+            packet.message_id,
+            packet.emoji,
+            packet.sender_id,
+            bool(packet.active),
+        )
+
+    def _apply_relayed_pin(self, packet: NetworkPacket) -> None:
+        target = None
+        with self._lock:
+            target = next(
+                (m for m in self.messages if m.id == packet.message_id), None
+            )
+        if target is None or packet.sender_id is None:
+            return
+        self.listener.pin_changed(
+            self, packet.message_id, packet.sender_id, bool(packet.active)
+        )
 
     def _process_packet_from_client(self, packet: NetworkPacket, sender_id: str) -> None:
         if packet.type in ("group_update", "kick_member"):
@@ -2015,6 +2106,66 @@ class P2PManager:
             else:
                 self.listener.typing_changed(self, sender_id, bool(packet.active))
                 self._broadcast_to_clients(packet, exclude=sender_id)
+        elif packet.type == "edit_message" and packet.message_id and packet.new_content is not None:
+            # only the message's original author may edit, and the claimed
+            # sender must be the authenticated connection (host relay rule)
+            target = None
+            with self._lock:
+                target = next(
+                    (m for m in self.messages if m.id == packet.message_id), None
+                )
+            if (
+                target is not None
+                and packet.sender_id == sender_id
+                and target.sender_id == sender_id
+            ):
+                with self._lock:
+                    target.content = packet.new_content
+                    target.edited = True
+                self.listener.message_edited(
+                    self, packet.message_id, packet.new_content, sender_id
+                )
+                self._broadcast_to_clients(packet, exclude=sender_id)
+            else:
+                logger.warning(
+                    "reject edit_message %s from %s: packet senderId=%r, message senderId=%r",
+                    packet.message_id,
+                    sender_id,
+                    packet.sender_id,
+                    target.sender_id if target is not None else None,
+                )
+        elif packet.type == "reaction" and packet.message_id and packet.emoji:
+            if packet.sender_id == sender_id:
+                with self._lock:
+                    known = any(m.id == packet.message_id for m in self.messages)
+                if known:
+                    self.listener.reaction_changed(
+                        self,
+                        packet.message_id,
+                        packet.emoji,
+                        sender_id,
+                        bool(packet.active),
+                    )
+                    self._broadcast_to_clients(packet, exclude=sender_id)
+        elif packet.type == "pin_message" and packet.message_id:
+            if packet.sender_id == sender_id:
+                with self._lock:
+                    known = any(m.id == packet.message_id for m in self.messages)
+                if known:
+                    self.listener.pin_changed(
+                        self, packet.message_id, sender_id, bool(packet.active)
+                    )
+                    self._broadcast_to_clients(packet, exclude=sender_id)
+        elif (
+            packet.type == "read_receipt"
+            and packet.up_to_id
+            and packet.reader_id == sender_id
+            and packet.group_id == self.current_group_id
+        ):
+            # a member read the group up to up_to_id: mark the HOST's own
+            # covered messages, then relay so the other members do the same
+            self.listener.group_read_receipt(self, sender_id, packet.up_to_id)
+            self._broadcast_to_clients(packet, exclude=sender_id)
         elif packet.type == "ping":
             with self._lock:
                 conn = self._connected_clients.get(sender_id)
@@ -2101,11 +2252,13 @@ class P2PManager:
         reply_to: Optional[str] = None,
         reply_preview: Optional[str] = None,
         reply_sender: Optional[str] = None,
+        mentions: Optional[List[str]] = None,
     ) -> Optional[ChatMessage]:
         """Send a chat message through the host relay; returns the created
         message (or None for invalid content) so the caller can also broadcast
         it over the group mesh. The optional reply_* triple attaches a quoted
-        header (see ChatMessage); a forward passes none of them."""
+        header (see ChatMessage); a forward passes none of them. [mentions]
+        carries the @-mentioned peer ids ("all" = everyone)."""
         if not is_valid_content(content):
             return None
         message = ChatMessage(
@@ -2118,6 +2271,7 @@ class P2PManager:
             reply_to=reply_to,
             reply_preview=reply_preview,
             reply_sender=reply_sender,
+            mentions=mentions or None,
         )
         with self._lock:
             self.messages.append(message)
@@ -2168,6 +2322,86 @@ class P2PManager:
         self._enqueue_send(packet)
         return True
 
+    def edit_message(self, message_id: str, new_content: str) -> bool:
+        """Author-only text edit: applies locally (content + edited flag) and
+        broadcasts edit_message so every member's copy follows. The group mesh
+        is mirrored by the ViewModel (like a chat send)."""
+        if not is_valid_content(new_content):
+            return False
+        with self._lock:
+            target = next((m for m in self.messages if m.id == message_id), None)
+            if target is None or target.sender_id != self.my_id:
+                return False
+            target.content = new_content
+            target.edited = True
+        self.listener.messages_changed(self)
+        self._enqueue_send(
+            NetworkPacket(
+                type="edit_message",
+                group_id=self.current_group_id,
+                message_id=message_id,
+                sender_id=self.my_id,
+                new_content=new_content,
+            )
+        )
+        return True
+
+    def send_reaction(self, message_id: str, emoji: str, active: bool) -> bool:
+        """Toggle an emoji reaction of ours on [message_id]. Advisory: never
+        queued offline (a member with no live path simply misses it)."""
+        emoji = sanitize_emoji(emoji)
+        if not emoji:
+            return False
+        with self._lock:
+            known = any(m.id == message_id for m in self.messages)
+        if not known:
+            return False
+        self._enqueue_send(
+            NetworkPacket(
+                type="reaction",
+                group_id=self.current_group_id,
+                message_id=message_id,
+                sender_id=self.my_id,
+                emoji=emoji,
+                active=bool(active),
+            )
+        )
+        return True
+
+    def send_pin(self, message_id: str, active: bool) -> bool:
+        """Pin/unpin a message in the group. Any member may pin (the group's
+        trust model is its password), the claimed sender is validated by every
+        receiver against its authenticated identity."""
+        with self._lock:
+            known = any(m.id == message_id for m in self.messages)
+        if not known:
+            return False
+        self._enqueue_send(
+            NetworkPacket(
+                type="pin_message",
+                group_id=self.current_group_id,
+                message_id=message_id,
+                sender_id=self.my_id,
+                active=bool(active),
+            )
+        )
+        return True
+
+    def send_group_read_receipt(self, up_to_id: str) -> None:
+        """Tell the group we have read up to [up_to_id] (host relay path; the
+        ViewModel mirrors it over the mesh). Receivers mark only their OWN
+        covered messages."""
+        if not up_to_id:
+            return
+        self._enqueue_send(
+            NetworkPacket(
+                type="read_receipt",
+                group_id=self.current_group_id,
+                up_to_id=up_to_id,
+                reader_id=self.my_id,
+            )
+        )
+
     def remove_local_message(self, message_id: str, sender_id: str) -> bool:
         """Remove a message locally because a delete arrived over the group
         mesh (the mesh path validated the sender). Only the original sender
@@ -2187,6 +2421,23 @@ class P2PManager:
             self.messages = [m for m in self.messages if m.id != message_id]
         self.listener.messages_changed(self)
         return True
+
+    def apply_edit_local(self, message_id: str, new_content: str, sender_id: str) -> bool:
+        """Apply an author edit to the local list because an edit_message
+        arrived (relay or mesh path; both validated the author). Idempotent:
+        applying the same content twice just re-notifies."""
+        changed = False
+        with self._lock:
+            target = next((m for m in self.messages if m.id == message_id), None)
+            if target is None or target.sender_id != sender_id:
+                return False
+            if target.content != new_content or not target.edited:
+                target.content = new_content
+                target.edited = True
+                changed = True
+        if changed:
+            self.listener.messages_changed(self)
+        return changed
 
     def apply_deleted_ids(self, deleted_ids) -> list:
         """Locally drop messages that a peer's tombstone data (join_ack /
@@ -2765,6 +3016,19 @@ class DirectChatListener:
         """The peer's typing indicator changed. Advisory: the ViewModel also
         expires an indicator that received no refresh, and a session that
         drops clears it."""
+        pass
+
+    def direct_message_edited(self, peer_id: str, message_id: str, new_content: str) -> None:
+        """The peer edited its own message (author + session validated by the
+        DirectChatManager)."""
+        pass
+
+    def direct_reaction_changed(self, peer_id: str, message_id: str, emoji: str, active: bool) -> None:
+        """The peer toggled an emoji reaction on a message of this chat."""
+        pass
+
+    def direct_pin_changed(self, peer_id: str, message_id: str, active: bool) -> None:
+        """The peer pinned/unpinned a message of this chat."""
         pass
 
 
@@ -3358,6 +3622,29 @@ class DirectChatManager:
         if changed:
             self._notify_messages(peer_id)
 
+    def _edit_message(self, peer_id: str, message_id: str, new_content: str, editor_id: str) -> bool:
+        """Apply an edit to the local direct-chat copy. Only the message's own
+        author may rewrite it; returns False (no change) otherwise. A no-op
+        edit (same text) still raises the edited flag — the author went
+        through the edit flow, and Android shows the marker immediately."""
+        changed = False
+        with self._lock:
+            msgs = self._messages.get(peer_id)
+            if msgs is None:
+                return False
+            for m in msgs:
+                if m.id == message_id:
+                    if m.sender_id == editor_id and (
+                        m.content != new_content or not m.edited
+                    ):
+                        m.content = new_content
+                        m.edited = True
+                        changed = True
+                    break
+        if changed:
+            self._notify_messages(peer_id)
+        return changed
+
     def _set_peer_typing(self, peer_id: str, active: bool) -> None:
         """Record/forward a peer typing change, deduped to real transitions."""
         with self._lock:
@@ -3743,6 +4030,92 @@ class DirectChatManager:
             )
         except Exception:
             pass
+
+    def edit_message(self, peer_id: str, message_id: str, new_content: str) -> bool:
+        """Edit one of OUR direct-chat messages on a live session. Advisory
+        like typing: never queued offline — the peer must be online to see the
+        rewrite (deletes behave the same way). Applies locally first."""
+        if not is_valid_content(new_content):
+            return False
+        with self._lock:
+            session = self._sessions.get(peer_id)
+            my_id = self._my_id
+        if session is None or not session["alive"]:
+            return False
+        target = next(
+            (m for m in self._messages.get(peer_id, []) if m.id == message_id), None
+        )
+        if target is None or target.sender_id != my_id:
+            return False
+        self._edit_message(peer_id, message_id, new_content, my_id)
+        # mark edited even when the new text equals the old one (the user
+        # still went through the edit flow)
+        with self._lock:
+            target.edited = True
+        self._notify_messages(peer_id)
+        try:
+            self._put_send(
+                session,
+                NetworkPacket(
+                    type="edit_message",
+                    group_id="direct:" + peer_id,
+                    message_id=message_id,
+                    sender_id=my_id,
+                    new_content=new_content,
+                ),
+            )
+        except Exception:
+            pass
+        return True
+
+    def send_direct_reaction(self, peer_id: str, message_id: str, emoji: str, active: bool) -> bool:
+        """Toggle an emoji reaction on a live direct session. Advisory: no
+        outbox — reactions are only meaningful while the peer is online."""
+        emoji = sanitize_emoji(emoji)
+        if not emoji:
+            return False
+        with self._lock:
+            session = self._sessions.get(peer_id)
+            my_id = self._my_id
+        if session is None or not session["alive"]:
+            return False
+        try:
+            self._put_send(
+                session,
+                NetworkPacket(
+                    type="reaction",
+                    group_id="direct:" + peer_id,
+                    message_id=message_id,
+                    sender_id=my_id,
+                    emoji=emoji,
+                    active=bool(active),
+                ),
+            )
+        except Exception:
+            pass
+        return True
+
+    def send_direct_pin(self, peer_id: str, message_id: str, active: bool) -> bool:
+        """Pin/unpin a message of a direct chat on a live session."""
+        with self._lock:
+            session = self._sessions.get(peer_id)
+            my_id = self._my_id
+        if session is None or not session["alive"]:
+            return False
+        try:
+            self._put_send(
+                session,
+                NetworkPacket(
+                    type="pin_message",
+                    group_id="direct:" + peer_id,
+                    message_id=message_id,
+                    sender_id=my_id,
+                    active=bool(active),
+                ),
+            )
+        except Exception:
+            pass
+        return True
 
     def _enqueue_pending(self, peer_id: str, contact: Peer, msg: ChatMessage) -> None:
         """Park a message for a currently-offline peer and start the redial loop."""
@@ -4305,6 +4678,47 @@ class DirectChatManager:
                         )
                     if target is not None and target.sender_id == sender:
                         self._remove_message(peer_id, packet.message_id)
+                elif packet.type == "edit_message" and packet.message_id and packet.new_content is not None:
+                    # only the session peer may edit as itself, and only its
+                    # own message (author check inside _edit_message). The
+                    # listener persists the new text, so it must fire ONLY for
+                    # an accepted edit — otherwise a peer could rewrite the
+                    # stored copy of MY message while the in-memory list
+                    # correctly refuses it (Android gates on the same result).
+                    if packet.sender_id == peer_id and self._edit_message(
+                        peer_id, packet.message_id, packet.new_content, peer_id
+                    ):
+                        listener = self._listener
+                        if listener is not None:
+                            try:
+                                listener.direct_message_edited(
+                                    peer_id, packet.message_id, packet.new_content
+                                )
+                            except Exception:
+                                logger.exception("direct edit listener failed")
+                elif packet.type == "reaction" and packet.message_id and packet.emoji:
+                    if packet.sender_id == peer_id:
+                        listener = self._listener
+                        if listener is not None:
+                            try:
+                                listener.direct_reaction_changed(
+                                    peer_id,
+                                    packet.message_id,
+                                    packet.emoji,
+                                    bool(packet.active),
+                                )
+                            except Exception:
+                                logger.exception("direct reaction listener failed")
+                elif packet.type == "pin_message" and packet.message_id:
+                    if packet.sender_id == peer_id:
+                        listener = self._listener
+                        if listener is not None:
+                            try:
+                                listener.direct_pin_changed(
+                                    peer_id, packet.message_id, bool(packet.active)
+                                )
+                            except Exception:
+                                logger.exception("direct pin listener failed")
                 elif packet.type in CALL_PACKET_TYPES:
                     # 1:1 session: call signaling must involve THIS member and
                     # the packet's sender role must match the linked peer.
@@ -4436,6 +4850,24 @@ class GroupMeshListener:
         over a mesh link. The mesh layer already validated that senderId is the
         group's creator; the ViewModel applies the change (announcement/name,
         or the kicked member's teardown)."""
+        pass
+
+    def group_mesh_edit(self, group_id: str, message_id: str, new_content: str, sender_id: str) -> None:
+        """A member edited its own message (edit_message over a mesh link;
+        the mesh layer validated sender against the link and the author)."""
+        pass
+
+    def group_mesh_reaction(self, group_id: str, message_id: str, emoji: str, sender_id: str, active: bool) -> None:
+        """A member toggled an emoji reaction over a mesh link."""
+        pass
+
+    def group_mesh_pin(self, group_id: str, message_id: str, sender_id: str, active: bool) -> None:
+        """A member pinned/unpinned a message over a mesh link."""
+        pass
+
+    def group_mesh_read_receipt(self, group_id: str, reader_id: str, up_to_id: str) -> None:
+        """A linked member reported reading the group up to [up_to_id] over a
+        mesh link (host-offline path)."""
         pass
 
 
@@ -4678,6 +5110,101 @@ class GroupMeshManager:
         )
         for link in links:
             self._spawn(self._link_write, link, packet)
+
+    def broadcast_edit(self, group_id: str, message_id: str, new_content: str) -> None:
+        """Tell every linked member that [message_id]'s author replaced its
+        content (host-offline path). The sender has already applied the edit
+        to its own mesh history (update_mesh_message), so a later history
+        push carries the new text."""
+        with self._lock:
+            state = self._groups.get(group_id)
+            if state is None:
+                return
+            my_id = state["my_peer"].id if state["my_peer"] else ""
+            links = list(state["links"].values())
+        packet = NetworkPacket(
+            type="edit_message",
+            group_id=group_id,
+            message_id=message_id,
+            sender_id=my_id,
+            new_content=new_content,
+        )
+        for link in links:
+            self._spawn(self._link_write, link, packet)
+
+    def broadcast_reaction(
+        self, group_id: str, message_id: str, emoji: str, active: bool
+    ) -> None:
+        """Toggle an emoji reaction over every mesh link. Advisory: members
+        with no link at send time miss it (no offline queue)."""
+        with self._lock:
+            state = self._groups.get(group_id)
+            if state is None:
+                return
+            my_id = state["my_peer"].id if state["my_peer"] else ""
+            links = list(state["links"].values())
+        packet = NetworkPacket(
+            type="reaction",
+            group_id=group_id,
+            message_id=message_id,
+            sender_id=my_id,
+            emoji=emoji,
+            active=bool(active),
+        )
+        for link in links:
+            self._spawn(self._link_write, link, packet)
+
+    def broadcast_pin(self, group_id: str, message_id: str, active: bool) -> None:
+        """Pin/unpin a message over every mesh link (host-offline path)."""
+        with self._lock:
+            state = self._groups.get(group_id)
+            if state is None:
+                return
+            my_id = state["my_peer"].id if state["my_peer"] else ""
+            links = list(state["links"].values())
+        packet = NetworkPacket(
+            type="pin_message",
+            group_id=group_id,
+            message_id=message_id,
+            sender_id=my_id,
+            active=bool(active),
+        )
+        for link in links:
+            self._spawn(self._link_write, link, packet)
+
+    def broadcast_read_receipt(self, group_id: str, up_to_id: str) -> None:
+        """Tell every linked member we have read the group up to [up_to_id]
+        (host-offline path)."""
+        with self._lock:
+            state = self._groups.get(group_id)
+            if state is None:
+                return
+            my_id = state["my_peer"].id if state["my_peer"] else ""
+            links = list(state["links"].values())
+        packet = NetworkPacket(
+            type="read_receipt",
+            group_id=group_id,
+            up_to_id=up_to_id,
+            reader_id=my_id,
+        )
+        for link in links:
+            self._spawn(self._link_write, link, packet)
+
+    def update_mesh_message(self, group_id: str, message_id: str, new_content: str, sender_id: str) -> bool:
+        """Apply an edit to this member's mesh history copy (author-validated
+        by the caller), so a later history push carries the new text."""
+        with self._lock:
+            state = self._groups.get(group_id)
+            if state is None:
+                return False
+            target = next(
+                (m for m in state["messages"] if m.id == message_id), None
+            )
+            if target is None or target.sender_id != sender_id:
+                return False
+            target.content = new_content
+            target.edited = True
+        return True
 
     def apply_deleted_ids(self, group_id: str, deleted_ids) -> None:
         """Convergence data received with a history push: drop still-present
@@ -5020,6 +5547,49 @@ class GroupMeshManager:
                 elif packet.type == "delete_message":
                     if packet.message_id and packet.sender_id:
                         self._handle_delete_incoming(group_id, link, packet.message_id, packet.sender_id)
+                elif packet.type == "edit_message" and packet.message_id and packet.new_content is not None:
+                    self._handle_edit_incoming(group_id, link, packet)
+                elif packet.type == "reaction" and packet.message_id and packet.emoji:
+                    # only the linked member may react as itself
+                    if packet.sender_id == link["peer_id"]:
+                        listener = self._listener
+                        if listener is not None:
+                            try:
+                                listener.group_mesh_reaction(
+                                    group_id,
+                                    packet.message_id,
+                                    packet.emoji,
+                                    packet.sender_id,
+                                    bool(packet.active),
+                                )
+                            except Exception:
+                                pass
+                elif packet.type == "pin_message" and packet.message_id:
+                    if packet.sender_id == link["peer_id"]:
+                        listener = self._listener
+                        if listener is not None:
+                            try:
+                                listener.group_mesh_pin(
+                                    group_id,
+                                    packet.message_id,
+                                    packet.sender_id,
+                                    bool(packet.active),
+                                )
+                            except Exception:
+                                pass
+                elif (
+                    packet.type == "read_receipt"
+                    and packet.up_to_id
+                    and packet.reader_id == link["peer_id"]
+                ):
+                    listener = self._listener
+                    if listener is not None:
+                        try:
+                            listener.group_mesh_read_receipt(
+                                group_id, packet.reader_id, packet.up_to_id
+                            )
+                        except Exception:
+                            pass
                 elif (
                     packet.type == "typing"
                     and packet.active is not None
@@ -5041,26 +5611,56 @@ class GroupMeshManager:
                         m for m in (packet.messages or [])
                         if m.sender_id and is_valid_content(m.content)
                     ]
+                    edits = []
                     with self._lock:
                         state = self._groups.get(group_id)
                         # A batch entry reusing a locally-known id with
-                        # DIFFERENT content is a forged overwrite (local
-                        # persistence upserts by id, so accepting it would
-                        # rewrite the stored message). Drop those entries;
-                        # identical id+content dedups naturally by id below.
-                        local_contents = (
-                            {m.id: m.content for m in state["messages"]}
+                        # DIFFERENT content is a forged overwrite UNLESS the
+                        # author itself pushes its own message over its OWN
+                        # link: that is exactly how an edit converges to a
+                        # member that was offline. Everyone else (including
+                        # the author id claimed over another member's link)
+                        # must never rewrite stored history.
+                        # TRUST NOTE: the mesh handshake is password-only and
+                        # the link's peer id is self-claimed (handle_mesh_hello
+                        # registers it without an identity proof), so a group
+                        # member CAN claim another author's id on its own link
+                        # and pass this check. The rewrite trust boundary is
+                        # therefore "holders of the group password", exactly
+                        # like the delete tombstones (see README security
+                        # notes); binding link identity (DeviceIdentity-signed
+                        # mesh hello) would be needed to make it author-true.
+                        local_rows = (
+                            {m.id: m for m in state["messages"]}
                             if state is not None
                             else None
                         )
-                    if local_contents is not None:
-                        valid_history = [
-                            m for m in valid_history
-                            if m.id not in local_contents
-                            or local_contents[m.id] == m.content
-                        ]
+                        if local_rows is not None:
+                            still_new = []
+                            for m in valid_history:
+                                local = local_rows.get(m.id)
+                                if local is None:
+                                    still_new.append(m)
+                                elif (
+                                    m.sender_id == link["peer_id"]
+                                    and local.sender_id == m.sender_id
+                                    and local.content != m.content
+                                ):
+                                    local.content = m.content
+                                    local.edited = True
+                                    edits.append(m)
+                            valid_history = still_new
                     if valid_history:
                         self._handle_incoming(group_id, valid_history)
+                    for m in edits:
+                        listener = self._listener
+                        if listener is not None:
+                            try:
+                                listener.group_mesh_edit(
+                                    group_id, m.id, m.content, m.sender_id
+                                )
+                            except Exception:
+                                pass
                     if packet.deleted_ids:
                         # tombstone convergence riding the history push (no
                         # rebroadcast — see apply_deleted_ids)
@@ -5133,6 +5733,39 @@ class GroupMeshManager:
         if listener is not None:
             try:
                 listener.group_mesh_admin(group_id, packet)
+            except Exception:
+                pass
+
+    def _handle_edit_incoming(self, group_id: str, link: dict, packet: NetworkPacket) -> None:
+        """Apply a mesh-received edit locally: update this member's mesh
+        history copy and relay to the ViewModel. Only the linked member may
+        edit as itself, and only its own message (stricter than the mesh
+        delete rule: content rewrites demand the author on the authoring
+        link). No forwarding: the sender's broadcast already reached every
+        link of the complete graph.
+        TRUST NOTE: the link peer id is self-claimed (password-only mesh
+        handshake), so like deletes this rule trusts holders of the group
+        password, not a proven author identity."""
+        if packet.sender_id != link["peer_id"]:
+            logger.warning(
+                "reject mesh edit %s: claimed senderId=%r on link %s",
+                packet.message_id, packet.sender_id, link["peer_id"],
+            )
+            return
+        if not self.update_mesh_message(
+            group_id, packet.message_id, packet.new_content, packet.sender_id
+        ):
+            logger.warning(
+                "reject mesh edit %s: message not found or not authored by %r",
+                packet.message_id, packet.sender_id,
+            )
+            return
+        listener = self._listener
+        if listener is not None:
+            try:
+                listener.group_mesh_edit(
+                    group_id, packet.message_id, packet.new_content, packet.sender_id
+                )
             except Exception:
                 pass
 

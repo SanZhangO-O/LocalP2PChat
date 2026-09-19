@@ -1,9 +1,9 @@
-package com.zqr.localchat.network
+﻿package com.zqr.localchat.network
 
 import android.util.Log
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.Peer
-import com.zqr.localchat.data.withSanitizedFileInfo
+import com.zqr.localchat.data.withSanitizedExtras
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -123,6 +123,27 @@ object GroupMeshManager {
      *  is a complete graph). */
     @Volatile
     var onGroupAdmin: ((String, NetworkPacket) -> Unit)? = null
+
+    /** A member edited its own message (edit_message over a mesh link; the
+     *  mesh layer validated the sender against the link AND the author):
+     *  (groupId, messageId, newContent, senderId). Mesh worker threads. */
+    @Volatile
+    var onGroupEdit: ((String, String, String, String) -> Unit)? = null
+
+    /** A member toggled an emoji reaction over a mesh link:
+     *  (groupId, messageId, emoji, senderId, active). Mesh worker threads. */
+    @Volatile
+    var onGroupReaction: ((String, String, String, String, Boolean) -> Unit)? = null
+
+    /** A member pinned/unpinned a message over a mesh link:
+     *  (groupId, messageId, senderId, active). Mesh worker threads. */
+    @Volatile
+    var onGroupPin: ((String, String, String, Boolean) -> Unit)? = null
+
+    /** A linked member reported reading the group up to [upToId] over a mesh
+     *  link: (groupId, readerId, upToId). Mesh worker threads. */
+    @Volatile
+    var onGroupReadReceipt: ((String, String, String) -> Unit)? = null
 
     /** Shared single writer for the high-frequency advisory broadcasts
      *  (typing / admin relay): one daemon thread instead of one thread per
@@ -256,6 +277,106 @@ object GroupMeshManager {
                 runCatching { link.wire.sendPacket(packet) }
             }
         }
+    }
+
+    /** Tell every linked member that [messageId]'s author replaced its
+     *  content (host-offline path). The edit is applied to this device's own
+     *  mesh history FIRST: a later history_reply must push the new text, or
+     *  every link re-establish would push the stale text and (because the
+     *  author-link merge rule accepts it) revert the edit on the receivers. */
+    fun broadcastEdit(groupId: String, messageId: String, newContent: String) {
+        val state = groups[groupId] ?: return
+        val myId = state.myPeer?.id ?: return
+        updateMeshMessage(groupId, messageId, newContent, myId)
+        val packet = NetworkPacket(
+            type = "edit_message",
+            groupId = groupId,
+            messageId = messageId,
+            senderId = myId,
+            newContent = newContent
+        )
+        val links = state.links.values.toList()
+        sendExecutor.execute {
+            links.forEach { link ->
+                runCatching { link.wire.sendPacket(packet) }
+            }
+        }
+    }
+
+    /** Toggle an emoji reaction over every mesh link. Advisory: members with
+     *  no link at send time miss it (no offline queue). */
+    fun broadcastReaction(groupId: String, messageId: String, emoji: String, active: Boolean) {
+        val state = groups[groupId] ?: return
+        val myId = state.myPeer?.id ?: return
+        val packet = NetworkPacket(
+            type = "reaction",
+            groupId = groupId,
+            messageId = messageId,
+            senderId = myId,
+            emoji = emoji,
+            active = active
+        )
+        val links = state.links.values.toList()
+        sendExecutor.execute {
+            links.forEach { link ->
+                runCatching { link.wire.sendPacket(packet) }
+            }
+        }
+    }
+
+    /** Pin/unpin a message over every mesh link (host-offline path). */
+    fun broadcastPin(groupId: String, messageId: String, active: Boolean) {
+        val state = groups[groupId] ?: return
+        val myId = state.myPeer?.id ?: return
+        val packet = NetworkPacket(
+            type = "pin_message",
+            groupId = groupId,
+            messageId = messageId,
+            senderId = myId,
+            active = active
+        )
+        val links = state.links.values.toList()
+        sendExecutor.execute {
+            links.forEach { link ->
+                runCatching { link.wire.sendPacket(packet) }
+            }
+        }
+    }
+
+    /** Tell every linked member we have read the group up to [upToId]
+     *  (host-offline path). */
+    fun broadcastReadReceipt(groupId: String, upToId: String) {
+        val state = groups[groupId] ?: return
+        val myId = state.myPeer?.id ?: return
+        val packet = NetworkPacket(
+            type = "read_receipt",
+            groupId = groupId,
+            upToId = upToId,
+            readerId = myId
+        )
+        val links = state.links.values.toList()
+        sendExecutor.execute {
+            links.forEach { link ->
+                runCatching { link.wire.sendPacket(packet) }
+            }
+        }
+    }
+
+    /** Apply an edit to this member's mesh history copy (author-validated by
+     *  the caller), so a later history push carries the new text. */
+    fun updateMeshMessage(groupId: String, messageId: String, newContent: String, senderId: String): Boolean {
+        val state = groups[groupId] ?: return false
+        synchronized(state) {
+            val messages = state.messages.value
+            val target = messages.firstOrNull { it.id == messageId }
+            if (target == null || target.senderId != senderId) return false
+            if (target.content != newContent || !target.edited) {
+                state.messages.value = messages.map {
+                    if (it.id == messageId) it.copy(content = newContent, edited = true) else it
+                }
+            }
+        }
+        return true
     }
 
     /** Relay an owner management packet over every mesh link. Called when a
@@ -539,7 +660,7 @@ object GroupMeshManager {
                         if (msg.senderId != link.peerId || !P2PManager.isValidContent(msg.content)) {
                             Log.w(TAG, "drop ${packet.type} on link ${link.peerId}: senderId=${msg.senderId} len=${msg.content.length}")
                         } else {
-                            handleIncoming(state, P2PManager.markFromMe(msg.withSanitizedFileInfo(), state.myPeer?.id ?: ""))
+                            handleIncoming(state, P2PManager.markFromMe(msg.withSanitizedExtras(), state.myPeer?.id ?: ""))
                         }
                     }
                     "delete_message" -> {
@@ -558,8 +679,11 @@ object GroupMeshManager {
                         // 过滤一致），防止伪造 senderId 注入或超长内容入库
                         val incoming = packet.messages.orEmpty()
                             .filter { it.senderId.isNotBlank() && P2PManager.isValidContent(it.content) }
-                            .map { P2PManager.markFromMe(it.withSanitizedFileInfo(), state.myPeer?.id ?: "") }
-                        handleIncoming(state, incoming)
+                        // Same rule as the Windows client: a batch entry
+                        // reusing a locally-known id with DIFFERENT content is
+                        // a forged overwrite UNLESS the author pushes its OWN
+                        // message over its OWN link (edit convergence).
+                        applyHistoryBatch(state, link, incoming)
                         // tombstone sync: drop messages deleted while this
                         // member was offline (no author check — the link's
                         // password-bound handshake proved group membership).
@@ -581,6 +705,37 @@ object GroupMeshManager {
                         }
                     }
                     "group_update", "kick_member" -> handleAdminIncoming(state, link, packet)
+                    "edit_message" -> handleEditIncoming(state, link, packet)
+                    "reaction" -> {
+                        // only the linked member may react as itself; sanitize
+                        // BEFORE the emptiness check so an all-control-char
+                        // payload can never persist as an empty reaction key
+                        // (Windows rejects it at decode)
+                        val id = packet.messageId
+                        val sender = packet.senderId
+                        val emoji = com.zqr.localchat.data.sanitizeEmoji(packet.emoji)
+                        if (id != null && sender != null && sender == link.peerId &&
+                            emoji.isNotEmpty()
+                        ) {
+                            onGroupReaction?.invoke(
+                                state.groupId, id, emoji, sender, packet.active == true
+                            )
+                        }
+                    }
+                    "pin_message" -> {
+                        val id = packet.messageId
+                        val sender = packet.senderId
+                        if (id != null && sender != null && sender == link.peerId) {
+                            onGroupPin?.invoke(state.groupId, id, sender, packet.active == true)
+                        }
+                    }
+                    "read_receipt" -> {
+                        val upTo = packet.upToId
+                        val reader = packet.readerId
+                        if (upTo != null && reader != null && reader == link.peerId) {
+                            onGroupReadReceipt?.invoke(state.groupId, reader, upTo)
+                        }
+                    }
                     "ping" -> runCatching { link.wire.sendPacket(NetworkPacket(type = "pong")) }
                     "pong" -> {}
                 }
@@ -593,6 +748,66 @@ object GroupMeshManager {
             updateHasLinks(state.groupId)
             closeSocket(link.socket)
         }
+    }
+
+    /** Merge one history batch: brand-new ids flow into [handleIncoming];
+     *  an id-colliding entry rewrites the local copy ONLY when the author
+     *  pushes its OWN message over its OWN link (edit convergence — the
+     *  strict rule mirrors the Windows client: everyone else's collision is
+     *  a forged overwrite and is dropped). */
+    private fun applyHistoryBatch(state: GroupState, link: Link, incoming: List<ChatMessage>) {
+        if (incoming.isEmpty()) return
+        val stillNew = ArrayList<ChatMessage>(incoming.size)
+        val edits = ArrayList<ChatMessage>()
+        synchronized(state) {
+            val local = state.messages.value.associateBy { it.id }
+            for (msg in incoming) {
+                val existing = local[msg.id]
+                when {
+                    existing == null -> stillNew.add(msg)
+                    msg.senderId == link.peerId &&
+                        existing.senderId == msg.senderId &&
+                        existing.content != msg.content -> {
+                        // edit convergence: replace in the mesh state and
+                        // report the edit so the ViewModel updates the row
+                        updateMeshMessage(state.groupId, msg.id, msg.content, msg.senderId)
+                        edits.add(msg)
+                    }
+                    // identical copy: dedup by id; anything else: forged drop
+                }
+            }
+        }
+        if (stillNew.isNotEmpty()) {
+            handleIncoming(
+                state,
+                stillNew.map { P2PManager.markFromMe(it.withSanitizedExtras(), state.myPeer?.id ?: "") }
+            )
+        }
+        for (msg in edits) {
+            onGroupEdit?.invoke(state.groupId, msg.id, msg.content, msg.senderId)
+        }
+    }
+
+    /** Apply a mesh-received edit locally: update this member's mesh history
+     *  copy and relay to the ViewModel. Only the linked member may edit as
+     *  itself, and only its own message (stricter than the mesh delete rule:
+     *  content rewrites demand the author on the authoring link). No
+     *  forwarding: the sender's broadcast already reached every link of the
+     *  complete graph. */
+    private fun handleEditIncoming(state: GroupState, link: Link, packet: NetworkPacket) {
+        val id = packet.messageId
+        val content = packet.newContent
+        val sender = packet.senderId
+        if (id == null || content == null || sender == null) return
+        if (sender != link.peerId || !P2PManager.isValidContent(content)) {
+            Log.w(TAG, "reject mesh edit $id: senderId=$sender on link ${link.peerId}")
+            return
+        }
+        if (!updateMeshMessage(state.groupId, id, content, sender)) {
+            Log.w(TAG, "reject mesh edit $id: message not found or not authored by $sender")
+            return
+        }
+        onGroupEdit?.invoke(state.groupId, id, content, sender)
     }
 
     /** Apply a mesh-received delete locally: remove the message from this

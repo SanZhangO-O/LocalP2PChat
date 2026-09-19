@@ -2,6 +2,7 @@ package com.zqr.localchat.data
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
+import org.json.JSONArray
 
 @Serializable
 data class Peer(
@@ -18,6 +19,7 @@ object FileKind {
     const val FILE = "file"
     const val IMAGE = "image"
     const val VIDEO = "video"
+    const val AUDIO = "audio"
 }
 
 /** Image extensions recognized for media classification (lowercase, with
@@ -28,14 +30,176 @@ val IMAGE_EXTENSIONS = setOf(".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", "
  *  dot); mirrors the Windows client's models.VIDEO_EXTENSIONS. */
 val VIDEO_EXTENSIONS = setOf(".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".3gp")
 
-/** Classify a file by name for the send path: "image", "video" or "file". */
+/** Audio extensions recognized for media classification (lowercase, with
+ *  dot); mirrors the Windows client's models.AUDIO_EXTENSIONS. Voice messages
+ *  are plain 16 kHz mono WAV on both platforms, so no codec is involved. */
+val AUDIO_EXTENSIONS = setOf(".wav", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".mp3", ".flac")
+
+/** Classify a file by name for the send path: "image", "video", "audio" or
+ *  "file". Old peers that do not know "audio" degrade it to a plain file
+ *  card that still downloads and plays externally. */
 fun detectMediaKind(fileName: String): String {
     val ext = fileName.substringAfterLast('.', "").lowercase()
     if (ext.isEmpty()) return FileKind.FILE
     return when {
         ".$ext" in IMAGE_EXTENSIONS -> FileKind.IMAGE
         ".$ext" in VIDEO_EXTENSIONS -> FileKind.VIDEO
+        ".$ext" in AUDIO_EXTENSIONS -> FileKind.AUDIO
         else -> FileKind.FILE
+    }
+}
+
+/** File kinds a decode keeps ("audio" included on this platform; anything
+ *  else degrades to a plain file, Windows normalize_media_kind parity). */
+fun normalizeMediaKind(kind: String): String =
+    if (kind == FileKind.IMAGE || kind == FileKind.VIDEO || kind == FileKind.AUDIO) kind
+    else FileKind.FILE
+
+/** Mentions (@提及): ChatMessage.mentions carries peer ids; the special id
+ *  "all" means "mentioned everyone". Windows models parity. */
+const val MENTION_ALL = "all"
+const val MAX_MENTIONS = 64
+const val MAX_MENTION_ID_LEN = 128
+
+/** Serialize a mentions list into the persisted text column ("" = none). */
+fun storedMentionsJson(mentions: List<String>?): String =
+    if (mentions.isNullOrEmpty()) "" else JSONArray(mentions).toString()
+
+/** Parse the persisted mentions column back into a list (null = none). */
+fun parseStoredMentions(raw: String?): List<String>? {
+    if (raw.isNullOrEmpty()) return null
+    return runCatching {
+        val arr = JSONArray(raw)
+        (0 until arr.length()).map { arr.getString(it) }
+    }.getOrNull()?.ifEmpty { null }
+}
+
+/** Python `str.isprintable() and not str.isspace()` parity for one code
+ *  point: non-printable categories (Cc/Cf/Cs/Co/Cn/Zl/Zp/Zs) and every
+ *  whitespace character are dropped, so both ends keep/drop exactly the same
+ *  characters (ZWJ is Cf -> dropped; VS16/keycap are marks -> kept;
+ *  SURROGATE is Cs -> dropped, matching Python, so a JSON lone surrogate can
+ *  never reach the reaction table). */
+private fun isPrintableNonSpaceCodePoint(cp: Int): Boolean {
+    if (Character.isWhitespace(cp) || Character.isSpaceChar(cp)) return false
+    return when (Character.getType(cp)) {
+        Character.CONTROL.toInt(),
+        Character.FORMAT.toInt(),
+        Character.SURROGATE.toInt(),
+        Character.PRIVATE_USE.toInt(),
+        Character.UNASSIGNED.toInt(),
+        Character.LINE_SEPARATOR.toInt(),
+        Character.PARAGRAPH_SEPARATOR.toInt(),
+        Character.SPACE_SEPARATOR.toInt() -> false
+        else -> true
+    }
+}
+
+/** A reaction emoji is a sender-supplied short string: drop non-printable and
+ *  whitespace characters and cap at 16 CODE POINTS (never splitting a
+ *  surrogate pair) — exactly the Windows `sanitize_emoji` rule, so the same
+ *  wire value maps to the same stored string on both platforms. Returns ""
+ *  when nothing usable remains. */
+fun sanitizeEmoji(value: String?): String {
+    val text = value ?: return ""
+    val out = StringBuilder(text.length)
+    var i = 0
+    var count = 0
+    while (i < text.length && count < 16) {
+        val cp = text.codePointAt(i)
+        i += Character.charCount(cp)
+        if (isPrintableNonSpaceCodePoint(cp)) {
+            out.appendCodePoint(cp)
+            count++
+        }
+    }
+    return out.toString()
+}
+
+/** Token-boundary match of "@name" (Windows `_matches_mention` parity): the
+ *  token counts only at start-of-text/after whitespace AND end-of-text/before
+ *  whitespace, so "@Anna" no longer mentions a member called "Ann" and
+ *  "user@host" never matches. The longest name wins naturally: a shorter
+ *  prefix leaves a letter (not a boundary) right after the token. */
+fun matchesMention(text: String, name: String): Boolean {
+    val token = "@$name"
+    var start = 0
+    while (true) {
+        val i = text.indexOf(token, start)
+        if (i < 0) return false
+        val beforeOk = i == 0 || text[i - 1].isWhitespace()
+        val end = i + token.length
+        val afterOk = end == text.length || text[end].isWhitespace()
+        if (beforeOk && afterOk) return true
+        start = i + 1
+    }
+}
+
+/** Ids mentioned in [text]: "@名字" tokens matched against [members] (plus
+ *  "@所有人"); null when nobody was mentioned (no wire field). */
+fun resolveMentionIds(text: String, members: List<Pair<String, String>>): List<String>? {
+    if ('@' !in text) return null
+    val ids = mutableListOf<String>()
+    if (matchesMention(text, "所有人")) ids.add(MENTION_ALL)
+    for ((id, name) in members) {
+        if (name.isNotEmpty() && matchesMention(text, name) && id !in ids) ids.add(id)
+    }
+    return ids.ifEmpty { null }
+}
+
+/** Truncate [text] to at most [maxCodePoints] CODE POINTS, never splitting a
+ *  surrogate pair. Windows slices strings by code points (`item[:128]`,
+ *  `preview[:40]`); Kotlin String.length/take count UTF-16 units, so they must
+ *  not be used for parity-sensitive limits (AGENTS.md section 6). */
+fun takeCodePoints(text: String, maxCodePoints: Int): String {
+    if (maxCodePoints <= 0) return ""
+    var count = 0
+    var i = 0
+    while (i < text.length && count < maxCodePoints) {
+        val cp = text.codePointAt(i)
+        i += Character.charCount(cp)
+        count++
+    }
+    return if (i >= text.length) text else text.substring(0, i)
+}
+
+/** Normalize an inbound mentions list: strings only, deduped in order, each
+ *  capped, at most [MAX_MENTIONS] entries. A malformed shape is ignored. */
+fun sanitizeMentions(raw: List<String>?): List<String>? {
+    if (raw == null) return null
+    val out = ArrayList<String>()
+    for (item in raw) {
+        val entry = takeCodePoints(item, MAX_MENTION_ID_LEN)
+        if (entry.isNotEmpty() && entry !in out) out.add(entry)
+        if (out.size >= MAX_MENTIONS) break
+    }
+    return out.ifEmpty { null }
+}
+
+private val EMOJI_MODIFIER_ORDS = setOf(0xFE0F, 0x200D, 0x20E3, 0x2764, 0xA9, 0xAE, 0x2122)
+
+private fun isEmojiCodePoint(cp: Int): Boolean =
+    cp >= 0x1F000 || cp in 0x2600..0x27BF || cp in 0x2B00..0x2BFF || cp in EMOJI_MODIFIER_ORDS
+
+/** True when [content] is sticker-sized: only emoji (+ variation selectors,
+ *  ZWJ, keycap caps), 1..16 CODE POINTS (a String iterates UTF-16 units, so
+ *  the scan decodes surrogate pairs — Windows parity), and at least one real
+ *  emoji character (not only modifiers). Local rendering hint only. */
+fun isBigEmoji(content: String?): Boolean {
+    val text = (content ?: "").trim()
+    if (text.isEmpty()) return false
+    val codePoints = ArrayList<Int>(text.length)
+    var i = 0
+    while (i < text.length) {
+        val cp = text.codePointAt(i)
+        codePoints.add(cp)
+        i += Character.charCount(cp)
+    }
+    if (codePoints.size > 16) return false
+    if (!codePoints.all { isEmojiCodePoint(it) }) return false
+    return codePoints.any {
+        it >= 0x1F000 || it in 0x2600..0x27BF || it in 0x2B00..0x2BFF ||
+            it == 0x2764 || it == 0xA9 || it == 0xAE || it == 0x2122
     }
 }
 
@@ -146,6 +310,13 @@ data class ChatMessage(
     val replyTo: String? = null,
     val replyPreview: String? = null,
     val replySender: String? = null,
+    /** @-mentioned peer ids ("all" = everyone). Optional, omitted from the
+     *  wire when unset so a plain message stays byte-identical (Windows
+     *  parity). */
+    val mentions: List<String>? = null,
+    /** True when the author replaced this message's content via edit_message
+     *  (carried on the wire only when true). */
+    val edited: Boolean = false,
     @Transient val isFromMe: Boolean = false,
     /** Local-only delivery state (like [isFromMe], never sent over the
      *  wire): true while an offline-sent message still waits in the direct
@@ -174,14 +345,24 @@ fun ChatMessage.replyPreviewText(): String {
 /** Inbound advisory metadata must never be trusted: a forged folderTotal (a
  *  display-only entry count) decodes to 0 = unknown once it exceeds the cap —
  *  mirrors the Windows FileInfo.from_dict clamp so both platforms agree on
- *  every wire value. */
-fun FileInfo.sanitized(): FileInfo =
-    if (folderTotal > MAX_FOLDER_FILES) copy(folderTotal = 0) else this
+ *  every wire value. Unknown kinds degrade to a plain file (Windows
+ *  normalize_media_kind parity). */
+fun FileInfo.sanitized(): FileInfo {
+    val capped = if (folderTotal > MAX_FOLDER_FILES) copy(folderTotal = 0) else this
+    return if (normalizeMediaKind(capped.kind) != capped.kind) {
+        capped.copy(kind = normalizeMediaKind(capped.kind))
+    } else capped
+}
 
-/** Clamp the advisory folder metadata carried by an inbound message (see
- *  [FileInfo.sanitized]); apply where a decoded file_message is accepted. */
-fun ChatMessage.withSanitizedFileInfo(): ChatMessage =
-    fileInfo?.let { copy(fileInfo = it.sanitized()) } ?: this
+/** Clamp every sender-controlled extra an inbound message carries — advisory
+ *  folder metadata (see [FileInfo.sanitized]) AND the mentions list (dedupe,
+ *  64 entries x 128 chars, Windows `sanitize_mentions` parity). Apply where a
+ *  decoded message is accepted, so nothing downstream (memory, storage,
+ *  render) ever sees an unbounded list. */
+fun ChatMessage.withSanitizedExtras(): ChatMessage = copy(
+    fileInfo = fileInfo?.sanitized(),
+    mentions = sanitizeMentions(mentions)
+)
 
 /**
  * Metadata for a video/audio call.

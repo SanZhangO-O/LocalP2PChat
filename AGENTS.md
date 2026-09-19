@@ -34,6 +34,11 @@ README「版本兼容说明」承诺：**聊天、文件、群组在版本不一
     （`direct_hello` 都进不来），表现为「手机电脑完全不互通」。
 - 兼容只针对「缺失的新字段」，**不针对校验失败**：密码错误、TOFU 身份不符、签名不合法
   等必须继续拒绝（见第 5 节）。
+- 新增「内容类」可选字段/类型的正确姿势参考 `audio`（语音消息）与 `mentions`/`edited`：
+  发送端省略默认值（普通消息字节不变），接收端旧版本忽略未知字段、未知 kind
+  normalize 后退化为 `file` 卡片照常下载/外部播放；编辑收敛走
+  `edit_message` + 历史推送的「作者本人经自己链路改写才接受」规则，其余来源一律按
+  伪造丢弃（改动 `history_reply` 合并规则必须两端同步并跑互通 E2E）。
 
 ## 3. 握手细节必须逐字节一致
 
@@ -64,6 +69,10 @@ README「版本兼容说明」承诺：**聊天、文件、群组在版本不一
   的对象必须在 shutdown/teardown 中停止定时器（回归：
   `windows/tests/test_functional.py::ViewModelFlowTest::test_shutdown_stops_every_owned_timer`，
   详见 `docs/LESSONS.md` 2026-09-19 续报）。
+- **页面持有原生资源必须在 hide/teardown 停止**：录音（`VoiceRecorder.cancel()`）、GIF
+  动画（`delegate.clear_movies()`）、归属该页的 QTimer；切会话还要显式 abort 录音，
+  否则「60 秒自动发送」会把语音发进当前打开的会话。`MainWindow.closeEvent` 统一调
+  页面 `teardown()`。详见 `docs/LESSONS.md` 2026-09-19 续报 4。
 - 离屏 GUI 测试要沿真实 UI 路径操作（点击行、`page.open_chat()`）。
   直接调 `vm.open_direct_chat()` 不会设置 `page._peer_id`，页面不刷新，会造成假失败。
 
@@ -73,6 +82,9 @@ README「版本兼容说明」承诺：**聊天、文件、群组在版本不一
   证明的对端豁免。**不要**给未知身份的地址不一致开口子，那正是中间人入口。
 - TOFU（`DeviceIdentity`）、移除标记、消息发送者校验、通话参与者校验保持原样；
   「兼容」永远只施加于新字段缺失，而不是校验失败。
+- 网络层的作者校验必须用于门控其监听器/持久化回调（`_edit_message(...)` 返回 True
+  才通知），存储层写接口对「发送者声明」（如编辑的 senderId）加 SQL 条件做纵深防御；
+  曾出现「内存拒绝但监听器照样落库」的伪造编辑。详见 `docs/LESSONS.md` 2026-09-19 续报 3。
 - 对端安全码（指纹）与首次接触提示是刻意设计，UI 改动不要隐藏。
 
 ## 6. Android / 模拟器注意事项
@@ -85,6 +97,22 @@ README「版本兼容说明」承诺：**聊天、文件、群组在版本不一
   干净启动允许重启应用。`pm clear` 会清掉运行时权限，之后要重新 `pm grant`。
 - 更多实测坑（UI 驱动、`/proc/net/tcp` 诊断、启动模拟器）见
   `android/.agents/skills/localchat-adb-e2e/SKILL.md`。
+- **按码点处理跨端字符逻辑**：Python 字符串按码点迭代，Kotlin String 按 UTF-16
+  码元——`all { isEmojiChar(it) }` 这类直接遍历 Char 的判定会把代理对（emoji）
+  判错，必须 `codePointAt` + `Character.charCount`（教训：`isBigEmoji`，
+  `docs/LESSONS.md` 2026-09-19）。
+- **嵌套泛型三层以上用 typealias**：`Map<String, List<Pair<String, String>>>`
+  结尾的 `>>>` 会被 K2 词法器当无符号右移运算符，报一堆与类型无关的错误
+  （`Interface Map does not have constructors` 等）；起个 `typealias` 绕开。
+- **Room 写 SQL 先对 minSdk 的 SQLite 版本**：`ON CONFLICT ... DO UPDATE`（UPSERT）
+  要 SQLite 3.24 = API 30，minSdk 24 上 prepare 即失败；父行改写用
+  `INSERT OR IGNORE ... SELECT` + 相关子查询 `UPDATE`。DB 写路径别用裸
+  `runCatching` 吞错（曾表现为「迁移后历史消失」）。详见 `docs/LESSONS.md`
+  2026-09-19 续报 2。
+- **`FileInputStream.getChannel()` 只读**：回填二进制头必须用
+  `RandomAccessFile(file, "rw")`（或 `FileOutputStream(fd).getChannel()`）。
+  曾导致录音 WAV 长度字段恒为 0，Windows 端 `wave` 读 0 帧、时长 0:00、播放无声。
+  详见 `docs/LESSONS.md` 2026-09-19 续报 1。
 
 ## 7. 测试与验证
 

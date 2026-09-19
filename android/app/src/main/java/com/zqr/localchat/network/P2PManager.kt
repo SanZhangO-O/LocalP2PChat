@@ -1,4 +1,4 @@
-package com.zqr.localchat.network
+﻿package com.zqr.localchat.network
 
 import android.content.ContentResolver
 import android.content.Context
@@ -12,7 +12,7 @@ import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.data.MAX_FOLDER_FILES
 import com.zqr.localchat.data.Peer
 import com.zqr.localchat.data.sanitizeRelativePath
-import com.zqr.localchat.data.withSanitizedFileInfo
+import com.zqr.localchat.data.withSanitizedExtras
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlin.coroutines.ContinuationInterceptor
@@ -517,6 +517,13 @@ class P2PManager(
      *  on the read-loop thread. */
     @Volatile
     var typingListener: ((senderId: String, active: Boolean) -> Unit)? = null
+
+    /** Message-experience callbacks (edit / reaction / pin / group read
+     *  receipt) relayed or mesh-delivered; set by the ViewModel. */
+    var editListener: ((messageId: String, newContent: String, senderId: String) -> Unit)? = null
+    var reactionListener: ((messageId: String, emoji: String, senderId: String, active: Boolean) -> Unit)? = null
+    var pinListener: ((messageId: String, senderId: String, active: Boolean) -> Unit)? = null
+    var groupReceiptListener: ((readerId: String, upToId: String) -> Unit)? = null
 
     /**
      * Invoked by the shared HostGroupServer when the program-wide listener
@@ -1075,7 +1082,7 @@ class P2PManager(
                 // so a plain append would show duplicate bubbles
                 _messages.update { list ->
                     if (list.any { it.id == msg.id }) list
-                    else list + markFromMe(msg.withSanitizedFileInfo(), myId)
+                    else list + markFromMe(msg.withSanitizedExtras(), myId)
                 }
             }
             "announce" -> packet.peer?.let { peer ->
@@ -1114,6 +1121,18 @@ class P2PManager(
                 val active = packet.active
                 if (sender != null && active != null && sender != myId) {
                     typingListener?.invoke(sender, active)
+                }
+            }
+            "edit_message" -> applyRelayedEdit(packet)
+            "reaction" -> applyRelayedReaction(packet)
+            "pin_message" -> applyRelayedPin(packet)
+            "read_receipt" -> {
+                // group-scope read receipt relayed by the host; the reader id
+                // was validated by the host against the member's connection
+                val upTo = packet.upToId
+                val reader = packet.readerId
+                if (upTo != null && reader != null && packet.groupId == groupId) {
+                    groupReceiptListener?.invoke(reader, upTo)
                 }
             }
             "pong" -> { /* traffic only; keeps the read loop alive */ }
@@ -1216,7 +1235,7 @@ class P2PManager(
                 // the relay path, but being defensive here costs nothing)
                 _messages.update { list ->
                     if (list.any { it.id == msg.id }) list
-                    else list + markFromMe(msg.withSanitizedFileInfo(), myId)
+                    else list + markFromMe(msg.withSanitizedExtras(), myId)
                 }
                 broadcastToClients(packet, exclude = senderId)
             }
@@ -1251,6 +1270,56 @@ class P2PManager(
                     return
                 }
                 typingListener?.invoke(senderId, packet.active)
+                broadcastToClients(packet, exclude = senderId)
+            }
+            "edit_message" -> {
+                val id = packet.messageId
+                val content = packet.newContent
+                if (id == null || content == null || !isValidContent(content) ||
+                    packet.senderId != senderId
+                ) {
+                    Log.w(TAG, "reject edit_message from $senderId: senderId=${packet.senderId}")
+                    return
+                }
+                val target = _messages.value.firstOrNull { it.id == id }
+                if (target == null || target.senderId != senderId) {
+                    Log.w(TAG, "reject edit_message $id from $senderId: author=${target?.senderId}")
+                    return
+                }
+                applyEditLocal(id, content, senderId)
+                // the ViewModel persists the edit (Windows listener
+                // .message_edited parity) — without this the host's stored row
+                // keeps the pre-edit text until some mesh link re-delivers it
+                editListener?.invoke(id, content, senderId)
+                broadcastToClients(packet, exclude = senderId)
+            }
+            "reaction" -> {
+                val emoji = packet.emoji?.let { com.zqr.localchat.data.sanitizeEmoji(it) }
+                if (packet.senderId != senderId || packet.messageId == null || emoji.isNullOrEmpty()) {
+                    Log.w(TAG, "reject reaction from $senderId: senderId=${packet.senderId}")
+                    return
+                }
+                if (_messages.value.none { it.id == packet.messageId }) return
+                reactionListener?.invoke(packet.messageId!!, emoji, senderId, packet.active == true)
+                // relays carry the SANITIZED value: a member must not push an
+                // over-long emoji into every client's reaction table
+                broadcastToClients(packet.copy(emoji = emoji), exclude = senderId)
+            }
+            "pin_message" -> {
+                if (packet.senderId != senderId || packet.messageId == null) {
+                    Log.w(TAG, "reject pin_message from $senderId: senderId=${packet.senderId}")
+                    return
+                }
+                if (_messages.value.none { it.id == packet.messageId }) return
+                pinListener?.invoke(packet.messageId!!, senderId, packet.active == true)
+                broadcastToClients(packet, exclude = senderId)
+            }
+            "read_receipt" -> {
+                val upTo = packet.upToId
+                if (upTo == null || packet.readerId != senderId || packet.groupId != groupId) {
+                    return
+                }
+                groupReceiptListener?.invoke(senderId, upTo)
                 broadcastToClients(packet, exclude = senderId)
             }
             "pong" -> { /* traffic only */ }
@@ -1318,12 +1387,14 @@ class P2PManager(
     /** Send a chat message through the host relay; returns the created
      *  message (or null when the content is invalid) so the caller can also
      *  broadcast it over the group mesh. The optional reply triple attaches a
-     *  quoted header (see ChatMessage); a forward passes none of them. */
+     *  quoted header (see ChatMessage); a forward passes none of them.
+     *  [mentions] carries the @-mentioned peer ids ("all" = everyone). */
     fun sendMessage(
         content: String,
         replyTo: String? = null,
         replyPreview: String? = null,
-        replySender: String? = null
+        replySender: String? = null,
+        mentions: List<String>? = null
     ): ChatMessage? {
         if (!isValidContent(content)) return null
         val msg = ChatMessage(
@@ -1335,7 +1406,8 @@ class P2PManager(
             isFromMe = true,
             replyTo = replyTo,
             replyPreview = replyPreview,
-            replySender = replySender
+            replySender = replySender,
+            mentions = mentions?.takeIf { it.isNotEmpty() }
         )
         // Update local state synchronously so a delete issued right after the
         // send (removeMessage) can find this message immediately.
@@ -1412,6 +1484,159 @@ class P2PManager(
             }
         }
         return true
+    }
+
+    /** Author-only text edit: applies locally (content + edited flag) and
+     *  broadcasts edit_message so every member's copy follows. The group mesh
+     *  is mirrored by the ViewModel (like a chat send). */
+    fun editMessage(messageId: String, newContent: String): Boolean {
+        if (!isValidContent(newContent)) return false
+        val target = _messages.value.firstOrNull { it.id == messageId }
+        if (target == null || target.senderId != myId) return false
+        _messages.update { list ->
+            list.map {
+                if (it.id == messageId) it.copy(content = newContent, edited = true) else it
+            }
+        }
+        enqueueSend(
+            NetworkPacket(
+                type = "edit_message",
+                groupId = currentGroupId,
+                messageId = messageId,
+                senderId = myId,
+                newContent = newContent
+            )
+        )
+        return true
+    }
+
+    /** Toggle OUR emoji reaction on [messageId]. Advisory: never queued
+     *  offline (a member with no live path simply misses it). */
+    fun sendReaction(messageId: String, emoji: String, active: Boolean): Boolean {
+        val clean = com.zqr.localchat.data.sanitizeEmoji(emoji)
+        if (clean.isEmpty()) return false
+        if (_messages.value.none { it.id == messageId }) return false
+        enqueueSend(
+            NetworkPacket(
+                type = "reaction",
+                groupId = currentGroupId,
+                messageId = messageId,
+                senderId = myId,
+                emoji = clean,
+                active = active
+            )
+        )
+        return true
+    }
+
+    /** Pin/unpin a message in the group. Any member may pin (the group's
+     *  trust model is its password); every receiver validates the claimed
+     *  sender against its authenticated identity. */
+    fun sendPin(messageId: String, active: Boolean): Boolean {
+        if (_messages.value.none { it.id == messageId }) return false
+        enqueueSend(
+            NetworkPacket(
+                type = "pin_message",
+                groupId = currentGroupId,
+                messageId = messageId,
+                senderId = myId,
+                active = active
+            )
+        )
+        return true
+    }
+
+    /** Tell the group we have read up to [upToId] (host relay path; the
+     *  ViewModel mirrors it over the mesh). Receivers mark only their OWN
+     *  covered messages. */
+    fun sendGroupReadReceipt(upToId: String) {
+        if (upToId.isBlank()) return
+        enqueueSend(
+            NetworkPacket(
+                type = "read_receipt",
+                groupId = currentGroupId,
+                upToId = upToId,
+                readerId = myId
+            )
+        )
+    }
+
+    /** Apply an edit to the local list because an edit_message arrived (relay
+     *  or mesh path; both validated the author). Idempotent. */
+    fun applyEditLocal(messageId: String, newContent: String, senderId: String): Boolean {
+        var changed = false
+        _messages.update { list ->
+            list.map { msg ->
+                if (msg.id == messageId) {
+                    if (msg.senderId == senderId && (msg.content != newContent || !msg.edited)) {
+                        changed = true
+                        msg.copy(content = newContent, edited = true)
+                    } else msg
+                } else msg
+            }
+        }
+        return changed
+    }
+
+    // --------------------------------------------- message-experience apply
+
+    private fun applyRelayedEdit(packet: NetworkPacket) {
+        val id = packet.messageId ?: return
+        val content = packet.newContent ?: return
+        val sender = packet.senderId ?: return
+        // the relayed packet is only authenticated by the host, and this
+        // device's decoder performs no validation (Windows validates at
+        // from_dict): check the scope and the content like every other path
+        if (packet.groupId != groupId || !isValidContent(content)) {
+            Log.w(
+                TAG,
+                "reject relayed edit_message $id: group=${packet.groupId} len=${content.length}"
+            )
+            return
+        }
+        val target = _messages.value.firstOrNull { it.id == id }
+        if (target == null || sender != target.senderId) {
+            Log.w(
+                TAG,
+                "reject edit_message $id: packet senderId=$sender, message senderId=${target?.senderId}"
+            )
+            return
+        }
+        applyEditLocal(id, content, sender)
+        editListener?.invoke(id, content, sender)
+    }
+
+    private fun applyRelayedReaction(packet: NetworkPacket) {
+        val id = packet.messageId ?: return
+        val sender = packet.senderId ?: return
+        // the relayed packet comes from another member: sanitize here too (the
+        // emoji is part of the reaction's primary key and must never be
+        // stored over-long), mirroring the host/direct/mesh paths
+        val emoji = com.zqr.localchat.data.sanitizeEmoji(packet.emoji ?: return)
+        if (emoji.isEmpty()) return
+        if (_messages.value.none { it.id == id }) return
+        reactionListener?.invoke(id, emoji, sender, packet.active == true)
+    }
+
+    private fun applyRelayedPin(packet: NetworkPacket) {
+        val id = packet.messageId ?: return
+        val sender = packet.senderId ?: return
+        if (_messages.value.none { it.id == id }) return
+        pinListener?.invoke(id, sender, packet.active == true)
+    }
+
+    private fun enqueueSend(packet: NetworkPacket) {
+        sendScope.launch {
+            try {
+                if (isHost) {
+                    broadcastToClients(packet)
+                } else {
+                    hostWire?.sendPacket(packet)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "${packet.type} send failed", e)
+            }
+        }
     }
 
     /** Send a packet addressed to a specific member (call signaling). As the

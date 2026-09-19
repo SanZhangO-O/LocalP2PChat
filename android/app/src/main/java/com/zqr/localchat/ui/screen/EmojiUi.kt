@@ -26,7 +26,22 @@ data class EmojiCategory(val name: String, val emojis: List<String>)
 object EmojiCatalog {
     const val RECENT_TAB = "最近"
 
+    /** 贴纸 tab: a curated set sent as plain text; pure-emoji short content
+     *  renders LARGE (sticker style), so no image assets and no protocol
+     *  change are needed — old peers just see a short emoji message. */
+    val stickers: List<String> = listOf(
+        "😂", "🥹", "😍", "🥺", "😤", "😱", "🤡", "💀",
+        "🙏", "👍", "👎", "👏", "💪", "🤝", "✌️", "🫶",
+        "❤️", "💔", "💯", "🔥", "✨", "🎉", "🎂", "🍺",
+        "☕", "🌹", "🌈", "☀️", "🌙", "⚡", "🐱", "🐶",
+        "🐼", "🦊", "🐷", "🐣", "🍀", "🎁", "🚀", "🏆"
+    )
+
     val categories: List<EmojiCategory> = listOf(
+        EmojiCategory(
+            "贴纸",
+            stickers
+        ),
         EmojiCategory(
             "笑脸",
             listOf(

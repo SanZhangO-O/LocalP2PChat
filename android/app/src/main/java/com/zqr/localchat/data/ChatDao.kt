@@ -73,15 +73,163 @@ interface ChatDao {
     @Query("UPDATE saved_messages SET read = :read WHERE groupId = :groupId AND id = :id")
     suspend fun updateMessageRead(groupId: String, id: String, read: Boolean)
 
-    /** Move every message row from one conversation key to another (used when
-     *  a manually added "ip:..." placeholder chat is revealed to be a real
-     *  device id by the handshake). OR REPLACE: the target chat's observer
-     *  may already have re-inserted some of these rows (IGNORE strategy), and
-     *  a plain UPDATE would then abort on the composite-PK conflict — leaving
-     *  the source group row behind (its CASCADE cleanup would be skipped).
-     *  REPLACE makes the move idempotent regardless of insert/move ordering. */
-    @Query("UPDATE OR REPLACE saved_messages SET groupId = :toGroupId WHERE groupId = :fromGroupId")
-    suspend fun moveMessages(fromGroupId: String, toGroupId: String)
+    /** Apply an author edit to one stored message: replace the body and raise
+     *  the edited flag. Returns the number of affected rows (0/1). */
+    @Query("UPDATE saved_messages SET content = :content, edited = 1 WHERE groupId = :groupId AND id = :id")
+    suspend fun updateMessageContent(groupId: String, id: String, content: String): Int
+
+    /** Author-gated edit (defense in depth, Windows `update_message_content`
+     *  parity): a forged edit naming another author must never rewrite stored
+     *  history even if a caller skipped the network-layer authorization. */
+    @Query(
+        "UPDATE saved_messages SET content = :content, edited = 1 " +
+            "WHERE groupId = :groupId AND id = :id AND senderId = :senderId"
+    )
+    suspend fun updateMessageContentFrom(
+        groupId: String,
+        id: String,
+        content: String,
+        senderId: String
+    ): Int
+
+    // ------------------------------------------------- reactions / pins / reads
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun addReaction(reaction: MessageReaction)
+
+    @Query(
+        "DELETE FROM message_reactions WHERE groupId = :groupId AND msgId = :msgId " +
+            "AND emoji = :emoji AND actorId = :actorId"
+    )
+    suspend fun removeReaction(groupId: String, msgId: String, emoji: String, actorId: String)
+
+    @Query("SELECT * FROM message_reactions WHERE groupId = :groupId ORDER BY rowid ASC")
+    suspend fun getReactions(groupId: String): List<MessageReaction>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertPin(pin: PinnedMessage)
+
+    @Query("DELETE FROM pinned_messages WHERE groupId = :groupId AND msgId = :msgId")
+    suspend fun removePin(groupId: String, msgId: String)
+
+    @Query("SELECT * FROM pinned_messages WHERE groupId = :groupId ORDER BY pinnedAt ASC")
+    suspend fun getPins(groupId: String): List<PinnedMessage>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun addGroupReads(reads: List<GroupRead>)
+
+    @Query("SELECT * FROM group_reads WHERE groupId = :groupId")
+    suspend fun getGroupReads(groupId: String): List<GroupRead>
+
+    /**
+     * Move every message row from one conversation key to another (used when
+     * a manually added "ip:..." placeholder chat is revealed to be a real
+     * device id by the handshake).
+     *
+     * NOT a bare `UPDATE OR REPLACE saved_messages SET groupId = ...`:
+     *  - the FK children (message_reactions / pinned_messages / group_reads)
+     *    have ON UPDATE NO ACTION, so re-keying a referenced parent aborts the
+     *    statement, and
+     *  - REPLACE is delete+insert, which would cascade the children away.
+     * Order matters: (1) INSERT OR IGNORE + UPDATE the parents under the new
+     * key (refresh, never delete — the target's child state survives),
+     * (2) re-key the children (their new parent exists now), (3) delete the
+     * source parents (nothing references them anymore, so the cascade is a
+     * no-op).
+     *
+     * Deliberately NOT SQLite UPSERT (`ON CONFLICT ... DO UPDATE`): that
+     * syntax needs SQLite >= 3.24 (Android 11 / API 30) while minSdk is 24,
+     * and the failure was silently swallowed by the caller's runCatching —
+     * history stayed under the placeholder key on Android 7-10. INSERT OR
+     * IGNORE + a correlated UPDATE works on every supported API.
+     */
+    @Transaction
+    suspend fun moveMessages(fromGroupId: String, toGroupId: String) {
+        copyMessagesToGroup(fromGroupId, toGroupId)
+        refreshMovedMessages(fromGroupId, toGroupId)
+        moveMessageExtras(fromGroupId, toGroupId)
+        deleteMessagesInGroup(fromGroupId)
+    }
+
+    @Query(
+        "INSERT OR IGNORE INTO saved_messages " +
+            "(id, groupId, content, timestamp, senderId, senderName, isFromMe, " +
+            "fileSize, downloadHost, downloadPort, kind, folderId, folderName, " +
+            "relativePath, folderTotal, pending, replyTo, replyPreview, replySender, " +
+            "read, edited, mentions) " +
+            "SELECT id, :toGroupId, content, timestamp, senderId, senderName, isFromMe, " +
+            "fileSize, downloadHost, downloadPort, kind, folderId, folderName, " +
+            "relativePath, folderTotal, pending, replyTo, replyPreview, replySender, " +
+            "read, edited, mentions FROM saved_messages WHERE groupId = :fromGroupId"
+    )
+    suspend fun copyMessagesToGroup(fromGroupId: String, toGroupId: String)
+
+    /** Refresh the payload of every moved row under the target key from its
+     *  source copy (the INSERT above only created missing rows). Correlated
+     *  subqueries keep this portable to SQLite 3.9 (API 24). */
+    @Query(
+        "UPDATE saved_messages SET " +
+            "content = (SELECT s.content FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "timestamp = (SELECT s.timestamp FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "senderId = (SELECT s.senderId FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "senderName = (SELECT s.senderName FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "isFromMe = (SELECT s.isFromMe FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "fileSize = (SELECT s.fileSize FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "downloadHost = (SELECT s.downloadHost FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "downloadPort = (SELECT s.downloadPort FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "kind = (SELECT s.kind FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "folderId = (SELECT s.folderId FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "folderName = (SELECT s.folderName FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "relativePath = (SELECT s.relativePath FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "folderTotal = (SELECT s.folderTotal FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "pending = (SELECT s.pending FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "replyTo = (SELECT s.replyTo FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "replyPreview = (SELECT s.replyPreview FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "replySender = (SELECT s.replySender FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "read = (SELECT s.read FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "edited = (SELECT s.edited FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id), " +
+            "mentions = (SELECT s.mentions FROM saved_messages s WHERE s.groupId = :fromGroupId AND s.id = saved_messages.id) " +
+            "WHERE groupId = :toGroupId AND id IN " +
+            "(SELECT s.id FROM saved_messages s WHERE s.groupId = :fromGroupId)"
+    )
+    suspend fun refreshMovedMessages(fromGroupId: String, toGroupId: String)
+
+    /** Re-key the message-experience children of a moved conversation; a
+     *  duplicate row already present under the target key collapses into one. */
+    @Query("UPDATE OR REPLACE message_reactions SET groupId = :toGroupId WHERE groupId = :fromGroupId")
+    suspend fun moveReactions(fromGroupId: String, toGroupId: String)
+
+    @Query("UPDATE OR REPLACE pinned_messages SET groupId = :toGroupId WHERE groupId = :fromGroupId")
+    suspend fun movePins(fromGroupId: String, toGroupId: String)
+
+    @Query("UPDATE OR REPLACE group_reads SET groupId = :toGroupId WHERE groupId = :fromGroupId")
+    suspend fun moveGroupReads(fromGroupId: String, toGroupId: String)
+
+    @Transaction
+    suspend fun moveMessageExtras(fromGroupId: String, toGroupId: String) {
+        moveReactions(fromGroupId, toGroupId)
+        movePins(fromGroupId, toGroupId)
+        moveGroupReads(fromGroupId, toGroupId)
+    }
+
+    /** Delete one conversation's messages. Callers moving a conversation must
+     *  run [moveMessageExtras] first: the FK cascade would otherwise drop the
+     *  child rows still keyed to the source. */
+    @Query("DELETE FROM saved_messages WHERE groupId = :fromGroupId")
+    suspend fun deleteMessagesInGroup(fromGroupId: String)
+
+    /** The timestamp of one stored message (null when absent): the cheap
+     *  lookup behind a group read receipt, instead of decrypting the whole
+     *  conversation. */
+    @Query("SELECT timestamp FROM saved_messages WHERE groupId = :groupId AND id = :id LIMIT 1")
+    suspend fun messageTimestamp(groupId: String, id: String): Long?
+
+    /** Ids of own messages at or before [timestamp] — the receipt cut-off. */
+    @Query(
+        "SELECT id FROM saved_messages WHERE groupId = :groupId AND isFromMe = 1 " +
+            "AND timestamp <= :timestamp"
+    )
+    suspend fun ownMessageIdsUpTo(groupId: String, timestamp: Long): List<String>
 
     /**
      * One transaction removes the group row; saved_messages rows cascade via

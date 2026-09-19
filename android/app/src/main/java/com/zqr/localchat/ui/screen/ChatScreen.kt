@@ -1,13 +1,19 @@
 package com.zqr.localchat.ui.screen
 
+import android.Manifest
 import android.content.ClipData
+import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.media.ThumbnailUtils
 import android.provider.MediaStore
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
@@ -29,13 +35,16 @@ import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.EmojiEmotions
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Reply
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.AddReaction
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -64,6 +73,7 @@ import com.zqr.localchat.data.CallResult
 import com.zqr.localchat.data.ChatMessage
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
+import com.zqr.localchat.data.resolveMentionIds
 import com.zqr.localchat.data.replyPreviewText
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.viewmodel.ChatViewModel
@@ -201,8 +211,9 @@ fun ChatScreen(
     downloadStates: Map<String, ChatViewModel.DownloadState> = emptyMap(),
     /** Display names of members currently typing ("xx 正在输入…"). */
     typingNames: List<String> = emptyList(),
-    /** Send the draft, optionally quoting [replyTo] (null = plain message). */
-    onSendMessage: (String, ChatMessage?) -> Boolean,
+    /** Send the draft, optionally quoting [replyTo] (null = plain message)
+     *  and mentioning [mentions] (null = nobody). */
+    onSendMessage: (String, ChatMessage?, List<String>?) -> Boolean,
     onForward: (groupId: String, content: String) -> Boolean,
     onDelete: (String) -> Unit,
     onPickFile: () -> Unit = {},
@@ -225,10 +236,33 @@ fun ChatScreen(
     /** The local user typed in the draft: refresh our typing indicator
      *  (the ViewModel throttles and auto-stops it). */
     onTyping: () -> Unit = {},
+    /** The open conversation shows the newest messages (screen opened or a
+     *  batch arrived): report the group read receipt (the ViewModel dedups
+     *  until a newer message arrives). */
+    onVisible: () -> Unit = {},
     /** A search-result jump: scroll to this message and flash-highlight it,
      *  then call [onRevealHandled] (once). */
     revealMessageId: String? = null,
     onRevealHandled: () -> Unit = {},
+    // ---- message experience (edit / reactions / pins / group receipts / mentions)
+    /** {msgId: [(emoji, actorId), …]} recorded reactions of this group. */
+    reactions: Map<String, List<Pair<String, String>>> = emptyMap(),
+    /** Pinned rows, oldest first (banner shows the last). */
+    pins: List<com.zqr.localchat.data.PinnedMessage> = emptyList(),
+    /** {msgId: [readerId, …]} recorded group read receipts (own messages). */
+    groupReaders: Map<String, List<String>> = emptyMap(),
+    /** Other-member count for the 已读 n/m label. */
+    memberCount: Int = 1,
+    /** This device's id (reaction ownership / mention highlight). */
+    myDeviceId: String = "",
+    /** (id, name) of the group's members for the @-picker. */
+    members: List<Pair<String, String>> = emptyList(),
+    onToggleReaction: (String, String, Boolean) -> Unit = { _, _, _ -> },
+    onTogglePin: (String, Boolean) -> Unit = { _, _ -> },
+    /** Author-only text edit; false = not delivered (disconnected). */
+    onEditMessage: (String, String) -> Boolean = { _, _ -> false },
+    /** Send a recorded WAV file path as a voice message (file channel). */
+    onSendVoice: (String) -> Unit = {},
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -246,15 +280,118 @@ fun ChatScreen(
     var revealConsumed by remember(revealMessageId) { mutableStateOf(false) }
     var emojiPickerOpen by remember { mutableStateOf(false) }
     var recentEmoji by remember { mutableStateOf(RecentEmoji.load(context)) }
+    // @-picker open while the draft ends with "@"
+    var mentionPickerOpen by remember { mutableStateOf(false) }
+    // Voice capture + playback (WAV 16 kHz mono, Windows parity).
+    val voiceDir = remember { java.io.File(context.cacheDir, "voice") }
+    val voiceRecorder = remember { com.zqr.localchat.ui.VoiceRecorder(voiceDir) }
+    val voicePlayer = remember { com.zqr.localchat.ui.VoicePlayer() }
+    var voiceRecording by remember { mutableStateOf(false) }
+    var voiceSeconds by remember { mutableStateOf(0) }
+    var playingVoiceId by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    // previous sessions' recordings can never be offered again (Windows
+    // parity): prune them off the main thread
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            com.zqr.localchat.ui.VoiceNotes.pruneRecordings(voiceDir)
+        }
+    }
+    /** Begin capture; the caller has already ensured the mic permission. */
+    fun startVoiceRecording() {
+        if (voiceRecording) return
+        if (voiceRecorder.start()) {
+            voiceRecording = true
+            voiceSeconds = 0
+        } else {
+            Toast.makeText(
+                context,
+                "无法开始录音：请先授予麦克风权限",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+    // RECORD_AUDIO is a runtime permission: voice messages must ask for it
+    // like the call flow does — a fresh install that never placed a call has
+    // no grant, and AudioRecord then stays silent (an empty clip).
+    val recordPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            startVoiceRecording()
+        } else {
+            Toast.makeText(
+                context,
+                "未授予麦克风权限，无法录制语音（可在系统设置中开启）",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+    // Leaving the screen must not keep the microphone capturing or the
+    // MediaPlayer playing (both are native resources). onFinished is bound in
+    // an effect (not the composition body) and unbound on dispose.
+    DisposableEffect(Unit) {
+        voicePlayer.onFinished = { playingVoiceId = null }
+        onDispose {
+            voicePlayer.onFinished = null
+            voicePlayer.stop()
+            voiceRecorder.cancel()
+        }
+    }
+    /** Stop capture off the main thread and offer the clip to the group. */
+    fun finishVoiceRecording() {
+        scope.launch {
+            // stop() joins the capture thread: never on the main thread (ANR)
+            val path = withContext(Dispatchers.IO) { voiceRecorder.stop() }
+            voiceRecording = false
+            if (path.isNotEmpty() && !connectionLost) onSendVoice(path)
+        }
+    }
+    LaunchedEffect(voiceRecording) {
+        while (voiceRecording) {
+            delay(250)
+            voiceSeconds = voiceRecorder.elapsedSeconds()
+            if (voiceSeconds >= 60) {
+                // 1-minute cap like the Windows client: stop AND send the clip
+                // (breaking alone would let the mic record forever)
+                finishVoiceRecording()
+                break
+            }
+        }
+    }
     val listState = rememberLazyListState()
     var shouldAutoScroll by remember(groupName) { mutableStateOf(true) }
     val snackbarHostState = remember { SnackbarHostState() }
-    val scope = rememberCoroutineScope()
     // Folder grouping + sorting is O(n log n): compute once per message-list
     // change instead of on every recomposition (and inside every scroll event)
     val messageItems = remember(messages) { buildMessageItems(messages) }
 
     val contentTooLong = inputText.text.length > P2PManager.MAX_CONTENT_LENGTH
+
+    // 已读 n/m for OWN group messages from the recorded receipts (cut-off rule
+    // matches the direct chat and Windows: timestamp <= the receipt's message).
+    // One ascending pass per message-list/read change — a per-row scan would
+    // make every recomposition O(rows x messages).
+    val readLabels = remember(messages, groupReaders, memberCount) {
+        val out = HashMap<String, String>()
+        if (groupReaders.isNotEmpty() && memberCount > 0) {
+            var covered = HashSet<String>()
+            messages.asSequence()
+                .filter { it.isFromMe }
+                .sortedBy { it.timestamp }
+                .forEach { m ->
+                    covered.addAll(groupReaders[m.id].orEmpty())
+                    val n = covered.size
+                    if (n > 0) {
+                        out[m.id] = if (n >= memberCount) "已读" else "已读 $n/$memberCount"
+                    }
+                }
+        }
+        out
+    }
+
+    fun readLabelFor(message: ChatMessage): String =
+        if (message.isFromMe) readLabels[message.id] ?: "" else ""
 
     // in-conversation search over the loaded list (newest first)
     val searchResults = remember(searchQuery, messageItems) {
@@ -299,9 +436,11 @@ fun ChatScreen(
         if (contentTooLong) return
         val text = inputText.text
         if (text.isNotBlank()) {
-            if (onSendMessage(text, replyTarget)) {
+            val mentions = resolveMentionIds(text, members)
+            if (onSendMessage(text, replyTarget, mentions)) {
                 inputText = TextFieldValue("")
                 replyTarget = null
+                mentionPickerOpen = false
             } else {
                 scope.launch {
                     snackbarHostState.showSnackbar("消息未发送：已断开连接")
@@ -332,6 +471,10 @@ fun ChatScreen(
 
     // a different group never inherits the previous chat's quote target
     LaunchedEffect(groupId) { replyTarget = null }
+
+    // the open chat shows the newest message: report a group read receipt
+    // (the ViewModel dedups until a newer message arrives)
+    LaunchedEffect(groupId, messages.size) { onVisible() }
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
@@ -461,11 +604,36 @@ fun ChatScreen(
                             tint = MaterialTheme.colorScheme.primary
                         )
                     }
+                    IconButton(
+                        onClick = {
+                            if (voiceRecording) {
+                                finishVoiceRecording()
+                            } else if (!connectionLost) {
+                                val granted = ContextCompat.checkSelfPermission(
+                                    context, Manifest.permission.RECORD_AUDIO
+                                ) == PackageManager.PERMISSION_GRANTED
+                                if (granted) {
+                                    startVoiceRecording()
+                                } else {
+                                    recordPermissionLauncher.launch(
+                                        Manifest.permission.RECORD_AUDIO
+                                    )
+                                }
+                            }
+                        },
+                        enabled = !connectionLost || voiceRecording
+                    ) {
+                        Text(
+                            text = if (voiceRecording) "${voiceSeconds}s" else "🎤",
+                            fontSize = if (voiceRecording) 11.sp else 18.sp
+                        )
+                    }
                     OutlinedTextField(
                         value = inputText,
                         onValueChange = {
                             inputText = it
                             if (it.text.isNotBlank()) onTyping()
+                            mentionPickerOpen = it.text.endsWith("@") && members.isNotEmpty()
                         },
                         placeholder = { Text("输入消息...") },
                         modifier = Modifier.weight(1f),
@@ -503,11 +671,53 @@ fun ChatScreen(
     }
     ) { padding ->
       Box(modifier = Modifier.fillMaxSize()) {
-        if (messages.isEmpty()) {
+        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            // Pinned-message banner: the newest pin; tap jumps to it, ✕ unpins.
+            if (pins.isNotEmpty()) {
+                val newest = pins.last()
+                // remembered: a per-recomposition firstOrNull() over the whole
+                // list is exactly the O(rows x messages) pattern LESSONS #5
+                // warns about; the cap also counts CODE POINTS (Windows
+                // preview[:40]), not UTF-16 units
+                val pinnedPreview = remember(pins, messages) {
+                    val raw = messages.firstOrNull { it.id == newest.msgId }
+                        ?.let { m ->
+                            (m.content.ifBlank { m.fileInfo?.fileName ?: "" })
+                                .replace("\n", " ")
+                        }
+                        .orEmpty()
+                    if (raw.isEmpty()) "（消息不在本地记录中）"
+                    else com.zqr.localchat.data.takeCodePoints(raw, 40)
+                }
+                val pinnedBy = newest.pinnedBy.takeIf { it.isNotBlank() }?.let { " $it" } ?: ""
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+                        .clickable {
+                            revealInList(newest.msgId)
+                        }
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "📌$pinnedBy 置顶：$pinnedPreview",
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(onClick = { onTogglePin(newest.msgId, false) }) {
+                        Text("取消", fontSize = 12.sp)
+                    }
+                }
+            }
+            Box(modifier = Modifier.weight(1f)) {
+                if (messages.isEmpty()) {
             Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding),
+                modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -528,7 +738,6 @@ fun ChatScreen(
             LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(padding)
                     .padding(horizontal = 12.dp),
                 state = listState,
                 contentPadding = PaddingValues(vertical = 8.dp),
@@ -566,43 +775,119 @@ fun ChatScreen(
                         is MessageItem.Msg -> {
                             val message = item.message
                             val fi = message.fileInfo
-                            if (fi != null) {
+                            val myReactions = reactions[message.id]
+                                ?.filter { it.second == myDeviceId }
+                                ?.map { it.first }
+                                ?.toSet()
+                                ?: emptySet()
+                            val reactionList = reactions[message.id]
+                                ?.fold(linkedMapOf<String, Int>()) { acc, (emoji, _) ->
+                                    acc[emoji] = (acc[emoji] ?: 0) + 1
+                                    acc
+                                }
+                                ?.map { it.key to it.value }
+                                ?: emptyList()
+                            if (fi != null && fi.kind == FileKind.AUDIO) {
+                                val saved =
+                                    downloadStates[message.id] as? ChatViewModel.DownloadState.Done
+                                VoiceMessageBubble(
+                                    message = message,
+                                    state = downloadStates[message.id],
+                                    localPath = saved?.uri ?: resolveMedia(fi),
+                                    playing = playingVoiceId == message.id,
+                                    isFromMe = message.isFromMe,
+                                    reactions = reactionList,
+                                    myReactions = myReactions,
+                                    pinned = pins.any { it.msgId == message.id },
+                                    onTogglePlay = {
+                                        val path = saved?.uri ?: resolveMedia(fi)
+                                        if (path != null) {
+                                            if (playingVoiceId == message.id) {
+                                                voicePlayer.stop()
+                                                playingVoiceId = null
+                                            } else if (voicePlayer.play(path)) {
+                                                playingVoiceId = message.id
+                                            } else {
+                                                onOpenFile(path)
+                                            }
+                                        } else {
+                                            onDownloadMedia(fi)
+                                        }
+                                    },
+                                    onReact = { emoji, active ->
+                                        onToggleReaction(message.id, emoji, active)
+                                    },
+                                    onPin = { active -> onTogglePin(message.id, active) },
+                                    onDelete = { pendingDelete = message.id }
+                                )
+                            } else if (fi != null) {
                                 if (fi.kind == FileKind.IMAGE || fi.kind == FileKind.VIDEO) {
                                     val saved =
                                         downloadStates[message.id] as? ChatViewModel.DownloadState.Done
-                                    MediaMessageBubble(
-                                        message = message,
-                                        state = downloadStates[message.id],
-                                        localPath = saved?.uri ?: resolveMedia(fi),
-                                        onDownload = { onDownloadMedia(fi) },
-                                        onSaveAs = { onDownloadFile(fi) },
-                                        onOpen = onOpenFile,
-                                        onDelete = { pendingDelete = message.id }
-                                    )
+                                    Column(horizontalAlignment = if (message.isFromMe) Alignment.End else Alignment.Start) {
+                                        MediaMessageBubble(
+                                            message = message,
+                                            state = downloadStates[message.id],
+                                            localPath = saved?.uri ?: resolveMedia(fi),
+                                            onDownload = { onDownloadMedia(fi) },
+                                            onSaveAs = { onDownloadFile(fi) },
+                                            onOpen = onOpenFile,
+                                            onDelete = { pendingDelete = message.id }
+                                        )
+                                        ReactionPills(
+                                            message = message,
+                                            reactions = reactionList,
+                                            myReactions = myReactions,
+                                            onToggleReaction = onToggleReaction,
+                                            readLabel = readLabelFor(message),
+                                            edited = message.edited
+                                        )
+                                    }
                                 } else {
                                     val saved =
                                         downloadStates[message.id] as? ChatViewModel.DownloadState.Done
-                                    FileMessageBubble(
-                                        message = message,
-                                        state = downloadStates[message.id],
-                                        onDownload = { onDownloadFile(fi) },
-                                        onOpen = saved?.let { done -> { onOpenFile(done.uri) } },
-                                        onCancel = { ChatViewModel.cancelDownload(message.id) },
-                                        onDelete = { pendingDelete = message.id }
-                                    )
+                                    Column(horizontalAlignment = if (message.isFromMe) Alignment.End else Alignment.Start) {
+                                        FileMessageBubble(
+                                            message = message,
+                                            state = downloadStates[message.id],
+                                            onDownload = { onDownloadFile(fi) },
+                                            onOpen = saved?.let { done -> { onOpenFile(done.uri) } },
+                                            onCancel = { ChatViewModel.cancelDownload(message.id) },
+                                            onDelete = { pendingDelete = message.id }
+                                        )
+                                        ReactionPills(
+                                            message = message,
+                                            reactions = reactionList,
+                                            myReactions = myReactions,
+                                            onToggleReaction = onToggleReaction,
+                                            readLabel = readLabelFor(message),
+                                            edited = message.edited
+                                        )
+                                    }
                                 }
                             } else {
                                 MessageBubble(
                                     message = message,
                                     onReply = { replyTarget = it },
                                     onForward = { pendingForward = it },
-                                    onDelete = { pendingDelete = it }
+                                    onDelete = { pendingDelete = it },
+                                    reactions = reactionList,
+                                    myReactions = myReactions,
+                                    pinned = pins.any { it.msgId == message.id },
+                                    mentionHighlighted = !message.isFromMe && message.mentions?.let {
+                                        it.contains(myDeviceId) || it.contains(com.zqr.localchat.data.MENTION_ALL)
+                                    } == true,
+                                    readLabel = readLabelFor(message),
+                                    onToggleReaction = onToggleReaction,
+                                    onTogglePin = { active -> onTogglePin(message.id, active) },
+                                    onEdit = { onEditMessage(message.id, it) }
                                 )
                             }
                         }
                     }
                     }
                 }
+            }
             }
         }
         if (searchActive) {
@@ -626,6 +911,7 @@ fun ChatScreen(
         }
       }
     }
+    }
 
     if (emojiPickerOpen) {
         EmojiPickerDialog(
@@ -641,6 +927,45 @@ fun ChatScreen(
                 recentEmoji = RecentEmoji.record(context, emoji)
             },
             onDismiss = { emojiPickerOpen = false }
+        )
+    }
+
+    if (mentionPickerOpen) {
+        AlertDialog(
+            onDismissRequest = { mentionPickerOpen = false },
+            title = { Text("@ 提及成员") },
+            text = {
+                Column {
+                    Text(
+                        text = "@所有人",
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                val t = inputText.text.removeSuffix("@") + "@所有人 "
+                                inputText = TextFieldValue(t, TextRange(t.length))
+                                mentionPickerOpen = false
+                            }
+                            .padding(vertical = 8.dp)
+                    )
+                    members.forEach { (id, name) ->
+                        Text(
+                            text = "@$name",
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    val t = inputText.text.removeSuffix("@") + "@$name "
+                                    inputText = TextFieldValue(t, TextRange(t.length))
+                                    mentionPickerOpen = false
+                                }
+                                .padding(vertical = 8.dp)
+                        )
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { mentionPickerOpen = false }) { Text("取消") }
+            }
         )
     }
 
@@ -812,9 +1137,18 @@ private fun MessageBubble(
     message: ChatMessage,
     onReply: (ChatMessage) -> Unit,
     onForward: (String) -> Unit,
-    onDelete: (String) -> Unit
+    onDelete: (String) -> Unit,
+    reactions: List<Pair<String, Int>> = emptyList(),
+    myReactions: Set<String> = emptySet(),
+    pinned: Boolean = false,
+    mentionHighlighted: Boolean = false,
+    readLabel: String = "",
+    onToggleReaction: (String, String, Boolean) -> Unit = { _, _, _ -> },
+    onTogglePin: (Boolean) -> Unit = {},
+    onEdit: ((String) -> Boolean)? = null
 ) {
     val isFromMe = message.isFromMe
+    val bigEmoji = com.zqr.localchat.data.isBigEmoji(message.content)
     val alignment = if (isFromMe) Alignment.End else Alignment.Start
     val bgColor = if (isFromMe)
         MaterialTheme.colorScheme.primary
@@ -826,6 +1160,8 @@ private fun MessageBubble(
         MaterialTheme.colorScheme.onSurfaceVariant
 
     var showMenu by remember { mutableStateOf(false) }
+    var showReactionPicker by remember { mutableStateOf(false) }
+    var showEditDialog by remember { mutableStateOf(false) }
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -844,23 +1180,25 @@ private fun MessageBubble(
         Box(
             modifier = Modifier
                 .widthIn(max = maxBubbleWidth)
+                .then(if (mentionHighlighted) Modifier.border(2.dp, Color(0xFFE8A13D), shape) else Modifier)
                 .clip(shape)
-                .background(bgColor)
+                .background(if (bigEmoji) Color.Transparent else bgColor)
                 .combinedClickable(
                     // both taps open the actions menu: the bubble is clearly
                     // interactive, so an empty onClick was misleading dead UI
                     onClick = { showMenu = true },
                     onLongClick = { showMenu = true }
                 )
-                .padding(horizontal = 14.dp, vertical = 10.dp)
+                .padding(horizontal = if (bigEmoji) 4.dp else 14.dp, vertical = if (bigEmoji) 2.dp else 10.dp)
         ) {
-            Column {
-                if (!isFromMe) {
+            Column(horizontalAlignment = Alignment.End) {
+                if (!isFromMe && !bigEmoji) {
                     Text(
                         text = message.senderName,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium,
-                        color = textColor.copy(alpha = 0.7f)
+                        color = textColor.copy(alpha = 0.7f),
+                        modifier = Modifier.align(Alignment.Start)
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                 }
@@ -868,10 +1206,19 @@ private fun MessageBubble(
                 Text(
                     text = message.content,
                     color = textColor,
-                    fontSize = 15.sp
+                    fontSize = if (bigEmoji) 40.sp else 15.sp
                 )
+                // Stickers keep a compact status line too: without it a big
+                // emoji lost 待送达/已编辑/已读/时间 entirely (Windows keeps
+                // the timestamp for stickers as well)
+                val status = buildString {
+                    if (message.pending) append("待送达 · ")
+                    else if (readLabel.isNotEmpty()) append(readLabel + " · ")
+                    if (message.edited) append("已编辑 · ")
+                    append(formatTime(message.timestamp))
+                }
                 Text(
-                    text = formatTime(message.timestamp),
+                    text = status,
                     color = textColor.copy(alpha = 0.6f),
                     fontSize = 11.sp,
                     modifier = Modifier.align(Alignment.End)
@@ -879,47 +1226,293 @@ private fun MessageBubble(
             }
             DropdownMenu(
                 expanded = showMenu,
-                onDismissRequest = { showMenu = false }
+                onDismissRequest = { showMenu = false; showReactionPicker = false }
             ) {
-                DropdownMenuItem(
-                    text = { Text("回复") },
-                    onClick = {
-                        onReply(message)
-                        showMenu = false
-                    },
-                    leadingIcon = { Icon(Icons.Filled.Reply, contentDescription = null) }
-                )
-                DropdownMenuItem(
-                    text = { Text("复制") },
-                    onClick = {
-                        scope.launch {
-                            clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("LocalChat", message.content)))
+                if (showReactionPicker) {
+                    Row(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+                        REACTION_CHOICES.forEach { emoji ->
+                            TextButton(onClick = {
+                                val active = emoji !in myReactions
+                                onToggleReaction(message.id, emoji, active)
+                                showMenu = false
+                                showReactionPicker = false
+                            }) {
+                                Text(emoji, fontSize = 20.sp)
+                            }
                         }
-                        Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
-                        showMenu = false
-                    },
-                    leadingIcon = { Icon(Icons.Default.ContentCopy, contentDescription = null) }
-                )
-                DropdownMenuItem(
-                    text = { Text("转发") },
-                    onClick = {
-                        onForward(message.content)
-                        showMenu = false
-                    },
-                    leadingIcon = { Icon(Icons.AutoMirrored.Filled.Forward, contentDescription = null) }
-                )
-                if (isFromMe) {
+                    }
+                } else {
                     DropdownMenuItem(
-                        text = { Text("删除") },
+                        text = { Text("回应") },
+                        onClick = { showReactionPicker = true },
+                        leadingIcon = { Icon(Icons.Default.AddReaction, contentDescription = null) }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("回复") },
                         onClick = {
-                            onDelete(message.id)
+                            onReply(message)
                             showMenu = false
                         },
-                        leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null) }
+                        leadingIcon = { Icon(Icons.Filled.Reply, contentDescription = null) }
                     )
+                    DropdownMenuItem(
+                        text = { Text("复制") },
+                        onClick = {
+                            scope.launch {
+                                clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("LocalChat", message.content)))
+                            }
+                            Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
+                            showMenu = false
+                        },
+                        leadingIcon = { Icon(Icons.Default.ContentCopy, contentDescription = null) }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("转发") },
+                        onClick = {
+                            onForward(message.content)
+                            showMenu = false
+                        },
+                        leadingIcon = { Icon(Icons.AutoMirrored.Filled.Forward, contentDescription = null) }
+                    )
+                    if (onEdit != null && isFromMe && !message.pending) {
+                        DropdownMenuItem(
+                            text = { Text("编辑") },
+                            onClick = {
+                                showMenu = false
+                                showEditDialog = true
+                            },
+                            leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null) }
+                        )
+                    }
+                    DropdownMenuItem(
+                        text = { Text(if (pinned) "取消置顶" else "置顶") },
+                        onClick = {
+                            onTogglePin(!pinned)
+                            showMenu = false
+                        },
+                        leadingIcon = { Icon(Icons.Default.PushPin, contentDescription = null) }
+                    )
+                    if (isFromMe) {
+                        DropdownMenuItem(
+                            text = { Text("删除") },
+                            onClick = {
+                                onDelete(message.id)
+                                showMenu = false
+                            },
+                            leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null) }
+                        )
+                    }
                 }
             }
         }
+        ReactionPills(
+            message = message,
+            reactions = reactions,
+            myReactions = myReactions,
+            onToggleReaction = onToggleReaction,
+            readLabel = "",
+            edited = message.edited
+        )
+    }
+    if (showEditDialog) {
+        val initial = message.content
+        var editDraft by remember { mutableStateOf(initial) }
+        AlertDialog(
+            onDismissRequest = { showEditDialog = false },
+            title = { Text("编辑消息") },
+            text = {
+                OutlinedTextField(
+                    value = editDraft,
+                    onValueChange = { editDraft = it },
+                    minLines = 2,
+                    maxLines = 6
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val text = editDraft.trim()
+                        if (text.isNotEmpty() && onEdit?.invoke(text) == true) {
+                            showEditDialog = false
+                        }
+                    }
+                ) {
+                    Text("保存")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEditDialog = false }) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+}
+
+/** Quick reaction set offered in the message menu (Windows parity). */
+internal val REACTION_CHOICES = listOf("👍", "❤️", "😂", "😮", "😢", "🎉")
+
+/** Reaction pill row under a bubble: grouped emoji with counts; tapping a
+ *  pill of mine toggles it off. File/media cards have no status row of their
+ *  own, so this also carries the own-message status label (read state /
+ *  已编辑) for them. */
+@Composable
+internal fun ReactionPills(
+    message: ChatMessage,
+    reactions: List<Pair<String, Int>>,
+    myReactions: Set<String>,
+    onToggleReaction: (String, String, Boolean) -> Unit,
+    readLabel: String,
+    edited: Boolean
+) {
+    val showLabel = readLabel.isNotEmpty() && message.isFromMe
+    if (reactions.isEmpty() && !showLabel && !edited) return
+    val align = if (message.isFromMe) Alignment.End else Alignment.Start
+    Column(
+        modifier = Modifier.padding(top = 2.dp),
+        horizontalAlignment = align
+    ) {
+        if (showLabel || edited) {
+            Text(
+                text = listOfNotNull(
+                    readLabel.takeIf { showLabel },
+                    "已编辑".takeIf { edited }
+                ).joinToString(" · "),
+                fontSize = 10.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        if (reactions.isNotEmpty()) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                reactions.forEach { (emoji, count) ->
+                    val mine = emoji in myReactions
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = if (mine)
+                            MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                        else
+                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                        border = if (mine) {
+                            androidx.compose.foundation.BorderStroke(
+                                1.dp, MaterialTheme.colorScheme.primary
+                            )
+                        } else null,
+                        onClick = { onToggleReaction(message.id, emoji, !mine) }
+                    ) {
+                        Text(
+                            text = if (count > 1) "$emoji ×$count" else emoji,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Voice-message bubble: play/stop + duration, rendered like a compact card.
+ *  Click plays the local WAV copy (auto-download first when not fetched);
+ *  long-press offers the same menu vocabulary as the other bubbles. */
+@Composable
+internal fun VoiceMessageBubble(
+    message: ChatMessage,
+    state: ChatViewModel.DownloadState?,
+    localPath: String?,
+    playing: Boolean,
+    isFromMe: Boolean,
+    reactions: List<Pair<String, Int>>,
+    myReactions: Set<String> = emptySet(),
+    pinned: Boolean,
+    onTogglePlay: () -> Unit,
+    onReact: (String, Boolean) -> Unit,
+    onPin: (Boolean) -> Unit,
+    onDelete: () -> Unit
+) {
+    val fi = message.fileInfo
+    val duration = remember(localPath) {
+        localPath?.let { com.zqr.localchat.ui.VoiceNotes.wavDurationSeconds(it) } ?: 0
+    }
+    val align = if (isFromMe) Alignment.End else Alignment.Start
+    var showMenu by remember { mutableStateOf(false) }
+    var showReactionPicker by remember { mutableStateOf(false) }
+    val bg = if (isFromMe) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
+    val textColor = if (isFromMe) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+    Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = align) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = bg,
+            modifier = Modifier
+                .widthIn(max = 220.dp)
+                .combinedClickable(onClick = onTogglePlay, onLongClick = { showMenu = true })
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (playing) "⏸" else "▶",
+                    color = textColor,
+                    fontSize = 16.sp
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = when {
+                        // formatDuration, not a hand-rolled "0:${...}": a 75 s
+                        // clip used to render as "0:75"
+                        playing -> "播放中 " + com.zqr.localchat.ui.VoiceNotes.formatDuration(duration)
+                        localPath != null -> com.zqr.localchat.ui.VoiceNotes.formatDuration(duration)
+                        state is ChatViewModel.DownloadState.Downloading -> "接收中…"
+                        else -> "语音（点击接收）"
+                    },
+                    color = textColor,
+                    fontSize = 14.sp
+                )
+            }
+            DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false; showReactionPicker = false }) {
+                if (showReactionPicker) {
+                    Row(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+                        REACTION_CHOICES.forEach { emoji ->
+                            TextButton(onClick = {
+                                // toggle, exactly like the text/file bubbles: a
+                                // reaction I already placed is removed again
+                                onReact(emoji, emoji !in myReactions)
+                                showMenu = false
+                                showReactionPicker = false
+                            }) {
+                                Text(emoji, fontSize = 20.sp)
+                            }
+                        }
+                    }
+                } else {
+                    DropdownMenuItem(
+                        text = { Text("回应") },
+                        onClick = { showReactionPicker = true }
+                    )
+                    DropdownMenuItem(
+                        text = { Text(if (pinned) "取消置顶" else "置顶") },
+                        onClick = { onPin(!pinned); showMenu = false }
+                    )
+                    if (isFromMe) {
+                        DropdownMenuItem(
+                            text = { Text("删除") },
+                            onClick = { onDelete(); showMenu = false }
+                        )
+                    }
+                }
+            }
+        }
+        ReactionPills(
+            message = message,
+            reactions = reactions,
+            myReactions = myReactions,
+            onToggleReaction = { _, emoji, active -> onReact(emoji, active) },
+            readLabel = "",
+            edited = message.edited
+        )
     }
 }
 

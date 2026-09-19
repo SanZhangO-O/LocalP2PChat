@@ -87,5 +87,10 @@ data class NetworkPacket(
      *  Both optional; null means "unchanged" and is omitted on the wire, so
      *  the bytes match the Windows peer's output. */
     val groupName: String? = null,
-    val announcement: String? = null
+    val announcement: String? = null,
+    /** edit_message: the author's replacement text for [messageId]. */
+    val newContent: String? = null,
+    /** reaction: the emoji toggled on/off for [messageId] by [senderId]
+     *  (with [active]). Sanitized + length-capped by the receiving paths. */
+    val emoji: String? = null
 )

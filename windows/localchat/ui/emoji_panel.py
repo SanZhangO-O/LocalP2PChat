@@ -27,11 +27,24 @@ RECENT_KEY = "recent_emoji"
 RECENT_CAP = 24
 GRID_COLUMNS = 8
 RECENT_CATEGORY = "最近"
+STICKER_CATEGORY = "贴纸"
+
+# Sticker tab: a curated set sent as plain text messages; the bubble renders
+# pure-emoji short content LARGE (sticker style), so no image assets and no
+# protocol change are needed — old peers just see a short emoji message.
+STICKER_EMOJIS = (
+    "😂", "🥹", "😍", "🥺", "😤", "😱", "🤡", "💀",
+    "🙏", "👍", "👎", "👏", "💪", "🤝", "✌️", "🫶",
+    "❤️", "💔", "💯", "🔥", "✨", "🎉", "🎂", "🍺",
+    "☕", "🌹", "🌈", "☀️", "🌙", "⚡", "🐱", "🐶",
+    "🐼", "🦊", "🐷", "🐣", "🍀", "🎁", "🚀", "🏆",
+)
 
 # Ordered (category, emoji) groups. Plain literals: the picker inserts the
 # character itself, whatever the input field supports.
 EMOJI_CATEGORIES = [
     (RECENT_CATEGORY, ()),
+    (STICKER_CATEGORY, STICKER_EMOJIS),
     (
         "笑脸",
         (
@@ -180,6 +193,7 @@ class EmojiPanel(QWidget):
             if widget is not None:
                 widget.deleteLater()
         name, emojis = EMOJI_CATEGORIES[index]
+        is_sticker = name == STICKER_CATEGORY
         items = list(self._recent) if name == RECENT_CATEGORY else list(emojis)
         if not items:
             placeholder = QLabel("还没有使用过的表情")
@@ -187,18 +201,28 @@ class EmojiPanel(QWidget):
             placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._grid.addWidget(placeholder, 0, 0, 1, GRID_COLUMNS)
             return
+        btn_w, btn_h = (52, 46) if is_sticker else (38, 32)
+        point_size = 22 if is_sticker else 14
+        # Sticker buttons are much wider than emoji cells: a fixed 8-column
+        # grid needed 430px inside a ~324px viewport, so the last columns were
+        # clipped with no scrollbar (setWidgetResizable + a grid wider than the
+        # viewport produces no horizontal range). Derive the column count from
+        # the viewport, reserving room for the vertical scrollbar.
+        gap = 2
+        available = self._scroll.viewport().width() - 16
+        columns = max(1, min(GRID_COLUMNS, (available + gap) // (btn_w + gap)))
         for i, emoji in enumerate(items):
             btn = QPushButton(emoji)
             btn.setObjectName("ghost")
-            btn.setFixedSize(38, 32)
+            btn.setFixedSize(btn_w, btn_h)
             btn.setToolTip(emoji)
             font = btn.font()
-            font.setPointSize(14)
+            font.setPointSize(point_size)
             btn.setFont(font)
             # clicked injects a bool into the first positional arg: keep it
             # from overwriting the emoji default (AGENTS.md PyQt6 trap)
             btn.clicked.connect(lambda checked=False, e=emoji: self._pick(e))
-            self._grid.addWidget(btn, i // GRID_COLUMNS, i % GRID_COLUMNS)
+            self._grid.addWidget(btn, i // columns, i % columns)
 
     def _pick(self, emoji: str) -> None:
         self._recent = record_recent(self.store, emoji)

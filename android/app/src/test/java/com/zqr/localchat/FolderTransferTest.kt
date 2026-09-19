@@ -7,7 +7,7 @@ import com.zqr.localchat.data.MAX_FOLDER_FILES
 import com.zqr.localchat.data.sanitizeFolderId
 import com.zqr.localchat.data.sanitizeRelativePath
 import com.zqr.localchat.data.sanitized
-import com.zqr.localchat.data.withSanitizedFileInfo
+import com.zqr.localchat.data.withSanitizedExtras
 import com.zqr.localchat.ui.screen.MessageItem
 import com.zqr.localchat.ui.screen.buildMessageItems
 import kotlinx.serialization.encodeToString
@@ -107,7 +107,7 @@ class FolderTransferTest {
         assertEquals(MAX_FOLDER_FILES, decoded.copy(folderTotal = MAX_FOLDER_FILES).sanitized().folderTotal)
 
         val msg = ChatMessage("m1", "a.txt", 1L, "p", "X", fileInfo = decoded)
-        assertEquals(0, msg.withSanitizedFileInfo().fileInfo!!.folderTotal)
+        assertEquals(0, msg.withSanitizedExtras().fileInfo!!.folderTotal)
     }
 
     // ------------------------------------------------------------ sanitizers

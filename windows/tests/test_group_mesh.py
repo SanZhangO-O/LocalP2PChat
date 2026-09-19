@@ -302,7 +302,7 @@ class GroupMeshTest(unittest.TestCase):
 
     def test_mesh_deleted_ids_converge_without_rebroadcast(self):
         """Received deletedIds drop the named messages from the local mesh
-        history and surface to the listener — and are never re-broadcast as
+        history and surface to the listener -- and are never re-broadcast as
         deletes (convergence is not a new delete event)."""
         self._link()
         msg = make_msg(
@@ -377,11 +377,12 @@ class GroupMeshTest(unittest.TestCase):
         )
 
     def test_history_reply_cannot_overwrite_existing_message(self):
-        """A history batch entry that reuses a locally-known message id with
-        DIFFERENT content must be dropped: local persistence upserts by id,
-        so accepting it would let a peer rewrite already-stored history.
-        Identical id+content still dedups naturally, and brand-new ids in
-        the same batch are still accepted."""
+        """A history batch entry reusing a locally-known id with DIFFERENT
+        content is accepted ONLY when the author pushes its OWN message over
+        its OWN link (that is how edits converge to a member that was
+        offline). The author id claimed over another member's link, or a
+        DIFFERENT sender's id, must never rewrite stored history. Brand-new
+        ids in the same batch are still accepted."""
         self._link()
         original = make_msg(
             "\u539f\u59cb\u5185\u5bb9", "aaa-member", "\u6210\u5458A", "h-conflict",
@@ -391,33 +392,58 @@ class GroupMeshTest(unittest.TestCase):
             wait_until(lambda: any(m.id == "h-conflict" for _, m in self.rec_b.messages)),
             "B should hold the original message first",
         )
-        # A pushes a forged history batch over its live link to B: one entry
-        # reuses the known id with tampered content, one is brand new.
-        forged = make_msg(
-            "\u7be1\u6539\u8fc7\u7684\u5185\u5bb9", "aaa-member", "\u6210\u5458A", "h-conflict",
+        # A pushes a history batch over its live link to B: one entry is the
+        # author's OWN edited message (accepted as edit convergence), one
+        # reuses a foreign author's id with tampered content (dropped), and
+        # one is brand new.
+        edited_own = make_msg(
+            "\u4fee\u6539\u540e\u7684\u5185\u5bb9", "aaa-member", "\u6210\u5458A", "h-conflict",
+        )
+        forged_foreign = make_msg(
+            "\u7be1\u6539\u8fc7\u7684\u5185\u5bb9", "ccc-member", "\u6210\u5458C", "h-foreign",
         )
         fresh = make_msg(
             "\u5168\u65b0\u5386\u53f2", "aaa-member", "\u6210\u5458A", "h-fresh",
         )
+        # B must first hold a message authored by the FOREIGN id so the forged
+        # entry actually collides with a locally-known row
+        foreign_original = make_msg(
+            "\u5916\u6765\u539f\u6587", "ccc-member", "\u6210\u5458C", "h-foreign",
+        )
+        self.b.note_message(GRP, foreign_original)
         links = list(self.a._groups[GRP]["links"].values())
         self.assertTrue(links, "A must have a live link to push over")
         for link in links:
             link["wire"].send_packet(
-                NetworkPacket(type="history_reply", group_id=GRP, messages=[forged, fresh])
+                NetworkPacket(
+                    type="history_reply",
+                    group_id=GRP,
+                    messages=[edited_own, forged_foreign, fresh],
+                )
             )
         self.assertTrue(
             wait_until(lambda: any(m.id == "h-fresh" for _, m in self.rec_b.messages)),
             "the new entry in the batch must still be accepted",
         )
+        # the author's own rewrite converges (edit semantics)
+        self.assertTrue(
+            wait_until(
+                lambda: any(
+                    m.id == "h-conflict" and m.content == "\u4fee\u6539\u540e\u7684\u5185\u5bb9"
+                    for _, m in self.rec_b.messages
+                )
+            ),
+            "an author pushing its own edited message over its own link must converge",
+        )
         time.sleep(0.3)
         stored = [
-            m for m in self.b._groups[GRP]["messages"] if m.id == "h-conflict"
+            m for m in self.b._groups[GRP]["messages"] if m.id == "h-foreign"
         ]
         self.assertEqual(len(stored), 1)
         self.assertEqual(
             stored[0].content,
-            "\u539f\u59cb\u5185\u5bb9",
-            "same id + different content must be dropped, not overwrite",
+            "\u5916\u6765\u539f\u6587",
+            "a foreign author's id claimed over another member's link must be dropped",
         )
         self.assertFalse(
             any(m.content == "\u7be1\u6539\u8fc7\u7684\u5185\u5bb9" for _, m in self.rec_b.messages),

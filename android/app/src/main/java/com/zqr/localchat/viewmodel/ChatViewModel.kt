@@ -52,7 +52,11 @@ import com.zqr.localchat.data.MAX_FOLDER_FILES
 import com.zqr.localchat.data.MessageSearch
 import com.zqr.localchat.data.Peer
 import com.zqr.localchat.data.SavedChatMessage
+import com.zqr.localchat.data.GroupRead
+import com.zqr.localchat.data.MessageReaction
+import com.zqr.localchat.data.PinnedMessage
 import com.zqr.localchat.data.SavedGroup
+import com.zqr.localchat.data.sanitizeEmoji
 import com.zqr.localchat.data.sanitizeRelativePath
 import com.zqr.localchat.network.Constants
 import com.zqr.localchat.network.DeviceIdentity
@@ -760,7 +764,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      *  sender. Failures are silently ignored: the copy is a rendering
      *  convenience, the offer itself was already delivered. */
     private fun mirrorOwnMedia(fileId: String, uri: Uri, fileName: String, kind: String) {
-        if (kind != FileKind.IMAGE) return
+        // voice notes are small: mirror them like images so the sender's own
+        // bubble stays playable (videos stay unmirrored — far larger)
+        if (kind != FileKind.IMAGE && kind != FileKind.AUDIO) return
         viewModelScope.launch(Dispatchers.IO) {
             val ok = runCatching {
                 val target = mediaTargetFile(fileId, fileName)
@@ -832,9 +838,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Path of an already-downloaded media copy, or null. Lets the chat UI
-     *  render image/video messages inline (also after a restart). */
+     *  render image/video messages inline (also after a restart); voice notes
+     *  resolve the same way so the bubble can play the local WAV. */
     fun localMediaPath(fileInfo: FileInfo): String? {
-        if (fileInfo.kind != FileKind.IMAGE && fileInfo.kind != FileKind.VIDEO) return null
+        if (fileInfo.kind != FileKind.IMAGE && fileInfo.kind != FileKind.VIDEO &&
+            fileInfo.kind != FileKind.AUDIO
+        ) {
+            return null
+        }
         val f = mediaTargetFile(fileInfo.fileId, fileInfo.fileName)
         return if (f.isFile) f.absolutePath else null
     }
@@ -1026,7 +1037,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         replyTo = plain.replyTo.ifEmpty { null },
                         replyPreview = plain.replyPreview.ifEmpty { null },
                         replySender = plain.replySender.ifEmpty { null },
-                        read = plain.read
+                        read = plain.read,
+                        edited = plain.edited,
+                        mentions = com.zqr.localchat.data.parseStoredMentions(plain.mentions)
                     )
                 }
             )
@@ -1100,7 +1113,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                         // the quote snippet is conversation content too
                                         replyPreview = StoreCipher.protect(msg.replyPreview ?: ""),
                                         replySender = msg.replySender ?: "",
-                                        read = msg.read
+                                        read = msg.read,
+                                        edited = msg.edited,
+                                        mentions = com.zqr.localchat.data.storedMentionsJson(msg.mentions)
                                     )
                                 })
                             }.isSuccess
@@ -2444,6 +2459,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         DirectChatManager.onTypingChanged = { peerId, active ->
             onDirectTyping(peerId, active)
         }
+        // Message experience on direct sessions (live only, like typing).
+        DirectChatManager.onMessageEdited = { peerId, messageId, newContent ->
+            val key = "direct:$peerId"
+            viewModelScope.launch(Dispatchers.IO) {
+                // the peer may only edit its OWN message: pass it as the
+                // expected author so the SQL re-checks it (Windows parity)
+                runCatching {
+                    persistEditedContent(key, messageId, newContent, senderId = peerId)
+                }
+            }
+        }
+        DirectChatManager.onReactionChanged = { peerId, messageId, emoji, active ->
+            applyReaction("direct:$peerId", messageId, emoji, peerId, active)
+        }
+        DirectChatManager.onPinChanged = { peerId, messageId, active ->
+            applyPin("direct:$peerId", messageId, peerId, active)
+        }
         // Owner management packets (group_update / kick_member) are only
         // accepted on a mesh link when senderId is the group's creator.
         GroupMeshManager.creatorIdProvider = { groupId ->
@@ -2453,6 +2485,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // metadata, or run the kicked member's teardown.
         GroupMeshManager.onGroupAdmin = { groupId, packet ->
             applyGroupAdminPacket(groupId, packet)
+        }
+        // Message experience over the mesh (host-offline path): the mesh layer
+        // validated the sender against the link (and the author, for edits);
+        // persist + refresh like the relayed variants.
+        GroupMeshManager.onGroupEdit = { groupId, messageId, newContent, senderId ->
+            applyGroupEdit(groupId, messageId, newContent, senderId)
+        }
+        GroupMeshManager.onGroupReaction = { groupId, messageId, emoji, senderId, active ->
+            applyReaction(groupId, messageId, emoji, senderId, active)
+        }
+        GroupMeshManager.onGroupPin = { groupId, messageId, senderId, active ->
+            applyPin(groupId, messageId, senderId, active)
+        }
+        GroupMeshManager.onGroupReadReceipt = { groupId, readerId, upToId ->
+            applyGroupReadReceipt(groupId, readerId, upToId)
         }
         // join_ack tombstone sync: tombstones learned from a peer's ack are
         // persisted so a history replay cannot resurrect the deleted rows.
@@ -2730,6 +2777,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // typing indicators relayed by the host (or seen by the host itself)
         p2p.typingListener = { senderId, active ->
             onGroupTyping(groupId, senderId, active)
+        }
+        // Message experience relayed by the host (the host validated the
+        // member identities before forwarding)
+        p2p.editListener = { messageId, newContent, senderId ->
+            applyGroupEdit(groupId, messageId, newContent, senderId)
+        }
+        p2p.reactionListener = { messageId, emoji, senderId, active ->
+            applyReaction(groupId, messageId, emoji, senderId, active)
+        }
+        p2p.pinListener = { messageId, senderId, active ->
+            applyPin(groupId, messageId, senderId, active)
+        }
+        p2p.groupReceiptListener = { readerId, upToId ->
+            applyGroupReadReceipt(groupId, readerId, upToId)
         }
         // Owner management: refresh/persist after a host-side update or an
         // applied member-side group_update; tear the group down when kicked.
@@ -3061,7 +3122,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             fileInfo = restoredFileInfo(plain),
                             replyTo = plain.replyTo.ifEmpty { null },
                             replyPreview = plain.replyPreview.ifEmpty { null },
-                            replySender = plain.replySender.ifEmpty { null }
+                            replySender = plain.replySender.ifEmpty { null },
+                            edited = plain.edited,
+                            mentions = com.zqr.localchat.data.parseStoredMentions(plain.mentions)
                         )
                     }
                     p2p.replaySavedMessages(msgs)
@@ -3430,7 +3493,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         content: String,
         replyTo: String? = null,
         replyPreview: String? = null,
-        replySender: String? = null
+        replySender: String? = null,
+        mentions: List<String>? = null
     ): Boolean {
         if (content.isBlank()) return false
         val gid = _activeGroupId.value ?: return false
@@ -3438,7 +3502,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // messages can go out over the host relay OR the group mesh (host
         // offline) — either path suffices
         if (!p2p.isConnected && !GroupMeshManager.hasLinks(gid)) return false
-        val msg = p2p.sendMessage(content, replyTo, replyPreview, replySender) ?: return false
+        val msg = p2p.sendMessage(content, replyTo, replyPreview, replySender, mentions) ?: return false
         GroupMeshManager.broadcast(gid, msg)
         // the message supersedes any "typing" we were showing
         stopTyping(gid)
@@ -3487,6 +3551,240 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         chatDao.trimDeletedMessages(gid, DeletedMessage.CAP)
                     }
                 }
+            }
+        }
+    }
+
+    // ------------------------------------------------------- message experience
+    // Edit / reactions / pins / group read receipts. Receive paths persist
+    // through chatDao (network threads hop into viewModelScope like the
+    // tombstone writes); UI reads the per-conversation snapshots below.
+
+    /** Bumped whenever one conversation's reaction/pin/read state changed so
+     *  open chat screens re-read their snapshot. */
+    private val _extrasVersion = MutableStateFlow(0)
+    val extrasVersion: StateFlow<Int> = _extrasVersion.asStateFlow()
+
+    private fun bumpExtras() {
+        _extrasVersion.value = _extrasVersion.value + 1
+    }
+
+    /** [{msgId: [(emoji, actorId), …]}] of one conversation (insertion order
+     *  preserved). Screens call this in a coroutine when [extrasVersion]
+     *  changes. */
+    suspend fun reactionsFor(conversationId: String): Map<String, List<Pair<String, String>>> =
+        runCatching {
+            chatDao.getReactions(conversationId)
+                .groupBy { it.msgId }
+                .mapValues { (_, rows) -> rows.map { it.emoji to it.actorId } }
+        }.getOrDefault(emptyMap())
+
+    /** Pinned rows of one conversation, oldest first (banner = last). */
+    suspend fun pinsFor(conversationId: String): List<PinnedMessage> =
+        runCatching { chatDao.getPins(conversationId) }.getOrDefault(emptyList())
+
+    /** {msgId: [readerId, …]} of recorded group read receipts. */
+    suspend fun groupReadersFor(conversationId: String): Map<String, List<String>> =
+        runCatching {
+            chatDao.getGroupReads(conversationId)
+                .groupBy { it.msgId }
+                .mapValues { (_, rows) -> rows.map { it.readerId } }
+        }.getOrDefault(emptyMap())
+
+    /** This device's stable id (mention matching, reaction ownership). */
+    val myDeviceId: String
+        get() = DirectChatManager.myIdValue
+
+    fun editMessage(messageId: String, newContent: String): Boolean {
+        val gid = _activeGroupId.value ?: return false
+        val p2p = groupP2pMap[gid] ?: return false
+        if (!p2p.editMessage(messageId, newContent)) return false
+        GroupMeshManager.broadcastEdit(gid, messageId, newContent)
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { persistEditedContent(gid, messageId, newContent) }
+        }
+        return true
+    }
+
+    fun toggleGroupReaction(messageId: String, emoji: String, active: Boolean) {
+        // sanitize ONCE at the entry point: local persistence, local state and
+        // the wire/broadcast must all carry the same (16-code-point) key, or
+        // an over-long input could never be un-reacted by the peer
+        val clean = sanitizeEmoji(emoji)
+        if (clean.isEmpty()) return
+        val gid = _activeGroupId.value ?: return
+        val p2p = groupP2pMap[gid] ?: return
+        p2p.sendReaction(messageId, clean, active)
+        GroupMeshManager.broadcastReaction(gid, messageId, clean, active)
+        applyReaction(gid, messageId, clean, p2p.myIdValue, active)
+    }
+
+    fun toggleGroupPin(messageId: String, active: Boolean) {
+        val gid = _activeGroupId.value ?: return
+        val p2p = groupP2pMap[gid] ?: return
+        p2p.sendPin(messageId, active)
+        GroupMeshManager.broadcastPin(gid, messageId, active)
+        applyPin(gid, messageId, p2p.myIdValue, active)
+    }
+
+    /** The open group chat shows the newest message: report the read receipt
+     *  (relay + mesh). Deduped per group until the newest id changes; only
+     *  ever sent for the OPEN group (that is what "read" means). */
+    fun notifyGroupReadReceipt() {
+        val gid = _activeGroupId.value ?: return
+        val p2p = groupP2pMap[gid] ?: return
+        val newest = p2p.messages.value.lastOrNull()?.id ?: return
+        if (groupReceiptSent[gid] == newest) return
+        groupReceiptSent[gid] = newest
+        p2p.sendGroupReadReceipt(newest)
+        GroupMeshManager.broadcastReadReceipt(gid, newest)
+    }
+
+    fun toggleDirectReaction(peerId: String, messageId: String, emoji: String, active: Boolean) {
+        // sanitize once: the stored key must equal the transmitted one
+        // (Windows parity, 16 code points)
+        val clean = sanitizeEmoji(emoji)
+        if (clean.isEmpty()) return
+        val sent = DirectChatManager.sendDirectReaction(peerId, messageId, clean, active)
+        val key = "direct:$peerId"
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                withDbLock(key) {
+                    if (active) {
+                        chatDao.addReaction(
+                            MessageReaction(key, messageId, clean, DirectChatManager.myIdValue)
+                        )
+                    } else {
+                        chatDao.removeReaction(key, messageId, clean, DirectChatManager.myIdValue)
+                    }
+                }
+            }
+            bumpExtras()
+        }
+        if (!sent) {
+            // no live session: nothing reaches the peer — keep the local row
+            // anyway so the state survives restarts (advisory feature)
+        }
+    }
+
+    fun toggleDirectPin(peerId: String, messageId: String, active: Boolean) {
+        DirectChatManager.sendDirectPin(peerId, messageId, active)
+        val key = "direct:$peerId"
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                withDbLock(key) {
+                    if (active) {
+                        chatDao.upsertPin(
+                            PinnedMessage(
+                                key, messageId, System.currentTimeMillis(),
+                                DirectChatManager.myIdValue
+                            )
+                        )
+                    } else {
+                        chatDao.removePin(key, messageId)
+                    }
+                }
+            }
+            bumpExtras()
+        }
+    }
+
+    fun editDirectMessage(peerId: String, messageId: String, newContent: String): Boolean {
+        val sent = DirectChatManager.editMessage(peerId, messageId, newContent)
+        if (sent) {
+            val key = "direct:$peerId"
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { persistEditedContent(key, messageId, newContent) }
+            }
+        }
+        return sent
+    }
+
+    private val groupReceiptSent = ConcurrentHashMap<String, String>()
+
+    private fun applyGroupEdit(groupId: String, messageId: String, newContent: String, senderId: String) {
+        groupP2pMap[groupId]?.applyEditLocal(messageId, newContent, senderId)
+        viewModelScope.launch(Dispatchers.IO) {
+            // author-gated persist: a forged edit can never rewrite stored
+            // history even if an upstream caller missed the authorization
+            runCatching {
+                persistEditedContent(groupId, messageId, newContent, senderId = senderId)
+            }
+        }
+    }
+
+    private fun applyReaction(groupId: String, messageId: String, emoji: String, actorId: String, active: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                withDbLock(groupId) {
+                    if (active) {
+                        chatDao.addReaction(MessageReaction(groupId, messageId, emoji, actorId))
+                    } else {
+                        chatDao.removeReaction(groupId, messageId, emoji, actorId)
+                    }
+                }
+            }
+            bumpExtras()
+        }
+    }
+
+    private fun applyPin(groupId: String, messageId: String, senderId: String, active: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                withDbLock(groupId) {
+                    if (active) {
+                        chatDao.upsertPin(
+                            PinnedMessage(groupId, messageId, System.currentTimeMillis(), senderId)
+                        )
+                    } else {
+                        chatDao.removePin(groupId, messageId)
+                    }
+                }
+            }
+            bumpExtras()
+        }
+    }
+
+    /** A member read the group up to [upToId]: record the reader on every OWN
+     *  message covered (same cut-off rule as the direct chat: timestamp <=
+     *  the receipt's message). Two targeted queries — never a full, decrypted
+     *  table read (a receipt arrives for every member and every new message). */
+    private fun applyGroupReadReceipt(groupId: String, readerId: String, upToId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                withDbLock(groupId) {
+                    val targetTs = chatDao.messageTimestamp(groupId, upToId)
+                        ?: return@withDbLock
+                    val covered = chatDao.ownMessageIdsUpTo(groupId, targetTs)
+                    if (covered.isNotEmpty()) {
+                        chatDao.addGroupReads(
+                            covered.map { GroupRead(groupId, it, readerId) }
+                        )
+                    }
+                }
+            }
+            bumpExtras()
+        }
+    }
+
+    /** Persist an author edit. Message bodies are encrypted at rest like every
+     *  other payload (StoreCipher): an edit must never downgrade the row to
+     *  plaintext. The DAO raises the edited flag. */
+    private suspend fun persistEditedContent(
+        conversationId: String,
+        messageId: String,
+        newContent: String,
+        senderId: String? = null
+    ) {
+        withDbLock(conversationId) {
+            val protected = StoreCipher.protect(newContent)
+            if (senderId == null) {
+                chatDao.updateMessageContent(conversationId, messageId, protected)
+            } else {
+                // received edit: the SQL re-checks the author (Windows parity)
+                chatDao.updateMessageContentFrom(
+                    conversationId, messageId, protected, senderId
+                )
             }
         }
     }
@@ -3776,7 +4074,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                         replyTo = msg.replyTo ?: "",
                                         // the quote snippet is conversation content too
                                         replyPreview = StoreCipher.protect(msg.replyPreview ?: ""),
-                                        replySender = msg.replySender ?: ""
+                                        replySender = msg.replySender ?: "",
+                                        edited = msg.edited,
+                                        mentions = com.zqr.localchat.data.storedMentionsJson(msg.mentions)
                                     )
                                 }
                                 val inserted = runCatching { chatDao.insertMessages(saved) }.isSuccess
@@ -3955,8 +4255,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         DirectChatManager.onCallSignal = null
         DirectChatManager.onRemovedMarksChanged = null
         DirectChatManager.onTypingChanged = null
+        DirectChatManager.onMessageEdited = null
+        DirectChatManager.onReactionChanged = null
+        DirectChatManager.onPinChanged = null
         GroupMeshManager.onGroupTyping = null
         GroupMeshManager.onGroupAdmin = null
+        GroupMeshManager.onGroupEdit = null
+        GroupMeshManager.onGroupReaction = null
+        GroupMeshManager.onGroupPin = null
+        GroupMeshManager.onGroupReadReceipt = null
         GroupMeshManager.creatorIdProvider = null
         // drop the quick-reply hook: a cleared ViewModel must never be invoked
         // by the reply receiver (a stale sink would send on dead managers)

@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import threading
@@ -65,6 +66,10 @@ class SavedMessage:
     # Own direct-chat message read by the peer (set by a read_receipt):
     # survives restart so "已读" does not flip back after a relaunch.
     read: bool = False
+    # Message edit: content replaced by its author (edit_message) and the
+    # mentioned peer ids (JSON list, "@" mentions). Both survive restart.
+    edited: bool = False
+    mentions: str = ""
 
 
 @dataclass
@@ -218,6 +223,45 @@ class ChatStore:
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)
                 """
             )
+            # Message-experience tables (edit/reactions/pins/group read
+            # receipts). All FK-cascade off saved_messages' composite PK, so
+            # deleting a message (or its whole group) cleans these up.
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS message_reactions (
+                    group_id TEXT NOT NULL,
+                    msg_id TEXT NOT NULL,
+                    emoji TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    FOREIGN KEY (group_id, msg_id) REFERENCES saved_messages(groupId, id) ON DELETE CASCADE,
+                    PRIMARY KEY (group_id, msg_id, emoji, actor_id)
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pinned_messages (
+                    group_id TEXT NOT NULL,
+                    msg_id TEXT NOT NULL,
+                    pinned_at INTEGER NOT NULL,
+                    pinned_by TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY (group_id, msg_id) REFERENCES saved_messages(groupId, id) ON DELETE CASCADE,
+                    PRIMARY KEY (group_id, msg_id)
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS group_reads (
+                    group_id TEXT NOT NULL,
+                    msg_id TEXT NOT NULL,
+                    reader_id TEXT NOT NULL,
+                    FOREIGN KEY (group_id, msg_id) REFERENCES saved_messages(groupId, id) ON DELETE CASCADE,
+                    PRIMARY KEY (group_id, msg_id, reader_id)
+                )
+                """
+            )
+            self._conn.commit()
             # Local call history: one row per finished call, keyed to the 1:1
             # conversation with the other participant ("direct:<peer_id>").
             # Never sent over the wire and never synced (Android parity).
@@ -298,6 +342,14 @@ class ChatStore:
                 c.execute(
                     "ALTER TABLE saved_messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0"
                 )
+            if "edited" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0"
+                )
+            if "mentions" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN mentions TEXT NOT NULL DEFAULT ''"
+                )
             return
         # old schema: rebuild with the composite PK (+ pending) and copy rows
         c.execute("ALTER TABLE saved_messages RENAME TO saved_messages_old")
@@ -324,6 +376,8 @@ class ChatStore:
                 replyPreview TEXT NOT NULL DEFAULT '',
                 replySender TEXT NOT NULL DEFAULT '',
                 read INTEGER NOT NULL DEFAULT 0,
+                edited INTEGER NOT NULL DEFAULT 0,
+                mentions TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (groupId) REFERENCES saved_groups(groupId) ON DELETE CASCADE,
                 PRIMARY KEY (groupId, id)
             )
@@ -339,14 +393,15 @@ class ChatStore:
                 (id, groupId, content, timestamp, senderId, senderName, isFromMe,
                  fileSize, downloadHost, downloadPort, kind,
                  folderId, folderName, relativePath, folderTotal, pending,
-                 replyTo, replyPreview, replySender, read)
+                 replyTo, replyPreview, replySender, read, edited, mentions)
             SELECT id, groupId, content, timestamp, senderId, senderName, isFromMe,
                    {_col('fileSize', '0')}, {_col('downloadHost', "''")},
                    {_col('downloadPort', '0')}, {_col('kind', "'file'")},
                    {_col('folderId', "''")}, {_col('folderName', "''")},
                    {_col('relativePath', "''")}, {_col('folderTotal', '0')}, 0,
                    {_col('replyTo', "''")}, {_col('replyPreview', "''")},
-                   {_col('replySender', "''")}, {_col('read', '0')}
+                   {_col('replySender', "''")}, {_col('read', '0')},
+                   {_col('edited', '0')}, {_col('mentions', "''")}
             FROM saved_messages_old
             """
         )
@@ -475,14 +530,40 @@ class ChatStore:
         if not messages:
             return
         with self._lock:
+            # UPSERT, never OR REPLACE: replacing a row deletes it first, and
+            # the new ON DELETE CASCADE children (reactions / pins / group
+            # reads) would silently go with it. DO UPDATE keeps the parent row
+            # alive (and refreshes the payload) while child state survives —
+            # Android's OnConflictStrategy.IGNORE parity.
             self._conn.executemany(
                 """
-                INSERT OR REPLACE INTO saved_messages
+                INSERT INTO saved_messages
                 (id, groupId, content, timestamp, senderId, senderName, isFromMe,
                  fileSize, downloadHost, downloadPort, kind,
                  folderId, folderName, relativePath, folderTotal, pending,
-                 replyTo, replyPreview, replySender, read)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 replyTo, replyPreview, replySender, read, edited, mentions)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(groupId, id) DO UPDATE SET
+                    content=excluded.content,
+                    timestamp=excluded.timestamp,
+                    senderId=excluded.senderId,
+                    senderName=excluded.senderName,
+                    isFromMe=excluded.isFromMe,
+                    fileSize=excluded.fileSize,
+                    downloadHost=excluded.downloadHost,
+                    downloadPort=excluded.downloadPort,
+                    kind=excluded.kind,
+                    folderId=excluded.folderId,
+                    folderName=excluded.folderName,
+                    relativePath=excluded.relativePath,
+                    folderTotal=excluded.folderTotal,
+                    pending=excluded.pending,
+                    replyTo=excluded.replyTo,
+                    replyPreview=excluded.replyPreview,
+                    replySender=excluded.replySender,
+                    read=excluded.read,
+                    edited=excluded.edited,
+                    mentions=excluded.mentions
                 """,
                 [
                     (
@@ -509,6 +590,8 @@ class ChatStore:
                         self._enc(m.reply_preview),
                         m.reply_sender,
                         1 if m.read else 0,
+                        1 if m.edited else 0,
+                        m.mentions,
                     )
                     for m in messages
                 ],
@@ -547,6 +630,8 @@ class ChatStore:
                 ),
                 reply_sender=r["replySender"] if "replySender" in r.keys() else "",
                 read=bool(r["read"]) if "read" in r.keys() else False,
+                edited=bool(r["edited"]) if "edited" in r.keys() else False,
+                mentions=r["mentions"] if "mentions" in r.keys() else "",
             )
             for r in rows
         ]
@@ -588,6 +673,8 @@ class ChatStore:
                 ),
                 reply_sender=r["replySender"] if "replySender" in r.keys() else "",
                 read=bool(r["read"]) if "read" in r.keys() else False,
+                edited=bool(r["edited"]) if "edited" in r.keys() else False,
+                mentions=r["mentions"] if "mentions" in r.keys() else "",
             )
             for r in rows
         ]
@@ -611,32 +698,210 @@ class ChatStore:
             )
             self._conn.commit()
 
+    # ------------------------------------------------- edit/reactions/pins/reads
+
+    def update_message_content(
+        self,
+        group_id: str,
+        message_id: str,
+        content: str,
+        sender_id: Optional[str] = None,
+    ) -> bool:
+        """Apply an author edit to one stored message: replace the body and
+        raise the edited flag. Returns False when the row does not exist or —
+        when [sender_id] is given — when the stored author differs. The author
+        condition is enforced in SQL on purpose: a forged edit packet must
+        never rewrite another author's stored text even if a caller skipped
+        the network-layer authorization (defense in depth)."""
+        with self._lock:
+            if sender_id is None:
+                cur = self._conn.execute(
+                    "UPDATE saved_messages SET content = ?, edited = 1 "
+                    "WHERE groupId = ? AND id = ?",
+                    (self._enc(content), group_id, message_id),
+                )
+            else:
+                cur = self._conn.execute(
+                    "UPDATE saved_messages SET content = ?, edited = 1 "
+                    "WHERE groupId = ? AND id = ? AND senderId = ?",
+                    (self._enc(content), group_id, message_id, sender_id),
+                )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def add_reaction(self, group_id: str, message_id: str, emoji: str, actor_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO message_reactions (group_id, msg_id, emoji, actor_id) "
+                "VALUES (?, ?, ?, ?)",
+                (group_id, message_id, emoji, actor_id),
+            )
+            self._conn.commit()
+
+    def remove_reaction(self, group_id: str, message_id: str, emoji: str, actor_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM message_reactions WHERE group_id = ? AND msg_id = ? "
+                "AND emoji = ? AND actor_id = ?",
+                (group_id, message_id, emoji, actor_id),
+            )
+            self._conn.commit()
+
+    def get_reactions(self, group_id: str) -> dict:
+        """All reactions of one conversation: {msg_id: [(emoji, actor_id), …]}
+        (insertion order preserved, so the UI shows the oldest emoji first)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT msg_id, emoji, actor_id FROM message_reactions "
+                "WHERE group_id = ? ORDER BY rowid ASC",
+                (group_id,),
+            ).fetchall()
+        out: dict = {}
+        for r in rows:
+            out.setdefault(r["msg_id"], []).append((r["emoji"], r["actor_id"]))
+        return out
+
+    def set_message_pinned(
+        self, group_id: str, message_id: str, pinned: bool, pinned_by: str = "",
+        pinned_at: Optional[int] = None,
+    ) -> None:
+        with self._lock:
+            if pinned:
+                ts = int(time.time() * 1000) if pinned_at is None else int(pinned_at)
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO pinned_messages "
+                    "(group_id, msg_id, pinned_at, pinned_by) VALUES (?, ?, ?, ?)",
+                    (group_id, message_id, ts, pinned_by),
+                )
+            else:
+                self._conn.execute(
+                    "DELETE FROM pinned_messages WHERE group_id = ? AND msg_id = ?",
+                    (group_id, message_id),
+                )
+            self._conn.commit()
+
+    def get_pinned_messages(self, group_id: str) -> List[tuple]:
+        """[(msg_id, pinned_at, pinned_by)] oldest pin first (the banner shows
+        the newest, i.e. the last entry)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT msg_id, pinned_at, pinned_by FROM pinned_messages "
+                "WHERE group_id = ? ORDER BY pinned_at ASC",
+                (group_id,),
+            ).fetchall()
+        return [(r["msg_id"], r["pinned_at"], r["pinned_by"]) for r in rows]
+
+    def record_group_reads(self, group_id: str, msg_ids, reader_id: str) -> int:
+        """Persist "reader_id has read these own messages" rows (idempotent).
+        Returns how many NEW rows were inserted (0 = a repeat receipt carried
+        no news), so the caller can skip the UI refresh entirely — receipts
+        arrive for every member and every new message."""
+        ids = [str(i) for i in dict.fromkeys(msg_ids or []) if i]
+        if not ids or not reader_id:
+            return 0
+        with self._lock:
+            before = self._conn.total_changes
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO group_reads (group_id, msg_id, reader_id) "
+                "VALUES (?, ?, ?)",
+                [(group_id, i, reader_id) for i in ids],
+            )
+            inserted = self._conn.total_changes - before
+            self._conn.commit()
+        return inserted
+
+    def get_group_readers(self, group_id: str) -> dict:
+        """{msg_id: [reader_id, …]} of recorded group read receipts."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT msg_id, reader_id FROM group_reads WHERE group_id = ?",
+                (group_id,),
+            ).fetchall()
+        out: dict = {}
+        for r in rows:
+            out.setdefault(r["msg_id"], []).append(r["reader_id"])
+        return out
+
     def move_messages(self, from_group_id: str, to_group_id: str) -> None:
         """Move every message row from one conversation key to another (used
         when a manually added "ip:..." placeholder chat is revealed to be a
-        real device id by the handshake). OR REPLACE: the target chat's
-        observer may already have re-inserted some of these rows, and a plain
-        UPDATE would then abort on the composite-PK conflict."""
+        real device id by the handshake). UPSERT (never OR REPLACE): the target
+        chat's observer may already hold some of these rows, and REPLACE would
+        delete the conflicting parent row — taking the target conversation's
+        reactions / pins / read receipts with it via ON DELETE CASCADE."""
         with self._lock:
             self._conn.execute(
                 """
-                INSERT OR REPLACE INTO saved_messages
+                INSERT INTO saved_messages
                     (id, groupId, content, timestamp, senderId, senderName, isFromMe,
                      fileSize, downloadHost, downloadPort, kind,
                      folderId, folderName, relativePath, folderTotal, pending,
-                     replyTo, replyPreview, replySender, read)
+                     replyTo, replyPreview, replySender, read, edited, mentions)
                 SELECT id, ?, content, timestamp, senderId, senderName, isFromMe,
                        fileSize, downloadHost, downloadPort, kind,
                        folderId, folderName, relativePath, folderTotal, pending,
-                       replyTo, replyPreview, replySender, read
+                       replyTo, replyPreview, replySender, read, edited, mentions
                 FROM saved_messages WHERE groupId = ?
+                ON CONFLICT(groupId, id) DO UPDATE SET
+                    content=excluded.content,
+                    timestamp=excluded.timestamp,
+                    senderId=excluded.senderId,
+                    senderName=excluded.senderName,
+                    isFromMe=excluded.isFromMe,
+                    fileSize=excluded.fileSize,
+                    downloadHost=excluded.downloadHost,
+                    downloadPort=excluded.downloadPort,
+                    kind=excluded.kind,
+                    folderId=excluded.folderId,
+                    folderName=excluded.folderName,
+                    relativePath=excluded.relativePath,
+                    folderTotal=excluded.folderTotal,
+                    pending=excluded.pending,
+                    replyTo=excluded.replyTo,
+                    replyPreview=excluded.replyPreview,
+                    replySender=excluded.replySender,
+                    read=excluded.read,
+                    edited=excluded.edited,
+                    mentions=excluded.mentions
                 """,
                 (to_group_id, from_group_id),
             )
+            # the message-experience rows follow their message: re-keyed AFTER
+            # the copied rows exist (their FK references the new group key) and
+            # BEFORE the source rows are deleted (the FK cascade would
+            # otherwise drop them). UPDATE OR REPLACE only collapses a
+            # duplicate (same emoji/actor or same pin) into one row.
+            for table in ("message_reactions", "pinned_messages", "group_reads"):
+                self._conn.execute(
+                    f"UPDATE OR REPLACE {table} SET group_id = ? WHERE group_id = ?",
+                    (to_group_id, from_group_id),
+                )
             self._conn.execute(
                 "DELETE FROM saved_messages WHERE groupId = ?", (from_group_id,)
             )
             self._conn.commit()
+
+    def get_message_timestamp(self, group_id: str, message_id: str) -> Optional[int]:
+        """The timestamp of one stored message (None when absent): the cheap
+        lookup the group read-receipt path needs instead of decrypting the
+        whole conversation."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT timestamp FROM saved_messages WHERE groupId = ? AND id = ?",
+                (group_id, message_id),
+            ).fetchone()
+        return None if row is None else int(row["timestamp"])
+
+    def get_own_message_ids_upto(self, group_id: str, timestamp: int) -> List[str]:
+        """Ids of own messages at or before [timestamp] — the coverage cut-off
+        of a group read receipt, computed in SQL without loading bodies."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM saved_messages "
+                "WHERE groupId = ? AND isFromMe = 1 AND timestamp <= ?",
+                (group_id, int(timestamp)),
+            ).fetchall()
+        return [r["id"] for r in rows]
 
     def delete_group(self, group_id: str) -> None:
         with self._lock:
@@ -875,6 +1140,8 @@ class ChatStore:
             reply_preview=self._dec(r["replyPreview"]) if "replyPreview" in keys else "",
             reply_sender=r["replySender"] if "replySender" in keys else "",
             read=bool(r["read"]) if "read" in keys else False,
+            edited=bool(r["edited"]) if "edited" in keys else False,
+            mentions=r["mentions"] if "mentions" in keys else "",
         )
 
     def get_setting(self, key: str, default: str = "") -> str:
@@ -917,4 +1184,6 @@ def to_saved_message(group_id: str, msg: ChatMessage) -> SavedMessage:
         reply_preview=msg.reply_preview or "",
         reply_sender=msg.reply_sender or "",
         read=msg.read,
+        edited=msg.edited,
+        mentions=json.dumps(msg.mentions) if msg.mentions else "",
     )

@@ -16,6 +16,7 @@ from .crypto import random_password
 from .download_state import FileResumeStore
 from .hardware import get_hardware_id, get_local_ip_address
 from .models import (
+    FILE_KIND_AUDIO,
     FILE_KIND_IMAGE,
     MAX_FOLDER_FILES,
     MEDIA_AUDIO,
@@ -127,6 +128,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # A conversation's local call log changed (one finished call recorded):
     # carries the peer id so an open direct chat re-renders its system rows.
     call_logs_changed = pyqtSignal(str)
+    # A conversation's message-experience state changed (a reaction / pin /
+    # group read receipt was applied or removed): carries the conversation
+    # key (group id or "direct:<peer_id>") so the open page re-renders.
+    extras_changed = pyqtSignal(str)
 
     # Burst window in ms: incoming notifications within this span are merged
     # into a single tray bubble instead of one popup per message.
@@ -178,6 +183,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.persisted_message_ids: Dict[str, set] = {}
         self.persisted_peer_counts: Dict[str, int] = {}
         self.persisted_my_names: Dict[str, str] = {}
+        # Per group: the newest message id a group read receipt was sent for
+        # (dedup — only send again when a newer message arrives).
+        self._group_receipt_sent: Dict[str, str] = {}
         # Per group: the P2PManager whose saved-history replay finished (or,
         # for a fresh host group, the one that had nothing to replay). Only
         # THAT instance may mirror deletes into the database: a stale
@@ -873,6 +881,8 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 reply_preview=m.reply_preview or None,
                 reply_sender=m.reply_sender or None,
                 read=m.read,
+                edited=m.edited,
+                mentions=json.loads(m.mentions) if m.mentions else None,
             )
             for m in saved
         ]
@@ -1162,14 +1172,14 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         return entries, folder_name, False
 
     def _mirror_own_media(self, msg: ChatMessage, source_path: str) -> None:
-        """After an own IMAGE goes out, copy it into the media dir on a worker
-        thread so the sender's own bubble renders inline like a received one —
-        and keeps doing so after a restart. Videos are NOT copied: they are
-        far larger and the placeholder card already opens fine for the
-        sender. Failures are ignored: the copy is a rendering convenience,
-        the offer itself was already delivered."""
+        """After an own IMAGE or VOICE message goes out, copy it into the
+        media dir on a worker thread so the sender's own bubble renders/plays
+        inline like a received one — and keeps doing so after a restart.
+        Videos are NOT copied: they are far larger and the placeholder card
+        already opens fine for the sender. Failures are ignored: the copy is
+        a rendering convenience, the offer itself was already delivered."""
         fi = msg.file_info
-        if fi is None or fi.kind != FILE_KIND_IMAGE:
+        if fi is None or fi.kind not in (FILE_KIND_IMAGE, FILE_KIND_AUDIO):
             return
 
         def run():
@@ -1472,6 +1482,122 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         """A member's typing indicator (host relay path); hop to the main
         thread via the queued signal."""
         self.group_typing_signal.emit(p2p.current_group_id or "", sender_id, active)
+
+    # -------------------------------------------------------------- message
+    # experience (edit / reactions / pins / group read receipts): network
+    # threads persist through the (thread-safe) store and hop to the main
+    # thread via signals.
+
+    def message_edited(self, p2p: P2PManager, message_id: str, new_content: str, sender_id: str) -> None:
+        """A relayed edit_message arrived (host relay path). The manager's
+        in-memory copy is already updated; persist and refresh."""
+        gid = p2p.current_group_id
+        if gid:
+            self._apply_group_edit(gid, message_id, new_content, sender_id)
+
+    def reaction_changed(self, p2p: P2PManager, message_id: str, emoji: str, sender_id: str, active: bool) -> None:
+        gid = p2p.current_group_id
+        if gid:
+            self._apply_reaction(gid, message_id, emoji, sender_id, active)
+
+    def pin_changed(self, p2p: P2PManager, message_id: str, sender_id: str, active: bool) -> None:
+        gid = p2p.current_group_id
+        if gid:
+            self._apply_pin(gid, message_id, sender_id, active)
+
+    def group_read_receipt(self, p2p: P2PManager, reader_id: str, up_to_id: str) -> None:
+        gid = p2p.current_group_id
+        if gid:
+            self._apply_group_read_receipt(gid, reader_id, up_to_id)
+
+    def group_mesh_edit(self, group_id: str, message_id: str, new_content: str, sender_id: str) -> None:
+        self._apply_group_edit(group_id, message_id, new_content, sender_id)
+
+    def group_mesh_reaction(self, group_id: str, message_id: str, emoji: str, sender_id: str, active: bool) -> None:
+        self._apply_reaction(group_id, message_id, emoji, sender_id, active)
+
+    def group_mesh_pin(self, group_id: str, message_id: str, sender_id: str, active: bool) -> None:
+        self._apply_pin(group_id, message_id, sender_id, active)
+
+    def group_mesh_read_receipt(self, group_id: str, reader_id: str, up_to_id: str) -> None:
+        self._apply_group_read_receipt(group_id, reader_id, up_to_id)
+
+    def direct_message_edited(self, peer_id: str, message_id: str, new_content: str) -> None:
+        # the network layer only reports an edit its author check accepted;
+        # the store write re-checks the author in SQL anyway (defense in
+        # depth: a forged edit can never rewrite another author's text)
+        with self._lock:
+            self.store.update_message_content(
+                "direct:" + peer_id, message_id, new_content, sender_id=peer_id
+            )
+
+    def direct_reaction_changed(self, peer_id: str, message_id: str, emoji: str, active: bool) -> None:
+        key = "direct:" + peer_id
+        with self._lock:
+            if active:
+                self.store.add_reaction(key, message_id, emoji, peer_id)
+            else:
+                self.store.remove_reaction(key, message_id, emoji, peer_id)
+        self.extras_changed.emit(key)
+
+    def direct_pin_changed(self, peer_id: str, message_id: str, active: bool) -> None:
+        key = "direct:" + peer_id
+        with self._lock:
+            self.store.set_message_pinned(key, message_id, active, pinned_by=peer_id)
+        self.extras_changed.emit(key)
+
+    def _apply_group_edit(self, group_id: str, message_id: str, new_content: str, sender_id: str) -> None:
+        """Persist a received edit and mirror it into the owning group's
+        in-memory list (the mesh path has updated its own state already; the
+        relay paths updated the P2PManager copy — apply_edit_local is
+        idempotent either way). The store write is author-gated in SQL, so a
+        forged edit can never rewrite stored history even if an upstream
+        caller skipped the authorization, and the UI only refreshes when a
+        row actually changed."""
+        p2p = self.group_p2p_map.get(group_id)
+        if p2p is not None:
+            p2p.apply_edit_local(message_id, new_content, sender_id)
+        with self._lock:
+            changed = self.store.update_message_content(
+                group_id, message_id, new_content, sender_id=sender_id
+            )
+        if changed and group_id == self.active_group_id:
+            self.active_messages_changed.emit()
+
+    def _apply_reaction(self, group_id: str, message_id: str, emoji: str, sender_id: str, active: bool) -> None:
+        with self._lock:
+            if active:
+                self.store.add_reaction(group_id, message_id, emoji, sender_id)
+            else:
+                self.store.remove_reaction(group_id, message_id, emoji, sender_id)
+        self.extras_changed.emit(group_id)
+
+    def _apply_pin(self, group_id: str, message_id: str, sender_id: str, active: bool) -> None:
+        with self._lock:
+            self.store.set_message_pinned(
+                group_id, message_id, active, pinned_by=sender_id
+            )
+        self.extras_changed.emit(group_id)
+
+    def _apply_group_read_receipt(self, group_id: str, reader_id: str, up_to_id: str) -> None:
+        """A member read the group up to [up_to_id]: record the reader on every
+        OWN message covered (same cut-off rule as the direct chat: timestamp
+        <= the receipt's message). Two targeted SQL lookups — never a full
+        decrypted table read (a receipt arrives for every member and every
+        new message)."""
+        with self._lock:
+            target_ts = self.store.get_message_timestamp(group_id, up_to_id)
+            if target_ts is None:
+                return
+            covered = self.store.get_own_message_ids_upto(group_id, target_ts)
+            if not covered:
+                return
+            inserted = self.store.record_group_reads(group_id, covered, reader_id)
+        if inserted:
+            # a repeat receipt (nothing new recorded) must not trigger a
+            # rebuild: N members x M messages would otherwise rebuild the
+            # whole conversation N*M times
+            self.extras_changed.emit(group_id)
 
     def deleted_ids_received(self, p2p: P2PManager, deleted_ids) -> None:
         """join_ack carried tombstone convergence data: the still-present
@@ -1989,6 +2115,17 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         p2p = self._active_p2p()
         return dict(p2p.peers) if p2p is not None else {}
 
+    def active_host_peer(self) -> Optional[Peer]:
+        """The active group's host (creator) as a member entry: for a host
+        group that is this device itself (never inside active_peers); for a
+        client group the host the connection was established to."""
+        p2p = self._active_p2p()
+        if p2p is None:
+            return None
+        if p2p.is_host:
+            return Peer(p2p.my_id, p2p.my_name or "用户", get_local_ip_address(), p2p.port)
+        return p2p.connected_host
+
     def active_group_numeric_id(self) -> str:
         """The active host group's numeric join id (for display / sharing)."""
         p2p = self._active_p2p()
@@ -2107,6 +2244,8 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                             reply_to=m.reply_to or None,
                             reply_preview=m.reply_preview or None,
                             reply_sender=m.reply_sender or None,
+                            edited=m.edited,
+                            mentions=json.loads(m.mentions) if m.mentions else None,
                         )
                         for m in saved
                     ]
@@ -2553,6 +2692,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         reply_to: Optional[str] = None,
         reply_preview: Optional[str] = None,
         reply_sender: Optional[str] = None,
+        mentions: Optional[List[str]] = None,
     ) -> bool:
         if not content.strip():
             return False
@@ -2569,6 +2709,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             reply_to=reply_to,
             reply_preview=reply_preview,
             reply_sender=reply_sender,
+            mentions=mentions,
         )
         if msg is not None:
             self.mesh.broadcast(gid, msg)
@@ -2600,6 +2741,136 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             # the delete over the group mesh so every member converges
             self.mesh.broadcast_delete(gid, message_id)
             self.store.delete_message(gid, message_id)
+            # the delete cascades reactions/pins out of the store: refresh
+            # the reaction cache and pinned banner instead of leaving a
+            # banner pointing at a message that no longer exists
+            self.extras_changed.emit(gid)
+
+    # ------------------------------------------------------- message experience
+
+    def edit_message(self, message_id: str, new_content: str) -> bool:
+        """Edit one of OUR text messages in the active group: apply locally,
+        relay, and mirror over the mesh (a member offline now converges via
+        the mesh history push, whose merge accepts author-consistent
+        rewrites)."""
+        gid = self.active_group_id
+        if gid is None:
+            return False
+        p2p = self.group_p2p_map.get(gid)
+        if p2p is None:
+            return False
+        if not p2p.edit_message(message_id, new_content):
+            return False
+        self.mesh.broadcast_edit(gid, message_id, new_content)
+        with self._lock:
+            self.store.update_message_content(gid, message_id, new_content)
+        return True
+
+    def toggle_group_reaction(self, message_id: str, emoji: str, active: bool) -> bool:
+        """Toggle OUR emoji reaction on a group message (relay + mesh mirror,
+        both advisory). Local store follows immediately."""
+        gid = self.active_group_id
+        if gid is None:
+            return False
+        p2p = self.group_p2p_map.get(gid)
+        if p2p is None:
+            return False
+        sent = p2p.send_reaction(message_id, emoji, active)
+        self.mesh.broadcast_reaction(gid, message_id, emoji, active)
+        self._apply_reaction(gid, message_id, emoji, p2p.my_id, active)
+        return sent or self.mesh.has_links(gid)
+
+    def toggle_group_pin(self, message_id: str, active: bool) -> bool:
+        """Pin/unpin a group message (any member; relay + mesh mirror)."""
+        gid = self.active_group_id
+        if gid is None:
+            return False
+        p2p = self.group_p2p_map.get(gid)
+        if p2p is None:
+            return False
+        sent = p2p.send_pin(message_id, active)
+        self.mesh.broadcast_pin(gid, message_id, active)
+        self._apply_pin(gid, message_id, p2p.my_id, active)
+        return sent or self.mesh.has_links(gid)
+
+    def notify_group_read_receipt(self) -> None:
+        """The open group chat shows the newest message: report the read
+         receipt (relay + mesh). Deduped per group until the newest id
+        changes; only ever sent for the OPEN group (that is what "read"
+        means)."""
+        gid = self.active_group_id
+        if gid is None or not self.window_active:
+            return
+        p2p = self.group_p2p_map.get(gid)
+        if p2p is None:
+            return
+        msgs = p2p.messages
+        if not msgs:
+            return
+        up_to = msgs[-1].id
+        with self._lock:
+            if self._group_receipt_sent.get(gid) == up_to:
+                return
+            self._group_receipt_sent[gid] = up_to
+        p2p.send_group_read_receipt(up_to)
+        self.mesh.broadcast_read_receipt(gid, up_to)
+
+    def toggle_direct_reaction(self, peer_id: str, message_id: str, emoji: str, active: bool) -> bool:
+        """Toggle OUR emoji reaction in a direct chat (live session only)."""
+        key = "direct:" + peer_id
+        sent = self.direct.send_direct_reaction(peer_id, message_id, emoji, active)
+        with self._lock:
+            if active:
+                self.store.add_reaction(key, message_id, emoji, self.direct.my_id_value)
+            else:
+                self.store.remove_reaction(key, message_id, emoji, self.direct.my_id_value)
+        self.extras_changed.emit(key)
+        return sent
+
+    def toggle_direct_pin(self, peer_id: str, message_id: str, active: bool) -> bool:
+        """Pin/unpin a direct-chat message (local + live session mirror)."""
+        key = "direct:" + peer_id
+        sent = self.direct.send_direct_pin(peer_id, message_id, active)
+        with self._lock:
+            self.store.set_message_pinned(
+                key, message_id, active, pinned_by=self.direct.my_id_value
+            )
+        self.extras_changed.emit(key)
+        return sent or not self.direct.is_chat_alive(peer_id)
+
+    def edit_direct_message(self, peer_id: str, message_id: str, new_content: str) -> bool:
+        """Edit one of OUR direct-chat messages (live session only; the local
+        copy follows even when the peer is offline but the send fails — an
+        offline edit cannot reach the peer)."""
+        sent = self.direct.edit_message(peer_id, message_id, new_content)
+        if sent:
+            with self._lock:
+                self.store.update_message_content(
+                    "direct:" + peer_id, message_id, new_content
+                )
+        return sent
+
+    # ------------------------------------------------- message experience read model
+
+    def reactions_for(self, conversation_key: str) -> dict:
+        """{msg_id: [(emoji, actor_id), …]} of one conversation (UI render)."""
+        with self._lock:
+            return self.store.get_reactions(conversation_key)
+
+    def pinned_for(self, conversation_key: str) -> list:
+        """[(msg_id, pinned_at, pinned_by)] oldest first (banner = last)."""
+        with self._lock:
+            return self.store.get_pinned_messages(conversation_key)
+
+    def group_readers_for(self, conversation_key: str) -> dict:
+        """{msg_id: [reader_id, …]} recorded group read receipts."""
+        with self._lock:
+            return self.store.get_group_readers(conversation_key)
+
+    @property
+    def my_device_id(self) -> str:
+        """This device's stable id (mention matching, reaction ownership)."""
+        return self.direct.my_id_value
 
     def send_file(self, path: str) -> bool:
         """Offer a local file to the active group. The offer reaches members

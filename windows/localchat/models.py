@@ -46,11 +46,23 @@ def _strict_port(value, field: str) -> int:
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".3gp"}
+AUDIO_EXTENSIONS = {".wav", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".mp3", ".flac"}
 
 FILE_KIND_FILE = "file"
 FILE_KIND_IMAGE = "image"
 FILE_KIND_VIDEO = "video"
+FILE_KIND_AUDIO = "audio"
 MEDIA_KINDS = (FILE_KIND_IMAGE, FILE_KIND_VIDEO)
+
+# Mentions (@提及): ChatMessage.mentions carries peer ids; the special id
+# "all" means "mentioned everyone". Optional on the wire (omitted when unset)
+# so a plain message stays byte-identical (Android parity).
+MENTION_ALL = "all"
+MAX_MENTIONS = 64
+MAX_MENTION_ID_LEN = 128
+# Reaction emoji are sender-supplied short strings: capped and stripped of
+# control characters so one packet cannot bloat storage or rendering.
+MAX_EMOJI_LEN = 16
 
 # Call media kinds carried by CallInfo.media: "audio" or (implicit) "video".
 # Omitted on the wire for video so a plain video offer stays byte-identical.
@@ -69,21 +81,87 @@ CALL_RESULT_FAILED = "failed"
 
 
 def detect_media_kind(name: str) -> str:
-    """Classify a file by extension: "image", "video" or "file". Used on the
-    send path so an image/video is offered as a viewable media message; the
-    receiving end renders it inline instead of as a plain file card."""
+    """Classify a file by extension: "image", "video", "audio" or "file". Used
+    on the send path so media is offered as a viewable message; the receiving
+    end renders it inline instead of as a plain file card. Old peers that do
+    not know "audio" degrade it to a plain file card that still downloads and
+    plays externally (normalize_media_kind parity on the Android side)."""
     ext = os.path.splitext(name)[1].lower()
     if ext in IMAGE_EXTENSIONS:
         return FILE_KIND_IMAGE
     if ext in VIDEO_EXTENSIONS:
         return FILE_KIND_VIDEO
+    if ext in AUDIO_EXTENSIONS:
+        return FILE_KIND_AUDIO
     return FILE_KIND_FILE
 
 
 def normalize_media_kind(kind: str) -> str:
     """Keep only the known kinds on parse; anything else (future sender kinds,
     crafted values) degrades to a plain file message."""
-    return kind if kind in (FILE_KIND_IMAGE, FILE_KIND_VIDEO) else FILE_KIND_FILE
+    if kind in (FILE_KIND_IMAGE, FILE_KIND_VIDEO, FILE_KIND_AUDIO):
+        return kind
+    return FILE_KIND_FILE
+
+
+def sanitize_emoji(value) -> str:
+    """A reaction emoji is a sender-supplied short string: drop control
+    characters and whitespace so a crafted value can never bloat storage or
+    break rendering. Returns "" when nothing usable remains."""
+    text = str(value or "")
+    text = "".join(
+        ch for ch in text if ch.isprintable() and not ch.isspace()
+    )
+    return text[:MAX_EMOJI_LEN]
+
+
+def sanitize_mentions(raw) -> List[str]:
+    """Normalize an inbound mentions list: strings only, deduped in order,
+    each capped, at most MAX_MENTIONS entries. A malformed shape is ignored
+    (returns []) rather than failing the whole message."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: List[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        entry = item[:MAX_MENTION_ID_LEN]
+        if entry and entry not in out:
+            out.append(entry)
+        if len(out) >= MAX_MENTIONS:
+            break
+    return out
+
+
+_EMOJI_MODIFIER_ORDS = frozenset((0xFE0F, 0x200D, 0x20E3, 0x2764, 0x00A9, 0x00AE, 0x2122))
+
+
+def _is_emoji_char(ch: str) -> bool:
+    o = ord(ch)
+    return (
+        o >= 0x1F000
+        or 0x2600 <= o <= 0x27BF
+        or 0x2B00 <= o <= 0x2BFF
+        or o in _EMOJI_MODIFIER_ORDS
+    )
+
+
+def is_big_emoji(content: str) -> bool:
+    """True when [content] is sticker-sized: only emoji (+ variation selectors,
+    ZWJ, keycap caps), 1..16 code points, at least one real emoji character
+    (not only modifiers). Local rendering hint only (never sent on the wire)."""
+    text = str(content or "").strip()
+    if not text or len(text) > 16:
+        return False
+    if not all(_is_emoji_char(ch) for ch in text):
+        return False
+    return any(
+        ord(ch) >= 0x1F000
+        or 0x2600 <= ord(ch) <= 0x27BF
+        or 0x2B00 <= ord(ch) <= 0x2BFF
+        or ord(ch) in (0x2764, 0x00A9, 0x00AE, 0x2122)
+        for ch in text
+    )
 
 
 # Folder transfer: a folder is offered as one file_message per entry (so old
@@ -263,6 +341,12 @@ class ChatMessage:
     reply_to: Optional[str] = None
     reply_preview: Optional[str] = None
     reply_sender: Optional[str] = None
+    # Message edit: mentions is the optional list of mentioned peer ids
+    # (MENTION_ALL = everyone); edited marks a message whose content was
+    # changed by its author via edit_message (set by the receiver, and carried
+    # on the wire only when True so a plain message stays byte-identical).
+    mentions: Optional[List[str]] = None
+    edited: bool = False
     # Local-only delivery state (like is_from_me, never sent over the wire):
     # true while an offline-sent message still waits in the direct chat
     # outbox for the peer to come online (Android parity).
@@ -288,6 +372,10 @@ class ChatMessage:
                 d["replyPreview"] = self.reply_preview
             if self.reply_sender is not None:
                 d["replySender"] = self.reply_sender
+        if self.mentions:
+            d["mentions"] = list(self.mentions)
+        if self.edited:
+            d["edited"] = True
         return d
 
     @staticmethod
@@ -306,6 +394,12 @@ class ChatMessage:
         reply_sender = (
             None if d.get("replySender") is None else str(d["replySender"])
         )
+        mentions = sanitize_mentions(d.get("mentions"))
+        edited = d.get("edited", False)
+        if not isinstance(edited, bool):
+            # like the typing/call flags: only a real boolean passes, so a
+            # crafted "true"/1 cannot forge the edited marker
+            raise ValueError("chat field edited must be a boolean")
         return ChatMessage(
             id=msg_id,
             content=str(d.get("content", "")),
@@ -316,6 +410,8 @@ class ChatMessage:
             reply_to=reply_to,
             reply_preview=reply_preview,
             reply_sender=reply_sender,
+            mentions=mentions or None,
+            edited=edited,
         )
 
     def marked_from_me(self, my_id: str) -> "ChatMessage":
@@ -523,6 +619,11 @@ class NetworkPacket:
     # encoded).
     group_name: Optional[str] = None
     announcement: Optional[str] = None
+    # edit_message packet: the author's replacement text for [message_id].
+    new_content: Optional[str] = None
+    # reaction packet: the emoji being toggled on/off for [message_id] by
+    # [sender_id] (with [active]). Sanitized + length-capped on parse.
+    emoji: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
@@ -582,6 +683,10 @@ class NetworkPacket:
             d["groupName"] = self.group_name
         if self.announcement is not None:
             d["announcement"] = self.announcement
+        if self.new_content is not None:
+            d["newContent"] = self.new_content
+        if self.emoji is not None:
+            d["emoji"] = self.emoji
         return d
 
     def to_json(self) -> str:
@@ -660,6 +765,10 @@ class NetworkPacket:
             pkt.group_name = str(d["groupName"])
         if d.get("announcement") is not None:
             pkt.announcement = str(d["announcement"])
+        if d.get("newContent") is not None:
+            pkt.new_content = str(d["newContent"])
+        if d.get("emoji") is not None:
+            pkt.emoji = sanitize_emoji(d["emoji"])
         if pkt_type == "error" and pkt.error_message is None:
             raise ValueError("error packet missing required field: errorMessage")
         if pkt_type == "chat" and pkt.message is None:
@@ -694,6 +803,22 @@ class NetworkPacket:
             raise ValueError("group_update packet missing required field: groupId")
         if pkt_type == "kick_member" and (not pkt.group_id or not pkt.target_id):
             raise ValueError("kick_member packet missing required field: groupId/targetId")
+        if pkt_type == "edit_message":
+            if not pkt.message_id or not pkt.sender_id or pkt.new_content is None:
+                raise ValueError(
+                    "edit_message packet missing required field: messageId/senderId/newContent"
+                )
+            if not is_valid_content(pkt.new_content):
+                raise ValueError("edit_message newContent is not valid content")
+        if pkt_type == "reaction":
+            if not pkt.message_id or not pkt.sender_id or not pkt.emoji:
+                raise ValueError(
+                    "reaction packet missing required field: messageId/senderId/emoji"
+                )
+        if pkt_type == "pin_message" and (not pkt.message_id or not pkt.sender_id):
+            raise ValueError(
+                "pin_message packet missing required field: messageId/senderId"
+            )
         return pkt
 
     @staticmethod

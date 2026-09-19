@@ -8,8 +8,16 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-    entities = [SavedGroup::class, SavedChatMessage::class, DeletedMessage::class, CallLogEntity::class],
-    version = 5,
+    entities = [
+        SavedGroup::class,
+        SavedChatMessage::class,
+        DeletedMessage::class,
+        CallLogEntity::class,
+        MessageReaction::class,
+        PinnedMessage::class,
+        GroupRead::class,
+    ],
+    version = 6,
     exportSchema = false
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -132,6 +140,60 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v5 -> v6: message-experience tables (edit/reactions/pins/group read
+         * receipts) plus the edited/mentions message columns. History must
+         * survive the upgrade (NEVER destructive): every new column gets its
+         * empty/0 default and the new tables are created empty. All three
+         * tables FK-cascade off saved_messages' composite key.
+         */
+        private val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE saved_messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0"
+                )
+                db.execSQL(
+                    "ALTER TABLE saved_messages ADD COLUMN mentions TEXT NOT NULL DEFAULT ''"
+                )
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `message_reactions` (" +
+                        "`groupId` TEXT NOT NULL, `msgId` TEXT NOT NULL, " +
+                        "`emoji` TEXT NOT NULL, `actorId` TEXT NOT NULL, " +
+                        "PRIMARY KEY(`groupId`, `msgId`, `emoji`, `actorId`), " +
+                        "FOREIGN KEY(`groupId`, `msgId`) REFERENCES `saved_messages`(`groupId`, `id`) " +
+                        "ON UPDATE NO ACTION ON DELETE CASCADE)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_message_reactions_groupId` " +
+                        "ON `message_reactions` (`groupId`)"
+                )
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `pinned_messages` (" +
+                        "`groupId` TEXT NOT NULL, `msgId` TEXT NOT NULL, " +
+                        "`pinnedAt` INTEGER NOT NULL, `pinnedBy` TEXT NOT NULL DEFAULT '', " +
+                        "PRIMARY KEY(`groupId`, `msgId`), " +
+                        "FOREIGN KEY(`groupId`, `msgId`) REFERENCES `saved_messages`(`groupId`, `id`) " +
+                        "ON UPDATE NO ACTION ON DELETE CASCADE)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_pinned_messages_groupId` " +
+                        "ON `pinned_messages` (`groupId`)"
+                )
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `group_reads` (" +
+                        "`groupId` TEXT NOT NULL, `msgId` TEXT NOT NULL, " +
+                        "`readerId` TEXT NOT NULL, " +
+                        "PRIMARY KEY(`groupId`, `msgId`, `readerId`), " +
+                        "FOREIGN KEY(`groupId`, `msgId`) REFERENCES `saved_messages`(`groupId`, `id`) " +
+                        "ON UPDATE NO ACTION ON DELETE CASCADE)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_group_reads_groupId` " +
+                        "ON `group_reads` (`groupId`)"
+                )
+            }
+        }
+
         @Volatile
         private var INSTANCE: ChatDatabase? = null
 
@@ -142,7 +204,10 @@ abstract class ChatDatabase : RoomDatabase() {
                     ChatDatabase::class.java,
                     "localchat_database"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                    .addMigrations(
+                        MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
+                        MIGRATION_5_6
+                    )
                     .build()
                 INSTANCE = instance
                 instance

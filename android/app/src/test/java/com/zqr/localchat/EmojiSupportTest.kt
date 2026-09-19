@@ -17,7 +17,7 @@ class EmojiSupportTest {
     @Test
     fun `catalog has the expected categories with enough emoji`() {
         assertEquals(
-            listOf("笑脸", "手势", "动物", "食物", "物品", "符号"),
+            listOf("贴纸", "笑脸", "手势", "动物", "食物", "物品", "符号"),
             EmojiCatalog.categories.map { it.name }
         )
         EmojiCatalog.categories.forEach { category ->
@@ -29,6 +29,14 @@ class EmojiSupportTest {
                 "no duplicates inside ${category.name}",
                 category.emojis.size,
                 category.emojis.toSet().size
+            )
+        }
+        // every sticker renders BIG (isBigEmoji) so the sticker tab actually
+        // produces the large sticker-style bubbles on both platforms
+        EmojiCatalog.categories.first().emojis.forEach { sticker ->
+            assertTrue(
+                "sticker $sticker must be detected as big emoji",
+                com.zqr.localchat.data.isBigEmoji(sticker)
             )
         }
     }
