@@ -54,6 +54,8 @@ dependencies {
     implementation(libs.camera.core)
     implementation(libs.camera.camera2)
     implementation(libs.camera.lifecycle)
+    // 扫码预览（PreviewView）：QrScanOverlay 的相机取景
+    implementation(libs.camera.view)
     // QR 生成与相机解码（扫码加联系人 / 群邀请）：纯 Java core，无 Play 服务依赖
     implementation(libs.zxing.core)
     implementation(libs.room.runtime)

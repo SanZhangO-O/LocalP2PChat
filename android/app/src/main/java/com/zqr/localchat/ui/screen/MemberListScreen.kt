@@ -53,7 +53,11 @@ fun MemberListScreen(
     onRemoveContact: (id: String) -> Unit,
     onAcceptRequest: (id: String) -> Unit,
     onIgnoreRequest: (id: String) -> Unit,
-    onOpenSearch: () -> Unit = {}
+    onOpenSearch: () -> Unit = {},
+    /** Open the camera scanner to import a contact QR. */
+    onScanContactQr: () -> Unit = {},
+    /** Show this device's contact QR (name + 安全码 + endpoint). */
+    onShowMyQr: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var showAdd by remember { mutableStateOf(false) }
@@ -209,6 +213,23 @@ fun MemberListScreen(
                         label = { Text("备注名（可选）") },
                         modifier = Modifier.fillMaxWidth()
                     )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        "也可以通过二维码添加 / 出示自己",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = onScanContactQr) {
+                            Text("扫二维码")
+                        }
+                        TextButton(onClick = onShowMyQr) {
+                            Text("我的二维码")
+                        }
+                    }
                 }
             },
             confirmButton = {

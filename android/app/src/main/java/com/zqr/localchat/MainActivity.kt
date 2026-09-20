@@ -30,6 +30,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zqr.localchat.call.CallManager
+import com.zqr.localchat.call.GroupCallManager
 import com.zqr.localchat.data.FileInfo
 import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.data.MAX_FOLDER_FILES
@@ -38,6 +39,10 @@ import com.zqr.localchat.data.replyPreviewText
 import com.zqr.localchat.network.GroupAuth
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.ui.screen.CallOverlay
+import com.zqr.localchat.ui.screen.GroupCallOverlay
+import com.zqr.localchat.ui.QrContactConfirmDialog
+import com.zqr.localchat.ui.QrScanOverlay
+import com.zqr.localchat.ui.QrShowDialog
 import com.zqr.localchat.ui.screen.ChatScreen
 import com.zqr.localchat.ui.screen.DirectChatScreen
 import com.zqr.localchat.ui.screen.GroupListScreen
@@ -289,6 +294,57 @@ fun LocalChatApp(
     val callVideoMuted by viewModel.callVideoMuted.collectAsState()
     val callUsingFrontCamera by viewModel.callUsingFrontCamera.collectAsState()
 
+    // --- group voice conference ---
+    val groupCallState by viewModel.groupCallState.collectAsState()
+    val groupCallParticipants by viewModel.groupCallParticipants.collectAsState()
+    val groupCallAudioMuted by viewModel.groupCallAudioMuted.collectAsState()
+
+    // --- QR invites ---
+    // null = no scan in progress; otherwise the scan purpose ("contact" |
+    // "group") decides what happens with the decoded payload
+    var qrScanPurpose by remember { mutableStateOf<String?>(null) }
+    var pendingContactInvite by remember {
+        mutableStateOf<com.zqr.localchat.network.ContactInvite?>(null)
+    }
+    var scannedGroupInvite by remember {
+        mutableStateOf<com.zqr.localchat.network.GroupInvite?>(null)
+    }
+    var showMyQr by remember { mutableStateOf(false) }
+    var showInviteQr by remember { mutableStateOf(false) }
+
+    fun handleScannedPayload(text: String) {
+        when (val invite = viewModel.parseQrInvite(text)) {
+            is com.zqr.localchat.network.ContactInvite -> {
+                if (qrScanPurpose == "contact") {
+                    pendingContactInvite = invite
+                } else {
+                    Toast.makeText(context, "这是联系人二维码，请在成员页“添加成员”中使用", Toast.LENGTH_SHORT).show()
+                }
+            }
+            is com.zqr.localchat.network.GroupInvite -> {
+                if (qrScanPurpose == "group") {
+                    if (invite.ip.isBlank()) {
+                        // Windows parity: a relay-only invite cannot prefill a
+                        // joinable address on this end
+                        Toast.makeText(
+                            context,
+                            "该邀请未包含加入地址：双方需填写同一个中继服务器后加入",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                    scannedGroupInvite = invite
+                    currentScreenName = Screen.Setup.name
+                } else {
+                    Toast.makeText(context, "这是群邀请二维码，请在“加入群组”页使用", Toast.LENGTH_SHORT).show()
+                }
+            }
+            else -> {
+                Toast.makeText(context, "二维码内容无法识别", Toast.LENGTH_SHORT).show()
+            }
+        }
+        qrScanPurpose = null
+    }
+
     // --- direct member chats ---
     val directContacts by viewModel.directContacts.collectAsState()
     val directLastMessages by viewModel.directLastMessages.collectAsState()
@@ -350,6 +406,12 @@ fun LocalChatApp(
     }
 
     LaunchedEffect(Unit) {
+        viewModel.groupCallEvents.collect { message ->
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    LaunchedEffect(Unit) {
         // member-first: the app listens from startup so any member can pull up
         // a direct chat with no confirmation. Request the notification
         // permission up front too — a user who only ever direct-chats (never
@@ -384,6 +446,9 @@ fun LocalChatApp(
     // back during a call hangs up instead of navigating
     BackHandler(enabled = callState !is CallManager.CallState.Idle) {
         viewModel.hangupCall()
+    }
+    BackHandler(enabled = groupCallState !is GroupCallManager.GroupCallState.Idle) {
+        viewModel.hangupGroupCall()
     }
 
     // --- file transfer ---
@@ -627,7 +692,9 @@ fun LocalChatApp(
                 onAddContact = viewModel::addDirectContact,
                 onRemoveContact = viewModel::removeDirectContact,
                 onAcceptRequest = viewModel::acceptContactRequest,
-                onIgnoreRequest = viewModel::ignoreContactRequest
+                onIgnoreRequest = viewModel::ignoreContactRequest,
+                onScanContactQr = { qrScanPurpose = "contact" },
+                onShowMyQr = { showMyQr = true }
             )
         }
         Screen.DirectChat -> {
@@ -827,6 +894,8 @@ fun LocalChatApp(
                 },
                 onCancelJoin = viewModel::cancelJoin,
                 onClearError = viewModel::clearConnectionResult,
+                scannedGroupInvite = scannedGroupInvite,
+                onScanGroupQr = { qrScanPurpose = "group" },
                 onBack = {
                     currentScreenName = Screen.GroupList.name
                 }
@@ -873,11 +942,15 @@ fun LocalChatApp(
                         viewModel.startCall(peerId, CallManager.MEDIA_AUDIO)
                     }
                 },
+                onStartConference = {
+                    requireCallPermission(audioOnly = true) { viewModel.startGroupCall() }
+                },
                 announcement = groups.find { it.groupId == activeGroupId }?.announcement ?: "",
                 onUpdateGroupInfo = viewModel::updateGroupInfo,
                 onKickMember = viewModel::kickMember,
                 groupId = activeGroupId,
-                memberFingerprints = activeMemberFingerprints
+                memberFingerprints = activeMemberFingerprints,
+                onShowInviteQr = { showInviteQr = true }
             )
         }
         Screen.Chat -> {
@@ -1051,6 +1124,88 @@ fun LocalChatApp(
         onSwitchCamera = viewModel::switchCallCamera,
         onHangup = viewModel::hangupCall
     )
+
+    (groupCallState as? GroupCallManager.GroupCallState.Incoming)?.let { incoming ->
+        AlertDialog(
+            onDismissRequest = { viewModel.declineGroupCall() },
+            title = { Text("🎙 语音会议邀请") },
+            text = { Text("${incoming.hostName} 邀请你加入群组语音会议") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        requireCallPermission(audioOnly = true) { viewModel.acceptGroupCall() }
+                    }
+                ) {
+                    Text("加入", color = androidx.compose.ui.graphics.Color(0xFF2E7D32))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.declineGroupCall() }) {
+                    Text("拒绝", color = MaterialTheme.colorScheme.error)
+                }
+            }
+        )
+    }
+
+    GroupCallOverlay(
+        state = groupCallState,
+        participants = groupCallParticipants,
+        audioMuted = groupCallAudioMuted,
+        onToggleAudio = { viewModel.setGroupCallAudioMuted(!groupCallAudioMuted) },
+        onHangup = viewModel::hangupGroupCall
+    )
+
+    // --- QR invite dialogs ---
+    if (showMyQr) {
+        QrShowDialog(
+            title = "我的二维码",
+            payload = viewModel.qrContactPayload(),
+            extraRows = listOf(
+                "名字" to viewModel.currentNickname().ifBlank { "用户" },
+                "本机安全码（请与对方核对）" to viewModel.securityCode.ifBlank { "未生成" }
+            ),
+            onDismiss = { showMyQr = false }
+        )
+    }
+    if (showInviteQr) {
+        val payload = viewModel.qrGroupInvitePayload()
+        if (payload == null) {
+            // the lobby only shows the button for a host; this guards a state
+            // flip between tap and render
+            SideEffect { showInviteQr = false }
+        } else {
+            QrShowDialog(
+                title = "群邀请二维码",
+                payload = payload,
+                extraRows = listOf(
+                    "群组名称" to activeGroupName,
+                    "群组数字ID" to (activeGroupId?.let { viewModel.activeGroupNumericId() } ?: "")
+                ),
+                onDismiss = { showInviteQr = false }
+            )
+        }
+    }
+    pendingContactInvite?.let { invite ->
+        QrContactConfirmDialog(
+            invite = invite,
+            onConfirm = {
+                if (!viewModel.addDirectContact(
+                        "${invite.ip}:${invite.port}", invite.name, invite.fingerprint
+                    )
+                ) {
+                    Toast.makeText(context, "二维码中的地址无效", Toast.LENGTH_SHORT).show()
+                }
+                pendingContactInvite = null
+            },
+            onDismiss = { pendingContactInvite = null }
+        )
+    }
+    if (qrScanPurpose != null) {
+        QrScanOverlay(
+            onFound = { handleScannedPayload(it) },
+            onDismiss = { qrScanPurpose = null }
+        )
+    }
     }
 }
 

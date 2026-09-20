@@ -34,6 +34,7 @@ import com.zqr.localchat.MainActivity
 import com.zqr.localchat.NotificationDismissReceiver
 import com.zqr.localchat.NotificationReplyReceiver
 import com.zqr.localchat.call.CallManager
+import com.zqr.localchat.call.GroupCallManager
 import com.zqr.localchat.crypto.Crypto
 import com.zqr.localchat.crypto.StoreCipher
 import com.zqr.localchat.data.CallDirection
@@ -59,16 +60,19 @@ import com.zqr.localchat.data.SavedGroup
 import com.zqr.localchat.data.sanitizeEmoji
 import com.zqr.localchat.data.sanitizeRelativePath
 import com.zqr.localchat.network.Constants
+import com.zqr.localchat.network.ContactInvite
 import com.zqr.localchat.network.DeviceIdentity
 import com.zqr.localchat.network.DirectChatManager
 import com.zqr.localchat.network.FileTransfer
 import com.zqr.localchat.network.GroupInfo
+import com.zqr.localchat.network.GroupInvite
 import com.zqr.localchat.network.GroupMeshManager
 import com.zqr.localchat.network.HostGroupServer
 import com.zqr.localchat.network.LocalAddress
 import com.zqr.localchat.network.NetworkPacket
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.network.Protocol
+import com.zqr.localchat.network.QrInvite
 import com.zqr.localchat.network.Wire
 import com.zqr.localchat.ui.screen.isValidHost
 import com.zqr.localchat.ui.screen.parseHostPort
@@ -542,6 +546,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * [media] is "video" (default) or "audio".
      */
     fun startDirectCall(peerId: String, media: String = CallMedia.VIDEO) {
+        if (GroupCallManager.state.value !is GroupCallManager.GroupCallState.Idle) {
+            _groupEvents.tryEmit("语音会议进行中，请先挂断会议")
+            return
+        }
         val contact = DirectChatManager.contacts.value[peerId] ?: return
         val peer = Peer(contact.id, contact.name, contact.ip, contact.port)
         if (peer.ipAddress.isBlank()) return
@@ -948,6 +956,53 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         persistedDirectRead.remove(id)
         DirectChatManager.closeChat(id)
         DirectChatManager.removeContact(id)
+    }
+
+    // ------------------------------------------------------------- QR invites
+
+    /** The contact QR this device shows: name, 安全码 and LAN endpoint.
+     *  The fingerprint in it lets the scanner pin TOFU before dialing
+     *  (Windows parity: qr_contact_payload). */
+    fun qrContactPayload(): String = QrInvite.encodeContactInvite(
+        name = currentNickname().ifBlank { "用户" },
+        fingerprint = securityCode,
+        ip = localIpAddress,
+        port = localPort
+    )
+
+    /** The group invite QR for the active HOSTED group: numeric join id +
+     *  this endpoint. The group password is NEVER part of it — joiners still
+     *  type the password themselves. Null when this device is not hosting. */
+    fun qrGroupInvitePayload(): String? {
+        if (!_activeIsHost.value) return null
+        val numeric = activeGroupNumericId()
+        if (numeric.isNullOrBlank()) return null
+        return QrInvite.encodeGroupInvite(
+            groupId = numeric,
+            name = _activeGroupName.value,
+            ip = localIpAddress,
+            port = localPort
+        )
+    }
+
+    /** Decode a scanned QR payload into a ContactInvite / GroupInvite, or
+     *  null when it is not a valid (current-format) invite. */
+    fun parseQrInvite(text: String): Any? =
+        runCatching { QrInvite.parse(text) }.getOrNull()
+
+    /** Scanned-QR contact add: pins the 安全码 the QR declared so the first
+     *  handshake with this endpoint must present exactly that identity
+     *  (Windows parity: add_direct_contact(expected_fingerprint)). */
+    fun addDirectContact(ipPort: String, name: String, expectedFingerprint: String): Boolean {
+        if (expectedFingerprint.isNotBlank()) {
+            val parsed = parseHostPort(ipPort)
+            if (parsed.host.isNotBlank() && parsed.port in 1..65535) {
+                DirectChatManager.setQrExpectedFingerprint(
+                    parsed.host, parsed.port, expectedFingerprint
+                )
+            }
+        }
+        return addDirectContact(ipPort, name)
     }
 
     /** Accept a parked contact request: adds the member (clearing any
@@ -2433,6 +2488,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             CallManager.finishedCalls.collect { call -> handleFinishedCall(call) }
         }
 
+        // Group voice conference: a meeting never rings or starts while the
+        // microphone is busy with a 1:1 call (Windows parity: busy_check).
+        GroupCallManager.busyCheck = {
+            CallManager.state.value !is CallManager.CallState.Idle
+        }
+
         // Group mesh: messages arriving over member-to-member links (host
         // offline, or history backfill) flow into the owning group's list.
         GroupMeshManager.onGroupMessage = { groupId, msgs ->
@@ -2774,6 +2835,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun registerGroupP2p(groupId: String, p2p: P2PManager) {
         groupP2pMap[groupId] = p2p
         p2p.callSignalListener = { packet -> CallManager.handleSignal(p2p, packet) }
+        p2p.groupCallSignalListener = { packet -> GroupCallManager.handleSignal(p2p, packet) }
         // typing indicators relayed by the host (or seen by the host itself)
         p2p.typingListener = { senderId, active ->
             onGroupTyping(groupId, senderId, active)
@@ -2859,6 +2921,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 ?: p2p.currentGroupName
             groupP2pMap.remove(groupId)
             monitoringJobs.remove(groupId)?.forEach { it.cancel() }
+            // the meeting/1:1 call riding this group's signaling is dead with it
+            // (Windows parity: kicked_from_group tears both down)
+            CallManager.endIfOn(p2p, "已离开群组")
+            GroupCallManager.endIfOn(p2p, "已离开群组")
             p2p.stop()
             teardownGroupMesh(groupId)
             persistedPeerCounts.remove(groupId)
@@ -3167,6 +3233,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         groupP2pMap.remove(groupId)?.let { old ->
             monitoringJobs.remove(groupId)?.forEach { it.cancel() }
             CallManager.endIfOn(old, "通话已结束")
+            GroupCallManager.endIfOn(old, "通话已结束")
             old.stop()
         }
         ChatApp.saveGroupPassword(getApplication(), groupId, password)
@@ -3402,7 +3469,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (pendingP2pManager != null) return
         val old = groupP2pMap.remove(gid)
         monitoringJobs.remove(gid)?.forEach { it.cancel() }
-        old?.let { CallManager.endIfOn(it, "连接已断开") }
+        old?.let {
+            CallManager.endIfOn(it, "连接已断开")
+            GroupCallManager.endIfOn(it, "连接已断开")
+        }
         old?.stop()
         _groups.update { list ->
             list.map { g -> if (g.groupId == gid) g.copy(connected = false) else g }
@@ -3429,7 +3499,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val p2p = groupP2pMap.remove(gid)
         monitoringJobs.remove(gid)?.forEach { it.cancel() }
         teardownGroupMesh(gid)
-        p2p?.let { CallManager.endIfOn(it, "通话已结束") }
+        p2p?.let {
+            CallManager.endIfOn(it, "通话已结束")
+            GroupCallManager.endIfOn(it, "通话已结束")
+        }
         p2p?.stop()
         // Leaving stops this group's server; the group stays in the list and
         // re-hosts on the same port when re-entered.
@@ -3456,7 +3529,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val p2p = groupP2pMap.remove(groupId)
         monitoringJobs.remove(groupId)?.forEach { it.cancel() }
         teardownGroupMesh(groupId)
-        p2p?.let { CallManager.endIfOn(it, "通话已结束") }
+        p2p?.let {
+            CallManager.endIfOn(it, "通话已结束")
+            GroupCallManager.endIfOn(it, "通话已结束")
+        }
         p2p?.stop()
         removedGroupIds.add(groupId)
         persistedMessageIds.remove(groupId)
@@ -3843,6 +3919,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val gid = _activeGroupId.value ?: return
         val p2p = groupP2pMap[gid] ?: return
         if (p2p.connectionLost.value) return
+        if (GroupCallManager.state.value !is GroupCallManager.GroupCallState.Idle) {
+            _groupEvents.tryEmit("语音会议进行中，请先挂断会议")
+            return
+        }
         val peer = p2p.peers.value[peerId] ?: return
         CallManager.startCall(p2p, peer, media)
     }
@@ -3863,6 +3943,37 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun setCallVideoMuted(muted: Boolean) = CallManager.setVideoMuted(muted)
 
     fun switchCallCamera() = CallManager.switchCamera()
+
+    // -------------------------------------------------- group voice meeting
+
+    val groupCallState: StateFlow<GroupCallManager.GroupCallState> = GroupCallManager.state
+    val groupCallParticipants: StateFlow<List<GroupCallManager.Participant>> =
+        GroupCallManager.participants
+    val groupCallAudioMuted: StateFlow<Boolean> = GroupCallManager.audioMuted
+    val groupCallEvents: SharedFlow<String> = GroupCallManager.events
+
+    /** Start a group voice conference in the active group (this device
+     *  becomes the meeting host / mixer). */
+    fun startGroupCall() {
+        val gid = _activeGroupId.value ?: run {
+            _groupEvents.tryEmit("请先进入一个群组")
+            return
+        }
+        val p2p = groupP2pMap[gid]
+        if (p2p == null || p2p.connectionLost.value) {
+            _groupEvents.tryEmit("未连接到群组，无法发起语音会议")
+            return
+        }
+        GroupCallManager.startMeeting(p2p)
+    }
+
+    fun acceptGroupCall() = GroupCallManager.acceptInvite()
+
+    fun declineGroupCall() = GroupCallManager.declineInvite()
+
+    fun hangupGroupCall() = GroupCallManager.leaveMeeting()
+
+    fun setGroupCallAudioMuted(muted: Boolean) = GroupCallManager.setAudioMuted(muted)
 
     /**
      * Persist one finished call to the local call log (Room, never synced)
@@ -3973,7 +4084,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         val jobConnection = viewModelScope.launch {
             p2p.connectionLost.collect { lost ->
-                if (lost) CallManager.endIfOn(p2p, "连接已断开")
+                if (lost) {
+                    CallManager.endIfOn(p2p, "连接已断开")
+                    GroupCallManager.endIfOn(p2p, "连接已断开")
+                }
                 _groups.update { list ->
                     list.map { g ->
                         if (g.groupId == groupId) g.copy(connected = !lost) else g
@@ -4273,6 +4387,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         networkCallback = null
         connectivityManager = null
+        // a cleared ViewModel must not leave a meeting or 1:1 call holding the
+        // microphone (Windows parity: shutdown hangs up both)
+        GroupCallManager.leaveMeeting()
+        CallManager.hangup()
         GroupMeshManager.shutdown()
         groupP2pMap.values.forEach { it.stop() }
         pendingP2pManager?.stop()

@@ -203,7 +203,9 @@ object QrInvite {
             groupId = digits,
             name = fields["n"] ?: "",
             ip = ip,
-            port = port,
+            // the branches above verified the port whenever it was declared;
+            // an undeclared port is the standard one
+            port = port ?: Constants.TCP_PORT,
             relay = relay
         )
     }

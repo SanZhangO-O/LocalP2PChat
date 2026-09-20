@@ -2,6 +2,8 @@ package com.zqr.localchat.ui.screen
 
 import android.content.ClipData
 import android.widget.Toast
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -17,6 +19,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
@@ -52,6 +55,8 @@ fun PeerListScreen(
     onOpenChat: () -> Unit,
     onCallPeer: (String) -> Unit = {},
     onCallAudioPeer: (String) -> Unit = {},
+    /** Start a group voice conference in this group (host mixes). */
+    onStartConference: () -> Unit = {},
     announcement: String = "",
     onUpdateGroupInfo: (String?, String?) -> Unit = { _, _ -> },
     onKickMember: (String) -> Unit = {},
@@ -59,7 +64,9 @@ fun PeerListScreen(
      *  bindings shown as 已验证 badges + 安全码 dialogs. Null disables. */
     groupId: String? = null,
     /** member device-id -> bound 安全码 (empty = not yet bound). */
-    memberFingerprints: Map<String, String> = emptyMap()
+    memberFingerprints: Map<String, String> = emptyMap(),
+    /** Show the group invite QR (host only; button hidden otherwise). */
+    onShowInviteQr: () -> Unit = {}
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     val clipboard = LocalClipboard.current
@@ -108,6 +115,13 @@ fun PeerListScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = onStartConference) {
+                        Icon(
+                            Icons.Filled.Groups,
+                            contentDescription = "语音会议",
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
                     if (isHost) {
                         IconButton(onClick = { showGroupSettings = true }) {
                             Icon(
@@ -238,6 +252,11 @@ fun PeerListScreen(
                                     }
                                 ) {
                                     Text("复制", fontSize = 13.sp)
+                                }
+                                if (isHost) {
+                                    TextButton(onClick = onShowInviteQr) {
+                                        Text("群邀请二维码", fontSize = 13.sp)
+                                    }
                                 }
                             }
                         }
@@ -563,6 +582,10 @@ fun PeerListScreen(
 private fun PeerItem(
     peer: com.zqr.localchat.data.Peer,
     isSelf: Boolean = false,
+    /** The member's TOFU-bound 安全码 (null/empty = not yet signature-bound). */
+    fingerprint: String? = null,
+    /** Show the 安全码 dialog: (member name, fingerprint). */
+    onShowFingerprint: ((name: String, fingerprint: String) -> Unit)? = null,
     onCall: (() -> Unit)? = null,
     onKick: (() -> Unit)? = null,
     onCallAudio: (() -> Unit)? = null
@@ -619,9 +642,38 @@ private fun PeerItem(
                             color = MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.Medium
                         )
+                    } else if (!fingerprint.isNullOrBlank()) {
+                        // TOFU badge: this member's device identity is
+                        // signature-bound in this group (Windows parity: the
+                        // 已验证 badge on the lobby member rows)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "已验证",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = Color(0xFF1B5E20),
+                            modifier = Modifier
+                                .background(Color(0xFFC8E6C9), RoundedCornerShape(6.dp))
+                                .padding(horizontal = 6.dp, vertical = 1.dp)
+                        )
                     }
                 }
                 Text(text = peer.ipAddress, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (!isSelf && onShowFingerprint != null) {
+                    Text(
+                        text = if (fingerprint.isNullOrBlank()) "安全码未绑定" else "安全码 $fingerprint",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "查看安全码",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier
+                            .padding(top = 2.dp)
+                            .clickable { onShowFingerprint(peer.name, fingerprint ?: "") }
+                    )
+                }
             }
             if (!isSelf && onCallAudio != null) {
                 IconButton(onClick = onCallAudio) {

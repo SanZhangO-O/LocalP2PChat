@@ -43,6 +43,16 @@ val CALL_PACKET_TYPES = setOf(
     "call_offer", "call_answer", "call_reject", "call_hangup", "call_failed"
 )
 
+/** Group voice conference signaling (star topology: the meeting host mixes).
+ *  Routed by the host like call packets (the packet actor must be the
+ *  authenticated sender; delivered only to the addressed member), but handed
+ *  to the separate groupCallSignalListener so the 1:1 call path is untouched.
+ *  Old peers ignore these unknown types (both read loops are when-chains
+ *  without else). Windows parity: GROUP_CALL_PACKET_TYPES. */
+val GROUP_CALL_PACKET_TYPES = setOf(
+    "group_call_invite", "group_call_join", "group_call_leave", "group_call_sync"
+)
+
 /**
  * Single TCP listener for the whole program.
  *
@@ -511,6 +521,15 @@ class P2PManager(
      */
     @Volatile
     var callSignalListener: ((NetworkPacket) -> Unit)? = null
+
+    /**
+     * Group voice conference signaling listener: invoked on the network
+     * thread for group_call_* packets addressed to this node (the routing
+     * already checked the addressing). The ViewModel wires it to the global
+     * GroupCallManager with this P2PManager captured in the closure.
+     */
+    @Volatile
+    var groupCallSignalListener: ((NetworkPacket) -> Unit)? = null
 
     /** A member's typing indicator changed (host relay path). Advisory: the
      *  ViewModel also expires an indicator that received no refresh. Invoked
@@ -1162,6 +1181,17 @@ class P2PManager(
                 }
                 callSignalListener?.invoke(packet)
             }
+            in GROUP_CALL_PACKET_TYPES -> {
+                // Group voice conference signaling relayed by the host: only
+                // packets explicitly addressed to this node whose declared
+                // parties include this node reach the listener (semantic
+                // checks — group id / meeting id / host identity — belong to
+                // the GroupCallManager). Windows parity: processPacketAsClient.
+                val call = packet.call ?: return
+                if (packet.targetId != myId) return
+                if (call.calleeId != myId && call.callerId != myId) return
+                groupCallSignalListener?.invoke(packet)
+            }
         }
     }
 
@@ -1352,6 +1382,7 @@ class P2PManager(
             }
             "pong" -> { /* traffic only */ }
             in CALL_PACKET_TYPES -> routeCallPacket(packet, senderId)
+            in GROUP_CALL_PACKET_TYPES -> routeGroupCallPacket(packet, senderId)
         }
     }
 
@@ -1404,6 +1435,34 @@ class P2PManager(
         }
         if (targetId == myId) {
             callSignalListener?.invoke(packet)
+            return
+        }
+        val conn = connectedClients[targetId]
+        if (conn != null) {
+            runCatching { conn.wire.sendPacket(packet) }
+        }
+    }
+
+    /**
+     * Host-side routing for group voice conference signaling: the packet
+     * actor (call.callerId — invite sender / joiner / leaver / meeting host)
+     * must be the authenticated sender connection; deliver locally when this
+     * host is the addressee, otherwise forward to the targeted member's
+     * socket (never broadcast). Parity with the Windows
+     * P2PManager._route_group_call_packet.
+     */
+    private fun routeGroupCallPacket(packet: NetworkPacket, senderId: String) {
+        val call = packet.call ?: return
+        if (call.callerId != senderId) {
+            Log.w(TAG, "drop group call ${packet.type} from $senderId: callerId mismatch")
+            return
+        }
+        val targetId = packet.targetId
+            // invite/sync address the invited member, join/leave address the
+            // meeting host — both are call.calleeId
+            ?: call.calleeId
+        if (targetId == myId) {
+            groupCallSignalListener?.invoke(packet)
             return
         }
         val conn = connectedClients[targetId]

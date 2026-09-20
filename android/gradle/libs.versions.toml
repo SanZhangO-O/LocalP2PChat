@@ -31,6 +31,7 @@ room-compiler = { group = "androidx.room", name = "room-compiler", version.ref =
 camera-core = { group = "androidx.camera", name = "camera-core", version.ref = "cameraX" }
 camera-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "cameraX" }
 camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "cameraX" }
+camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "cameraX" }
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxingCore" }
 
 [plugins]

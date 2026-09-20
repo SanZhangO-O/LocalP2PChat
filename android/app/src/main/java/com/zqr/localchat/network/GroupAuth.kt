@@ -1,6 +1,8 @@
 package com.zqr.localchat.network
 
 import android.util.Log
+import com.zqr.localchat.crypto.Crypto
+import com.zqr.localchat.data.ChatMessage
 
 /**
  * Group sender identity binding (TOFU signatures) — Windows parity:

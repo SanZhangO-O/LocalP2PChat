@@ -23,6 +23,7 @@ import androidx.compose.ui.unit.sp
 import com.zqr.localchat.ChatApp
 import com.zqr.localchat.network.Constants
 import com.zqr.localchat.network.GroupInfo
+import com.zqr.localchat.network.GroupInvite
 import com.zqr.localchat.viewmodel.ChatViewModel
 import kotlinx.coroutines.launch
 
@@ -117,6 +118,10 @@ fun SetupScreen(
     onConfirmJoin: () -> Unit,
     onCancelJoin: () -> Unit,
     onClearError: () -> Unit = {},
+    /** A scanned group invite QR: prefills the join form (id + address). */
+    scannedGroupInvite: GroupInvite? = null,
+    /** Open the camera scanner to import a group invite QR. */
+    onScanGroupQr: () -> Unit = {},
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -128,6 +133,19 @@ fun SetupScreen(
     val mode = modeName?.let { name -> runCatching { SetupMode.valueOf(name) }.getOrNull() }
     var pendingDuplicateCreate by rememberSaveable { mutableStateOf(false) }
     val savedGroupNames by ChatViewModel.savedGroupNames.collectAsState()
+
+    // A scanned group invite QR fills the join fields once (a manual edit
+    // afterwards must not be overwritten by a recomposition).
+    var appliedInvite by remember { mutableStateOf<GroupInvite?>(null) }
+    LaunchedEffect(scannedGroupInvite) {
+        val invite = scannedGroupInvite ?: return@LaunchedEffect
+        if (appliedInvite != invite) {
+            appliedInvite = invite
+            groupName = invite.groupId
+            hostIp = if (invite.ip.isNotBlank()) "${invite.ip}:${invite.port}" else ""
+            modeName = SetupMode.JOIN.name
+        }
+    }
 
     val addressText = if (localIpAddress.isNotEmpty()) {
         "$localIpAddress:$localPort"
@@ -157,6 +175,7 @@ fun SetupScreen(
                     onGroupNameChange = { groupName = it },
                     onHostIpChange = { hostIp = it },
                     onPasswordChange = { groupPassword = it },
+                    onScanQr = onScanGroupQr,
                     onJoin = {
                         val parsed = parseHostPort(hostIp)
                         if (isValidHost(parsed.host)) {
@@ -218,6 +237,7 @@ fun SetupScreen(
                             groupPassword = it
                             onClearError()
                         },
+                        onScanQr = onScanGroupQr,
                         onJoin = {
                             val parsed = parseHostPort(hostIp)
                             if (isValidHost(parsed.host)) {
@@ -550,6 +570,7 @@ private fun JoinGroupForm(
     onGroupNameChange: (String) -> Unit,
     onHostIpChange: (String) -> Unit,
     onPasswordChange: (String) -> Unit,
+    onScanQr: () -> Unit = {},
     onJoin: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -641,7 +662,16 @@ private fun JoinGroupForm(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp)
         )
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            "创建者出示了二维码？扫一扫即可填入数字ID与地址（密码仍需手动输入）",
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+        )
+        TextButton(onClick = onScanQr, modifier = Modifier.align(Alignment.End)) {
+            Text("扫二维码")
+        }
+        Spacer(modifier = Modifier.height(16.dp))
         val joinIdDigits = groupName.filter { it.isDigit() }
         Button(
             onClick = onJoin,
