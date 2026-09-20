@@ -22,7 +22,14 @@ from PyQt6.QtWidgets import (
 )
 
 from ..models import ContactRequest, Peer
+from ..qrshare import ContactInvite, GroupInvite
 from ..view_model import MAX_NAME_LENGTH, ChatViewModel
+from .qr_dialogs import (
+    ContactQrDialog,
+    confirm_contact_invite,
+    open_import_dialog,
+    parse_scanned,
+)
 from .theme import ERROR, PRIMARY, TEXT_SUBTLE
 from .widgets import AvatarLabel, Toast, format_message_time
 
@@ -264,7 +271,7 @@ class MemberListPage(QWidget):
         if box.clickedButton() is remove_btn:
             self.vm.remove_direct_contact(contact.id)
 
-    def _show_add_dialog(self):
+    def _build_add_dialog(self) -> QDialog:
         dialog = QDialog(self.window())
         dialog.setObjectName("confirmDialog")
         dialog.setWindowTitle("添加成员")
@@ -284,7 +291,22 @@ class MemberListPage(QWidget):
         name_edit.setMaxLength(MAX_NAME_LENGTH)
         name_edit.setMinimumHeight(38)
         layout.addWidget(name_edit)
-        layout.addSpacing(8)
+        layout.addSpacing(4)
+        qr_row = QHBoxLayout()
+        qr_hint = QLabel("也可以通过二维码添加 / 出示自己")
+        qr_hint.setObjectName("faint")
+        qr_hint.setWordWrap(True)
+        qr_row.addWidget(qr_hint, 1)
+        qr_scan_btn = QPushButton("扫二维码")
+        qr_scan_btn.setObjectName("outline")
+        qr_scan_btn.setToolTip("扫描或导入对方的联系人二维码")
+        qr_row.addWidget(qr_scan_btn)
+        qr_show_btn = QPushButton("我的二维码")
+        qr_show_btn.setObjectName("ghost")
+        qr_show_btn.setToolTip("出示本机联系人二维码（含安全码）")
+        qr_row.addWidget(qr_show_btn)
+        layout.addLayout(qr_row)
+        layout.addSpacing(4)
         buttons = QHBoxLayout()
         buttons.addStretch()
         cancel_btn = QPushButton("取消")
@@ -301,5 +323,28 @@ class MemberListPage(QWidget):
                 return
             dialog.accept()
 
+        def on_scan_qr():
+            text = open_import_dialog(dialog, "扫二维码添加成员")
+            if not text:
+                return
+            invite = parse_scanned(dialog, self.vm, text)
+            if invite is None:
+                return
+            if isinstance(invite, ContactInvite):
+                if confirm_contact_invite(dialog, self.vm, invite):
+                    dialog.accept()
+            elif isinstance(invite, GroupInvite):
+                Toast(self.window()).show_message(
+                    "这是群邀请二维码，请在“加入群组”页使用"
+                )
+
+        def on_show_qr():
+            ContactQrDialog(self.vm, dialog).exec()
+
         ok_btn.clicked.connect(on_accept)
-        dialog.exec()
+        qr_scan_btn.clicked.connect(on_scan_qr)
+        qr_show_btn.clicked.connect(on_show_qr)
+        return dialog
+
+    def _show_add_dialog(self):
+        self._build_add_dialog().exec()

@@ -1,4 +1,5 @@
 PyQt6>=6.6
+# opencv-python 兼作「扫二维码」的图片识别（QRCodeDetector）。
 opencv-python>=4.8
 numpy>=1.24
 # 端到端加密：所有网络传输（群组、直聊、mesh、文件、通话媒体）通过
@@ -13,3 +14,6 @@ imageio-ffmpeg>=0.4.9
 # 音频采集/播放：优先使用 sounddevice（PortAudio），QtMultimedia 作为未安装
 # sounddevice 时的兜底（部分机器 QtMultimedia 无可用后端，播放会"假成功"）。
 sounddevice>=0.4.6
+# 二维码生成（可选）：「我的二维码 / 群邀请二维码」用它渲染二维码图片；
+# 未安装时界面降级为展示二维码文本 + 复制按钮，功能不受影响。
+qrcode>=7.4

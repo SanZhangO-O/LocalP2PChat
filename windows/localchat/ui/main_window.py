@@ -6,6 +6,7 @@ from ..view_model import ChatViewModel
 from .call_window import CallWindow, IncomingCallDialog
 from .chat_page import ChatPage
 from .direct_chat_page import DirectChatPage
+from .group_call_window import GroupCallInviteDialog, GroupCallWindow
 from .group_list_page import GroupListPage
 from .group_lobby_page import GroupLobbyPage
 from .member_list_page import MemberListPage
@@ -91,9 +92,12 @@ class MainWindow(QMainWindow):
         self._last_notify_gid = None
         self._incoming_dialog = None
         self._call_window = None
+        self._group_call_dialog = None
+        self._group_call_window = None
 
         self._setup_tray()
         self._setup_call_ui()
+        self._setup_group_call_ui()
         # member-first: the home page is the member list
         self._go_members()
 
@@ -138,6 +142,45 @@ class MainWindow(QMainWindow):
                 self._incoming_dialog.close()
             if self._call_window is not None:
                 self._call_window.close()
+
+    def _setup_group_call_ui(self):
+        gm = self.vm.group_call
+        gm.incoming_invite.connect(self._on_group_call_invite)
+        gm.state_changed.connect(self._on_group_call_state)
+        gm.call_ended.connect(
+            lambda reason: self.toast.show_message(f"语音会议结束：{reason}")
+        )
+        gm.call_error.connect(self.toast.show_message)
+
+    def _on_group_call_invite(self, meeting_id: str, host_name: str):
+        if self._group_call_dialog is not None:
+            return
+        dialog = GroupCallInviteDialog(
+            host_name,
+            on_accept=self.vm.accept_group_call,
+            on_reject=self.vm.decline_group_call,
+            parent=self,
+        )
+        self._group_call_dialog = dialog
+        dialog.finished.connect(lambda _: setattr(self, "_group_call_dialog", None))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_group_call_state(self, state: str, title: str, detail: str):
+        if state in ("outgoing", "active"):
+            if self._group_call_window is None:
+                win = GroupCallWindow(self.vm.group_call, self)
+                self._group_call_window = win
+                win.finished.connect(
+                    lambda _: setattr(self, "_group_call_window", None)
+                )
+                win.show()
+        elif state == "idle":
+            if self._group_call_dialog is not None:
+                self._group_call_dialog.close()
+            if self._group_call_window is not None:
+                self._group_call_window.close()
 
     def _setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():

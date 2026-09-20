@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 from .. import network as network_module
 from ..models import MEDIA_AUDIO, Peer
 from ..view_model import MAX_NAME_LENGTH, ChatViewModel
+from .qr_dialogs import GroupInviteQrDialog
 from .theme import ERROR, PRIMARY, TEXT_SUBTLE
 from .widgets import AvatarLabel, Toast
 
@@ -53,6 +54,16 @@ class GroupSettingsDialog(QDialog):
         self.announcement_edit.setFixedHeight(110)
         layout.addWidget(self.announcement_edit)
 
+        invite_row = QHBoxLayout()
+        invite_hint = QLabel("邀请其他人加入本群（不含群密码）")
+        invite_hint.setObjectName("faint")
+        invite_row.addWidget(invite_hint, 1)
+        invite_btn = QPushButton("群邀请二维码")
+        invite_btn.setObjectName("outline")
+        invite_btn.clicked.connect(self._show_invite_qr)
+        invite_row.addWidget(invite_btn)
+        layout.addLayout(invite_row)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
@@ -63,6 +74,12 @@ class GroupSettingsDialog(QDialog):
         save_btn.clicked.connect(self._on_save)
         cancel_btn.clicked.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _show_invite_qr(self):
+        group_id = self.vm.active_group_numeric_id()
+        if not group_id:
+            return
+        GroupInviteQrDialog(self.vm, group_id, self.vm.active_group_name, self.window()).exec()
 
     def _on_save(self):
         name = self.name_edit.text().strip()
@@ -84,6 +101,8 @@ class PeerRow(QFrame):
         on_call=None,
         on_kick=None,
         on_voice_call=None,
+        verified: bool = False,
+        on_fingerprint=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -106,6 +125,17 @@ class PeerRow(QFrame):
             me = QLabel("我")
             me.setStyleSheet(f"font-size: 11px; color: {PRIMARY}; font-weight: 600;")
             name_row.addWidget(me)
+        elif verified:
+            # TOFU badge: this member's device identity is signature-bound in
+            # this group (groupauth); the 安全码 dialog allows an out-of-band
+            # comparison against the member's own settings screen
+            badge = QLabel("已验证")
+            badge.setStyleSheet(
+                "font-size: 11px; color: #1B5E20; background: #C8E6C9;"
+                "border-radius: 6px; padding: 1px 6px; font-weight: 600;"
+            )
+            badge.setToolTip("该成员已通过设备签名身份验证")
+            name_row.addWidget(badge)
         name_row.addStretch()
         info.addLayout(name_row)
         ip_label = QLabel(peer.ip_address)
@@ -128,6 +158,14 @@ class PeerRow(QFrame):
             voice_btn.setFixedSize(64, 40)
             voice_btn.clicked.connect(lambda checked=False, pid=peer.id: on_voice_call(pid))
             layout.addWidget(voice_btn)
+
+        if not is_self and on_fingerprint is not None:
+            fp_btn = QPushButton("安全码")
+            fp_btn.setObjectName("ghost")
+            fp_btn.setToolTip("查看该成员的设备身份安全码")
+            fp_btn.setFixedSize(64, 40)
+            fp_btn.clicked.connect(lambda checked=False, pid=peer.id: on_fingerprint(pid))
+            layout.addWidget(fp_btn)
 
         if not is_self and on_kick is not None:
             kick_btn = QPushButton("移出")
@@ -171,6 +209,11 @@ class GroupLobbyPage(QWidget):
         self.chat_btn = QPushButton("进入聊天")
         self.chat_btn.clicked.connect(self.on_open_chat)
         header_layout.addWidget(self.chat_btn)
+        self.conference_btn = QPushButton("语音会议")
+        self.conference_btn.setObjectName("ghost")
+        self.conference_btn.setToolTip("发起多人语音会议（仅音频）")
+        self.conference_btn.clicked.connect(self._start_group_call)
+        header_layout.addWidget(self.conference_btn)
         self.settings_btn = QPushButton("群设置")
         self.settings_btn.setObjectName("ghost")
         self.settings_btn.setToolTip("修改群名称与群公告")
@@ -229,6 +272,14 @@ class GroupLobbyPage(QWidget):
         group_id_copy_btn.setStyleSheet("font-size: 12px;")
         group_id_copy_btn.clicked.connect(self._copy_group_id)
         self.group_id_row.addWidget(group_id_copy_btn)
+        invite_qr_btn = QPushButton("群邀请二维码")
+        invite_qr_btn.setObjectName("ghost")
+        invite_qr_btn.setStyleSheet("font-size: 12px;")
+        invite_qr_btn.setToolTip(
+            "出示群邀请二维码：扫码自动填入数字ID与地址（不含群密码，密码仍需手动输入）"
+        )
+        invite_qr_btn.clicked.connect(self._show_invite_qr)
+        self.group_id_row.addWidget(invite_qr_btn)
         host_layout.addWidget(self.group_id_row_widget)
         self.password_row_widget = QWidget()
         self.password_row = QHBoxLayout(self.password_row_widget)
@@ -334,6 +385,12 @@ class GroupLobbyPage(QWidget):
         QApplication.clipboard().setText(group_id)
         Toast(self.window()).show_message("已复制数字ID")
 
+    def _show_invite_qr(self):
+        group_id = self.vm.active_group_numeric_id()
+        if not group_id:
+            return
+        GroupInviteQrDialog(self.vm, group_id, self.vm.active_group_name, self.window()).exec()
+
     def _confirm_leave(self):
         box = QMessageBox(self.window())
         box.setWindowTitle("退出群组")
@@ -367,6 +424,39 @@ class GroupLobbyPage(QWidget):
         if box.clickedButton() is kick_btn:
             self.vm.kick_active_member(peer_id)
 
+    def _show_member_fingerprint(self, peer_id: str):
+        """Security-code dialog for one group member: shows the TOFU-bound
+        device identity fingerprint (安全码) to compare out-of-band against
+        the member's own settings screen."""
+        gid = self.vm.active_group_id
+        if not gid:
+            return
+        peers = self.vm.active_peers()
+        peer = peers.get(peer_id)
+        name = peer.name if peer is not None else peer_id
+        fingerprint = self.vm.group_member_fingerprint(gid, peer_id)
+        if fingerprint:
+            box = QMessageBox(self.window())
+            box.setWindowTitle("成员安全码")
+            box.setText(
+                f"{name} 的设备安全码：\n\n{fingerprint}\n\n"
+                "与对方设置页「本机安全码」当面比对一致，即可完全排除中间人。"
+            )
+            copy_btn = box.addButton("复制", QMessageBox.ButtonRole.ActionRole)
+            box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is copy_btn:
+                QApplication.clipboard().setText(fingerprint)
+                Toast(self.window()).show_message("已复制安全码")
+        else:
+            box = QMessageBox(self.window())
+            box.setWindowTitle("成员安全码")
+            box.setText(
+                f"{name} 尚未在本群绑定设备身份（未收到过其签名消息）。\n"
+                "对方发送消息后，这里会显示其设备安全码。"
+            )
+            box.exec()
+
     def refresh(self):
         gid = self.vm.active_group_id
         is_host = self.vm.active_is_host
@@ -383,6 +473,7 @@ class GroupLobbyPage(QWidget):
         self.host_address_label.setText(f"{ip}:{self.vm.local_port}" if ip else "未连接到网络")
         self.host_card.setVisible(is_host and gid is not None)
         self.settings_btn.setVisible(bool(is_host) and gid is not None)
+        self.conference_btn.setVisible(gid is not None)
         announcement = self.vm.active_group_announcement() if gid else ""
         self.announce_label.setText(announcement)
         self.announce_card.setVisible(bool(announcement) and gid is not None)
@@ -445,6 +536,7 @@ class GroupLobbyPage(QWidget):
                 self.empty_label.setText("已连接到群组")
 
     def _add_peer_row(self, peer: Peer, is_self: bool):
+        gid = self.vm.active_group_id
         item = QListWidgetItem()
         row = PeerRow(
             peer,
@@ -457,6 +549,12 @@ class GroupLobbyPage(QWidget):
                 else None
             ),
             on_voice_call=self._start_voice_call if not is_self else None,
+            verified=(
+                not is_self
+                and bool(gid)
+                and self.vm.group_member_verified(gid, peer.id)
+            ),
+            on_fingerprint=self._show_member_fingerprint if not is_self else None,
         )
         item.setSizeHint(row.sizeHint())
         self.peer_list.addItem(item)
@@ -467,3 +565,6 @@ class GroupLobbyPage(QWidget):
 
     def _start_voice_call(self, peer_id: str):
         self.vm.start_call(peer_id, media=MEDIA_AUDIO)
+
+    def _start_group_call(self):
+        self.vm.start_group_call()

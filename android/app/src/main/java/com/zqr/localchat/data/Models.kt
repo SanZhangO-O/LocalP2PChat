@@ -317,6 +317,14 @@ data class ChatMessage(
     /** True when the author replaced this message's content via edit_message
      *  (carried on the wire only when true). */
     val edited: Boolean = false,
+    /** Group sender identity binding (TOFU, see network.GroupAuth): the
+     *  author's long-term identity public key (Base64 SPKI, same key as the
+     *  direct-mode handshake) plus the ECDSA signature over the group signing
+     *  transcript. Optional, omitted from the wire when unset so a plain
+     *  message stays byte-identical (Windows parity). Direct chats never set
+     *  them. */
+    val senderPubId: String? = null,
+    val senderSig: String? = null,
     @Transient val isFromMe: Boolean = false,
     /** Local-only delivery state (like [isFromMe], never sent over the
      *  wire): true while an offline-sent message still waits in the direct
@@ -367,11 +375,15 @@ fun ChatMessage.withSanitizedExtras(): ChatMessage = copy(
 /**
  * Metadata for a video/audio call.
  * Serialized with kotlinx defaults: fields equal to their default value
- * (mediaPort=0, accepted=true, audioEnabled=true, media=null) are omitted,
- * matching the Python side's output.
+ * (mediaPort=0, accepted=true, audioEnabled=true, media=null, meetingId=null)
+ * are omitted, matching the Python side's output.
  *
  * [media] is "audio" or "video"; null means video (omitted on the wire so a
  * plain video offer stays byte-identical to the pre-media-field format).
+ *
+ * [meetingId] binds group voice conference signaling (group_call_*) and the
+ * conference media hello to one meeting; null for 1:1 calls (omitted on the
+ * wire, so 1:1 call packets stay byte-identical).
  */
 @Serializable
 data class CallInfo(
@@ -382,7 +394,8 @@ data class CallInfo(
     val mediaPort: Int = 0,
     val accepted: Boolean = true,
     val audioEnabled: Boolean = true,
-    val media: String? = null
+    val media: String? = null,
+    val meetingId: String? = null
 )
 
 /** Call media kinds carried by CallInfo.media. */

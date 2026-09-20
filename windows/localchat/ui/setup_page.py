@@ -13,7 +13,14 @@ from PyQt6.QtWidgets import (
 )
 
 from ..models import GroupInfo
+from ..qrshare import ContactInvite, GroupInvite
 from ..view_model import MAX_NAME_LENGTH, ChatViewModel
+from .qr_dialogs import (
+    ContactQrDialog,
+    GroupInviteQrDialog,
+    open_import_dialog,
+    parse_scanned,
+)
 from .widgets import Toast
 
 MODE_SELECT = 0
@@ -274,6 +281,12 @@ class SetupPage(QWidget):
         self.create_address_label = QLabel("")
         self.create_address_label.setStyleSheet("font-size: 16px; font-weight: 600;")
         addr_row.addWidget(self.create_address_label, 1)
+        qr_show_btn = QPushButton("二维码")
+        qr_show_btn.setObjectName("ghost")
+        qr_show_btn.setStyleSheet("font-size: 12px;")
+        qr_show_btn.setToolTip("出示本机联系人二维码（含安全码），供对方扫码添加")
+        qr_show_btn.clicked.connect(self._show_contact_qr)
+        addr_row.addWidget(qr_show_btn)
         copy_btn = QPushButton("复制")
         copy_btn.setObjectName("ghost")
         copy_btn.setStyleSheet("font-size: 12px;")
@@ -316,6 +329,20 @@ class SetupPage(QWidget):
         ip_hint.setObjectName("faint")
         ip_hint.setWordWrap(True)
         page.layout().insertWidget(page.layout().indexOf(self.join_submit_btn), ip_hint)
+        qr_row = QHBoxLayout()
+        qr_row.setContentsMargins(0, 0, 0, 0)
+        qr_hint = QLabel("创建者出示了二维码？直接扫描即可填入下方信息")
+        qr_hint.setObjectName("faint")
+        qr_hint.setWordWrap(True)
+        qr_row.addWidget(qr_hint, 1)
+        qr_scan_btn = QPushButton("扫二维码")
+        qr_scan_btn.setObjectName("outline")
+        qr_scan_btn.setToolTip("扫描群邀请二维码，自动填入数字ID与地址（密码仍需手动输入）")
+        qr_row.addWidget(qr_scan_btn)
+        page.layout().insertWidget(
+            page.layout().indexOf(self.join_submit_btn), self._wrap_row(qr_row)
+        )
+        qr_scan_btn.clicked.connect(self._on_scan_group_qr)
         for edit in (
             self.join_name_edit,
             self.join_group_edit,
@@ -326,6 +353,39 @@ class SetupPage(QWidget):
             edit.textChanged.connect(self._on_join_input_changed)
         self._on_join_input_changed()
         return page
+
+    def _wrap_row(self, row_layout) -> QWidget:
+        holder = QWidget()
+        holder.setLayout(row_layout)
+        return holder
+
+    def _show_contact_qr(self):
+        ContactQrDialog(self.vm, self.window()).exec()
+
+    def _on_scan_group_qr(self):
+        text = open_import_dialog(self, "扫二维码加入群组")
+        if not text:
+            return
+        invite = parse_scanned(self, self.vm, text)
+        if invite is None:
+            return
+        if isinstance(invite, ContactInvite):
+            Toast(self.window()).show_message(
+                "这是联系人二维码，请在成员页“添加成员”中使用"
+            )
+            return
+        self.join_group_edit.setText(invite.group_id)
+        self.join_ip_edit.setText(
+            f"{invite.ip}:{invite.port}" if invite.ip else ""
+        )
+        self.join_server_edit.setText(invite.relay)
+        self._clear_error()
+        if not invite.ip and not invite.relay:
+            self._set_error(
+                "该邀请未包含加入地址：双方需填写同一个中继服务器后加入"
+            )
+        else:
+            Toast(self.window()).show_message("已填入邀请信息，请输入昵称与群组密码")
 
     def refresh(self):
         """Re-evaluate page state every time it is shown."""

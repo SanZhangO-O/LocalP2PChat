@@ -11,6 +11,7 @@ lifecycleViewmodelCompose = "2.7.0"
 kotlinxSerialization = "1.6.3"
 room = "2.7.0"
 cameraX = "1.4.2"
+zxingCore = "3.5.3"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -30,6 +31,7 @@ room-compiler = { group = "androidx.room", name = "room-compiler", version.ref =
 camera-core = { group = "androidx.camera", name = "camera-core", version.ref = "cameraX" }
 camera-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "cameraX" }
 camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "cameraX" }
+zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxingCore" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

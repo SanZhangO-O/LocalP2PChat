@@ -497,9 +497,17 @@ class PythonClientToAndroidHost(ProtocolTestBase):
         chat = json.loads(chat_raw)
         self.assertEqual(chat["type"], "chat")
         msg = chat["message"]
-        self.assertEqual(set(msg.keys()), {"id", "content", "timestamp", "senderId", "senderName"})
+        base_keys = {"id", "content", "timestamp", "senderId", "senderName"}
+        self.assertTrue(
+            base_keys.issubset(msg.keys()),
+            f"the plain message fields must all survive: {sorted(msg.keys())}",
+        )
         self.assertNotIn("isFromMe", msg)
         self.assertNotIn("pending", msg)
+        # group sender identity binding (TOFU, see groupauth.py) rides along as
+        # an optional field pair once this device has an identity key; it is
+        # omitted when unset and ignored by older peers. Nothing else may leak.
+        self.assertLessEqual(set(msg.keys()) - base_keys, {"senderPubId", "senderSig"})
         self.assertEqual(msg["senderName"], "\u738b\u4e94")  # 王五
 
 

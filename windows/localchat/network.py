@@ -19,21 +19,27 @@ from .crypto import (
     random_bytes,
     to_b64,
 )
+from . import groupauth
 from .hardware import get_hardware_id, get_local_ip_address
 from .models import (
     FILE_KIND_FILE,
     MAX_FOLDER_FILES,
+    MAX_GROUP_FILE_REMOVED,
+    MAX_GROUP_FILES,
     MAX_LINE_LENGTH,
     TCP_PORT,
     ChatMessage,
     ContactRequest,
     FileInfo,
+    ForwardedInfo,
+    GroupFileInfo,
     GroupInfo,
     NetworkPacket,
     Peer,
     detect_media_kind,
     is_valid_content,
     sanitize_emoji,
+    sanitize_file_name,
     sanitize_relative_path,
 )
 from .punch import (
@@ -58,6 +64,15 @@ logger = logging.getLogger(__name__)
 # host only to the addressed member instead of being broadcast.
 CALL_PACKET_TYPES = frozenset(
     {"call_offer", "call_answer", "call_reject", "call_hangup", "call_failed"}
+)
+
+# Group voice conference signaling (star topology: the meeting host mixes).
+# Routed by the host like call packets (actor must be the authenticated
+# sender; delivered only to the addressed member), but handed to the separate
+# group_call listener so the 1:1 call path is untouched. Old peers ignore
+# these unknown types (both read loops are if/elif chains without else).
+GROUP_CALL_PACKET_TYPES = frozenset(
+    {"group_call_invite", "group_call_join", "group_call_leave", "group_call_sync"}
 )
 
 # Hard cap on a single downloaded file. Protects storage from a broken or
@@ -89,26 +104,77 @@ FILE_DL_TOKEN_PREFIX = "lc-file-dl-v1:"
 MAX_DELETED_IDS = 200
 MAX_DELETED_ID_LEN = 128
 
+# Group file share area (群文件) wire bounds. The index cap lives in models
+# (MAX_GROUP_FILES); the push budget keeps ONE history_reply batch safely
+# under the line cap — 500 entries with names/keys would not fit a single
+# 64KB line, so pushes are split like history batches (Android parity:
+# GroupFiles.PUSH_BUDGET_BYTES). join_ack is a single packet and carries at
+# most the newest JOIN_ACK_GROUP_FILES_CAP entries; the rest converges over
+# the mesh history push.
+GROUP_FILE_PUSH_BUDGET_BYTES = 32 * 1024
+JOIN_ACK_GROUP_FILES_CAP = 120
+
+
+def sanitize_id_list(ids, cap: int, max_len: int = MAX_DELETED_ID_LEN) -> list:
+    """Dedupe, drop blanks/oversized ids and cap an id list received from the
+    wire (delete tombstones and group-file removal tombstones share the
+    shape). Android parity: sanitizeDeletedIds / GroupFiles.sanitizeRemovedIds."""
+    if isinstance(ids, str):
+        # a malformed wire value ("removedIds": "abc") must not iterate into
+        # single-character ids
+        ids = [ids]
+    out = []
+    seen = set()
+    for raw in ids or []:
+        mid = str(raw)
+        if not mid.strip() or len(mid) > max_len or mid in seen:
+            continue
+        seen.add(mid)
+        out.append(mid)
+        if len(out) >= cap:
+            break
+    return out
+
 
 def sanitize_deleted_ids(deleted_ids) -> list:
     """Dedupe, drop blanks/oversized ids and cap the tombstone list of ONE
     packet (join_ack / history_reply). Android parity:
     P2PManager.sanitizeDeletedIds."""
-    if isinstance(deleted_ids, str):
-        # a malformed wire value ("deletedIds": "abc") must not iterate into
-        # single-character ids
-        deleted_ids = [deleted_ids]
+    return sanitize_id_list(deleted_ids, MAX_DELETED_IDS)
+
+
+def sanitize_group_files(raw) -> list:
+    """Sanitize an inbound group-file index (join_ack / history_reply
+    groupFiles): valid entries only, deduped by fileId (first wins), capped
+    at MAX_GROUP_FILES. A malformed entry is skipped, never fatal — one
+    crafted entry must not break the whole convergence packet."""
+    if isinstance(raw, dict):
+        raw = [raw]
     out = []
     seen = set()
-    for raw in deleted_ids or []:
-        mid = str(raw)
-        if not mid.strip() or len(mid) > MAX_DELETED_ID_LEN or mid in seen:
+    for item in raw or []:
+        if not isinstance(item, dict):
             continue
-        seen.add(mid)
-        out.append(mid)
-        if len(out) >= MAX_DELETED_IDS:
+        try:
+            entry = GroupFileInfo.from_dict(item)
+        except Exception:
+            continue
+        if entry.file_id in seen:
+            continue
+        seen.add(entry.file_id)
+        out.append(entry)
+        if len(out) >= MAX_GROUP_FILES:
             break
     return out
+
+
+def can_remove_group_file(sender_id: str, entry_sender_id: str, creator_id: str) -> bool:
+    """Removal authorization for the group file share area: the uploader or
+    the group owner. Pure so both the relay host, the mesh path and the
+    storage layer's caller agree (Android parity: GroupFiles.canRemove)."""
+    if not sender_id:
+        return False
+    return sender_id == entry_sender_id or (bool(creator_id) and sender_id == creator_id)
 
 
 
@@ -241,8 +307,32 @@ def file_download_token(file_key: bytes, file_id: str) -> str:
 def _serve_file_download(
     sock: socket.socket, file_id: str, path: str, file_size: int, file_key: bytes
 ) -> None:
-    """Serve one file-download connection. Handshake (Android parity, see
-    FileTransfer.kt):
+    """Serve one file-download connection (random-port chat file servers).
+    Reads the plaintext handshake line, then delegates to
+    [_serve_file_download_parsed]."""
+    try:
+        sock.settimeout(30)
+        reader = sock.makefile("r", encoding="utf-8", newline="\n")
+        handshake = _read_line_bounded(reader)
+        if handshake is None:
+            return
+        try:
+            req = NetworkPacket.from_json(handshake)
+        except Exception:
+            # includes a request without the (now mandatory) offset field
+            return
+        _serve_file_download_parsed(sock, req, file_id, path, file_size, file_key)
+    except Exception:
+        pass
+    finally:
+        _graceful_close_send(sock)
+
+
+def _serve_file_download_parsed(
+    sock: socket.socket, req: NetworkPacket, file_id: str, path: str, file_size: int, file_key: bytes
+) -> None:
+    """Validate an already-parsed file_download request and stream the file.
+    Handshake (Android parity, see FileTransfer.kt):
 
         receiver -> "file_download" {fileId, token, offset}            (plaintext)
         sender   -> ENCRYPTED LINE: AES-GCM(fileKey, file_meta JSON)
@@ -262,18 +352,11 @@ def _serve_file_download(
     fileKey, msg="lc-file-dl-v1:" + fileId)) proves the downloader received
     the encrypted offer — a request without it (or with a wrong one) is
     closed without meta or bytes, verified in constant time.
-    """
+
+    Also used for the group file share area (群文件): the request line then
+    arrives on the shared listener, which looks the fileId up in its
+    shared-file registry before calling this."""
     try:
-        sock.settimeout(30)
-        reader = sock.makefile("r", encoding="utf-8", newline="\n")
-        handshake = _read_line_bounded(reader)
-        if handshake is None:
-            return
-        try:
-            req = NetworkPacket.from_json(handshake)
-        except Exception:
-            # includes a request without the (now mandatory) offset field
-            return
         if req.type != "file_download" or req.file_id != file_id:
             return
         if req.offset is None or req.offset < 0:
@@ -327,17 +410,21 @@ def _serve_file_download(
     except Exception:
         pass
     finally:
-        # Graceful close: flush the remaining send buffer before FIN. A
-        # full shutdown(SHUT_RDWR) on Windows can discard buffered tail
-        # bytes, which would corrupt the last chunk of a transfer.
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
-        try:
-            sock.close()
-        except OSError:
-            pass
+        _graceful_close_send(sock)
+
+
+def _graceful_close_send(sock: socket.socket) -> None:
+    # Graceful close: flush the remaining send buffer before FIN. A
+    # full shutdown(SHUT_RDWR) on Windows can discard buffered tail
+    # bytes, which would corrupt the last chunk of a transfer.
+    try:
+        sock.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
 
 
 def _download_file_offer(
@@ -630,6 +717,37 @@ class HostGroupServer:
         # the public signaling server and feeds punched/relayed member
         # connections into _handle (set by enable_signaling).
         self._signaling_bridge = None
+        # Group file share area (群文件): fileId -> {path, size, key} of files
+        # this device shares into its groups' share areas. A file_download
+        # request line arriving on the shared listener is served from here
+        # (token + per-file-key GCM, same contract as the chat file servers)
+        # without a group handshake: the listener port is stable across
+        # restarts, so an index entry's offer stays valid while the app runs.
+        self._shared_files: Dict[str, dict] = {}
+
+    # -------------------------------------------------- group shared files
+
+    def register_shared_file(self, file_id: str, path: str, size: int, file_key_b64: str) -> None:
+        """Start serving [file_id] from [path] on the shared listener port.
+        Registration is app-lifetime (not tied to a group connection), so a
+        member that is "in the group but reconnecting" keeps serving its
+        shared files. Re-registering the same id replaces the entry."""
+        with self._lock:
+            self._shared_files[file_id] = {
+                "path": path,
+                "size": int(size),
+                "key": file_key_b64,
+            }
+
+    def unregister_shared_file(self, file_id: str) -> None:
+        with self._lock:
+            self._shared_files.pop(file_id, None)
+
+    def _lookup_shared_file(self, file_id: Optional[str]) -> Optional[dict]:
+        if not file_id:
+            return None
+        with self._lock:
+            return self._shared_files.get(file_id)
 
     # ------------------------------------------------------------- lifecycle
 
@@ -900,6 +1018,33 @@ class HostGroupServer:
                     start = NetworkPacket.from_json(first_line)
                 except Exception:
                     return
+                if start.type == "file_download":
+                    # group file share area (群文件): a download request for a
+                    # shared file arrives on this listener without a group
+                    # handshake. The token inside the request proves the
+                    # downloader received the (encrypted) group_file_add, and
+                    # every chunk is GCM-verified with the per-file key — the
+                    # same security contract as the chat file servers, with
+                    # no PBKDF2 work to protect, so the handshake rate limit
+                    # bucket already spent on this connection covers it.
+                    shared = self._lookup_shared_file(start.file_id)
+                    if shared is None:
+                        self._safe_close(sock)
+                        return
+                    try:
+                        file_key = from_b64(shared["key"])
+                    except Exception:
+                        self._safe_close(sock)
+                        return
+                    _serve_file_download_parsed(
+                        sock,
+                        start,
+                        start.file_id,
+                        shared["path"],
+                        shared["size"],
+                        file_key,
+                    )
+                    return
                 if start.type != Protocol.HS_START:
                     return
                 wire = make_wire(sock, reader)
@@ -1082,6 +1227,35 @@ class P2PListener:
         message ids deleted in the group while this member was away."""
         pass
 
+    # --------------------------------------------- group file share callbacks
+
+    def group_file_add_received(self, p2p: "P2PManager", entry: GroupFileInfo) -> None:
+        """A member shared a file into the group share area (group_file_add;
+        the relay/mesh path has already validated the sender binding)."""
+        pass
+
+    def group_file_remove_received(
+        self, p2p: "P2PManager", file_id: str, sender_id: str
+    ) -> bool:
+        """A group_file_remove arrived. The implementation authorizes
+        (uploader or group owner), applies it and returns whether the removal
+        was valid — the relay host only rebroadcasts when this returns True
+        (LESSONS 2026-09-19 #3: a rejected packet must neither persist nor
+        propagate)."""
+        return False
+
+    def group_files_received(
+        self, p2p: "P2PManager", entries, removed_ids
+    ) -> None:
+        """join_ack carried share-area convergence data: [entries] is the
+        peer's current index, [removed_ids] the file ids removed while this
+        member was away."""
+        pass
+
+    def group_mesh_group_files(self, group_id: str, entries, removed_ids) -> None:
+        """history_reply carried share-area convergence data (mesh path)."""
+        pass
+
     def typing_changed(self, p2p: "P2PManager", sender_id: str, active: bool) -> None:
         """A member's typing indicator changed (host relay path). Called from
         the read-loop thread; [active] False means the member stopped (or sent
@@ -1212,10 +1386,20 @@ class P2PManager:
         # Optional call-signaling listener: callable(p2p, packet) invoked on
         # the network thread for call_* packets addressed to this node.
         self.call_listener = None
+        # Optional group voice conference listener: callable(p2p, packet)
+        # invoked on the network thread for group_call_* packets addressed to
+        # this node (kept separate so the 1:1 call path is untouched).
+        self.group_call_listener = None
         # Tombstone source for join_ack: callable(group_id) -> [msgId, ...]
         # naming messages deleted while members were away (the ViewModel
         # backs it with the deleted_messages table). None omits the field.
         self.deleted_ids_provider = None
+        # Group file share area (群文件) sources for the host's join_ack:
+        # callable(group_id) -> [GroupFileInfo, ...] (the share index, newest
+        # first) and callable(group_id) -> [fileId, ...] (removed-file
+        # tombstones). Backed by the ViewModel's store; None omits the field.
+        self.group_files_provider = None
+        self.removed_file_ids_provider = None
         # Listener hardening (parity with HostGroupServer): concurrent
         # handlers are capped and handshakes are rate-limited per source IP,
         # because every accepted connection runs a PBKDF2 handshake that a
@@ -1603,6 +1787,7 @@ class P2PManager:
                 if ids:
                     self.apply_deleted_ids(ids)
                     self.listener.deleted_ids_received(self, ids)
+            self._apply_join_group_files(response)
             host = response.host
             if host is not None and (
                 typed_endpoint is None
@@ -1693,6 +1878,7 @@ class P2PManager:
                     if ids:
                         self.apply_deleted_ids(ids)
                         self.listener.deleted_ids_received(self, ids)
+                self._apply_join_group_files(response)
                 self._start_heartbeat()
                 self._read_loop_from_host(self._host_socket, wire)
             except Exception:
@@ -1703,6 +1889,99 @@ class P2PManager:
                     self._host_wire = None
 
         self._spawn(run)
+
+    # -------------------------------------------------- group file share area
+
+    def _apply_join_group_files(self, response: NetworkPacket) -> None:
+        """join_ack share-area convergence (both join paths): the store
+        applies removal tombstones first and skips entries they cover, so a
+        member that was offline for BOTH a share and its removal converges
+        exactly. Never rebroadcast (Android parity)."""
+        removed = sanitize_id_list(response.removed_ids, MAX_GROUP_FILE_REMOVED)
+        entries = sanitize_group_files(response.group_files)
+        if not removed and not entries:
+            return
+        try:
+            self.listener.group_files_received(self, entries, removed)
+        except Exception:
+            pass
+
+    def send_group_packet(self, packet: NetworkPacket) -> None:
+        """Queue one group-scoped control packet (group_file_add/remove) onto
+        the serialized send worker: the host broadcasts it, a member sends it
+        over the host relay. The mesh mirror is the ViewModel's job (same
+        split as a chat send)."""
+        self._enqueue_send(packet)
+
+    @staticmethod
+    def _group_file_entry_from_packet(packet: NetworkPacket) -> Optional[GroupFileInfo]:
+        """Build a sanitized share-index entry from a group_file_add packet.
+        Returns None when required fields are missing — the packet is then
+        ignored entirely (all fields are optional on the wire so old peers
+        decode and ignore it; a packet without usable content is just
+        noise)."""
+        if not packet.file_id or not packet.name:
+            return None
+        if packet.size is None or packet.size < 0:
+            return None
+        if not packet.sender_id:
+            return None
+        file_info = packet.file_info
+        return GroupFileInfo(
+            file_id=packet.file_id[:MAX_FILE_ID_LEN],
+            name=sanitize_file_name(packet.name),
+            size=packet.size,
+            sender_id=packet.sender_id[:MAX_DELETED_ID_LEN],
+            sender_name=(packet.sender_name or "")[:64],
+            ts=packet.ts or 0,
+            download_host=file_info.download_host if file_info else "",
+            download_port=file_info.download_port if file_info else 0,
+            file_key=file_info.file_key if file_info else "",
+        )
+
+    def _handle_group_file_add_from_client(self, packet: NetworkPacket, sender_id: str) -> None:
+        """A member shared a file into the share area: bind the claimed
+        senderId to the authenticated connection, apply locally (persist via
+        the listener) and relay to the other members. Sharing is open to any
+        group member."""
+        if packet.sender_id != sender_id or packet.group_id != self.group_id:
+            logger.warning(
+                "reject group_file_add from %s: packet senderId=%r groupId=%r",
+                sender_id, packet.sender_id, packet.group_id,
+            )
+            return
+        entry = self._group_file_entry_from_packet(packet)
+        if entry is None or entry.sender_id != sender_id:
+            logger.warning("reject group_file_add from %s: unusable entry", sender_id)
+            return
+        self.listener.group_file_add_received(self, entry)
+        self._broadcast_to_clients(packet, exclude=sender_id)
+
+    def _handle_group_file_remove_from_client(self, packet: NetworkPacket, sender_id: str) -> None:
+        """A member removed a shared file. Authorization (uploader or group
+        owner) lives in the listener implementation and gates BOTH the
+        persistence and the rebroadcast: a rejected remove must neither
+        propagate nor mint a tombstone (LESSONS 2026-09-19 #3)."""
+        if (
+            not packet.file_id
+            or packet.sender_id != sender_id
+            or packet.group_id != self.group_id
+        ):
+            logger.warning(
+                "reject group_file_remove from %s: packet senderId=%r groupId=%r",
+                sender_id, packet.sender_id, packet.group_id,
+            )
+            return
+        applied = bool(
+            self.listener.group_file_remove_received(self, packet.file_id, sender_id)
+        )
+        if not applied:
+            logger.warning(
+                "group_file_remove %s from %s not authorized; not relayed",
+                packet.file_id, sender_id,
+            )
+            return
+        self._broadcast_to_clients(packet, exclude=sender_id)
 
     # -------------------------------------------------------- host handlers
 
@@ -1794,6 +2073,30 @@ class P2PManager:
                 # tombstone convergence: ids deleted while this member was
                 # away, so it drops/resists them instead of resurrecting
                 ack.deleted_ids = deleted_ids
+            group_files = None
+            if self.group_files_provider is not None:
+                try:
+                    group_files = sanitize_group_files(
+                        self.group_files_provider(self.group_id)
+                    )
+                except Exception:
+                    group_files = []
+            if group_files:
+                # share-area convergence: the join_ack is a single packet, so
+                # only the newest slice rides it — the rest converges over the
+                # mesh history push (both sides push on link establishment)
+                ack.group_files = group_files[:JOIN_ACK_GROUP_FILES_CAP]
+            removed_file_ids = None
+            if self.removed_file_ids_provider is not None:
+                try:
+                    removed_file_ids = sanitize_id_list(
+                        self.removed_file_ids_provider(self.group_id),
+                        MAX_GROUP_FILE_REMOVED,
+                    )
+                except Exception:
+                    removed_file_ids = []
+            if removed_file_ids:
+                ack.removed_ids = removed_file_ids
             wire.send_packet(ack)
         except Exception:
             # the member is gone before the ack: undo the registration above,
@@ -1888,6 +2191,12 @@ class P2PManager:
 
     def _process_packet_as_client(self, packet: NetworkPacket) -> None:
         if packet.type in ("chat", "file_message") and packet.message is not None:
+            msg = packet.message
+            # author identity gate (TOFU): a bound sender must sign, a valid
+            # signature must match the remembered key — BEFORE the message
+            # reaches the list / the listener (LESSONS 2026-09-19 #3)
+            if not groupauth.verify_message(self.current_group_id, msg):
+                return
             with self._lock:
                 # idempotent insert: a member's message reaches us over the
                 # host relay AND over the mesh (whoever arrives first wins),
@@ -1932,6 +2241,14 @@ class P2PManager:
                     target.sender_id,
                 )
                 return
+            if not groupauth.verify_delete(
+                self.current_group_id,
+                packet.sender_id or "",
+                packet.message_id,
+                packet.sender_pub_id,
+                packet.sender_sig,
+            ):
+                return
             with self._lock:
                 self.messages = [m for m in self.messages if m.id != packet.message_id]
             self.listener.messages_changed(self)
@@ -1946,6 +2263,10 @@ class P2PManager:
             self._apply_relayed_reaction(packet)
         elif packet.type == "pin_message" and packet.message_id:
             self._apply_relayed_pin(packet)
+        elif packet.type == "group_file_add":
+            self._apply_relayed_group_file_add(packet)
+        elif packet.type == "group_file_remove":
+            self._apply_relayed_group_file_remove(packet)
         elif (
             packet.type == "read_receipt"
             and packet.up_to_id
@@ -1981,13 +2302,28 @@ class P2PManager:
                 if call.caller_id != self.my_id and call.callee_id != self.my_id:
                     return
             self._dispatch_call(packet)
+        elif packet.type in GROUP_CALL_PACKET_TYPES:
+            # Group voice conference signaling relayed by the host: only
+            # packets explicitly addressed to this node whose declared
+            # parties include this node reach the listener (semantic
+            # checks — group id / meeting id / host identity — belong to
+            # the GroupCallManager).
+            call = packet.call
+            if call is None:
+                return
+            if packet.target_id != self.my_id:
+                return
+            if call.callee_id != self.my_id and call.caller_id != self.my_id:
+                return
+            self._dispatch_group_call(packet)
         # "pong": traffic only; keeps the read loop alive
 
     # ------------------------------------------------- message-experience apply
 
     def _apply_relayed_edit(self, packet: NetworkPacket) -> None:
         """A relayed edit_message: the host already checked the sender's
-        identity; only the message's original author may change its content."""
+        identity; only the message's original author may change its content,
+        and the author's device signature must verify (TOFU)."""
         target = None
         with self._lock:
             target = next(
@@ -2000,6 +2336,15 @@ class P2PManager:
                 packet.sender_id,
                 target.sender_id if target is not None else None,
             )
+            return
+        if not groupauth.verify_edit(
+            self.current_group_id,
+            packet.sender_id,
+            packet.message_id,
+            packet.new_content,
+            packet.sender_pub_id,
+            packet.sender_sig,
+        ):
             return
         with self._lock:
             target.content = packet.new_content
@@ -2036,6 +2381,37 @@ class P2PManager:
             self, packet.message_id, packet.sender_id, bool(packet.active)
         )
 
+    # --------------------------------------------- relayed share-area packets
+
+    def _apply_relayed_group_file_add(self, packet: NetworkPacket) -> None:
+        """A relayed group_file_add: the host bound the sender's identity
+        before forwarding; the entry must still name that sender and carry
+        usable fields before it reaches the index."""
+        if packet.group_id != self.group_id or not packet.sender_id:
+            return
+        entry = self._group_file_entry_from_packet(packet)
+        if entry is None or entry.sender_id != packet.sender_id:
+            logger.warning(
+                "reject relayed group_file_add: senderId=%r unusable entry",
+                packet.sender_id,
+            )
+            return
+        self.listener.group_file_add_received(self, entry)
+
+    def _apply_relayed_group_file_remove(self, packet: NetworkPacket) -> None:
+        """A relayed group_file_remove: authorization (uploader or group
+        owner) is re-checked by the listener implementation before anything
+        is applied — the host's check never lifts the receiver's own."""
+        if (
+            packet.group_id != self.group_id
+            or not packet.file_id
+            or not packet.sender_id
+        ):
+            return
+        self.listener.group_file_remove_received(
+            self, packet.file_id, packet.sender_id
+        )
+
     def _process_packet_from_client(self, packet: NetworkPacket, sender_id: str) -> None:
         if packet.type in ("group_update", "kick_member"):
             # only the group owner (creator) may send management packets; the
@@ -2048,6 +2424,14 @@ class P2PManager:
             )
             self._drop_client(sender_id)
             return
+        if packet.type == "group_file_add":
+            # share area: any member may share (sender identity is the
+            # authenticated connection; removal is the authorized one)
+            self._handle_group_file_add_from_client(packet, sender_id)
+            return
+        if packet.type == "group_file_remove":
+            self._handle_group_file_remove_from_client(packet, sender_id)
+            return
         if packet.type in ("chat", "file_message") and packet.message is not None:
             msg = packet.message
             if msg.sender_id != sender_id or not is_valid_content(msg.content):
@@ -2058,6 +2442,9 @@ class P2PManager:
                     msg.sender_id,
                     len(msg.content),
                 )
+                return
+            # author identity gate before the message is stored or relayed
+            if not groupauth.verify_message(self.current_group_id, msg):
                 return
             with self._lock:
                 # idempotent insert (same message id can never arrive twice on
@@ -2078,6 +2465,14 @@ class P2PManager:
                 and packet.sender_id == sender_id
                 and target.sender_id == sender_id
             ):
+                if not groupauth.verify_delete(
+                    self.current_group_id,
+                    sender_id,
+                    packet.message_id,
+                    packet.sender_pub_id,
+                    packet.sender_sig,
+                ):
+                    return
                 with self._lock:
                     self.messages = [m for m in self.messages if m.id != packet.message_id]
                 self.listener.messages_changed(self)
@@ -2119,6 +2514,15 @@ class P2PManager:
                 and packet.sender_id == sender_id
                 and target.sender_id == sender_id
             ):
+                if not groupauth.verify_edit(
+                    self.current_group_id,
+                    sender_id,
+                    packet.message_id,
+                    packet.new_content,
+                    packet.sender_pub_id,
+                    packet.sender_sig,
+                ):
+                    return
                 with self._lock:
                     target.content = packet.new_content
                     target.edited = True
@@ -2176,6 +2580,8 @@ class P2PManager:
                     pass
         elif packet.type in CALL_PACKET_TYPES:
             self._route_call_packet(packet, sender_id)
+        elif packet.type in GROUP_CALL_PACKET_TYPES:
+            self._route_group_call_packet(packet, sender_id)
         # "pong": traffic only; keeps the read loop alive
 
     def _route_call_packet(self, packet: NetworkPacket, sender_id: str) -> None:
@@ -2240,6 +2646,46 @@ class P2PManager:
         except Exception:
             logger.exception("call listener failed")
 
+    def _route_group_call_packet(self, packet: NetworkPacket, sender_id: str) -> None:
+        """Host-side routing for group voice conference signaling: the packet
+        actor (call.callerId — invite sender / joiner / leaver / meeting
+        host) must be the authenticated sender connection; deliver locally
+        when this host is the addressee, otherwise forward to the targeted
+        member's socket (never broadcast)."""
+        call = packet.call
+        if call is None:
+            return
+        if call.caller_id != sender_id:
+            logger.warning(
+                "drop group call %s from %s: callerId mismatch",
+                packet.type, sender_id,
+            )
+            return
+        target_id = packet.target_id
+        if target_id is None:
+            # invite/sync address the invited member, join/leave address the
+            # meeting host — both are call.calleeId
+            target_id = call.callee_id
+        if target_id == self.my_id:
+            self._dispatch_group_call(packet)
+            return
+        with self._lock:
+            conn = self._connected_clients.get(target_id)
+        if conn is not None:
+            try:
+                conn["wire"].send_packet(packet)
+            except Exception:
+                pass
+
+    def _dispatch_group_call(self, packet: NetworkPacket) -> None:
+        listener = self.group_call_listener
+        if listener is None:
+            return
+        try:
+            listener(self, packet)
+        except Exception:
+            logger.exception("group call listener failed")
+
     def _set_join_result(self, success: bool, message: str) -> None:
         self.connection_result = (success, message)
         self.listener.join_state_changed(self)
@@ -2253,11 +2699,16 @@ class P2PManager:
         reply_preview: Optional[str] = None,
         reply_sender: Optional[str] = None,
         mentions: Optional[List[str]] = None,
+        quote_sender: Optional[str] = None,
+        quote_kind: Optional[str] = None,
+        forwarded: Optional[ForwardedInfo] = None,
     ) -> Optional[ChatMessage]:
         """Send a chat message through the host relay; returns the created
         message (or None for invalid content) so the caller can also broadcast
         it over the group mesh. The optional reply_* triple attaches a quoted
-        header (see ChatMessage); a forward passes none of them. [mentions]
+        header (see ChatMessage); quote_sender/quote_kind fill the nested
+        quote object's original-sender id and content kind. A forward passes
+        [forwarded] (display-only provenance) and no reply fields. [mentions]
         carries the @-mentioned peer ids ("all" = everyone)."""
         if not is_valid_content(content):
             return None
@@ -2271,8 +2722,14 @@ class P2PManager:
             reply_to=reply_to,
             reply_preview=reply_preview,
             reply_sender=reply_sender,
+            quote_sender=quote_sender,
+            quote_kind=quote_kind,
+            forwarded=forwarded,
             mentions=mentions or None,
         )
+        # author identity signature (TOFU binding, groupauth.py): no-op when
+        # this device has no identity key yet (legacy behavior)
+        groupauth.sign_message(self.current_group_id, message)
         with self._lock:
             self.messages.append(message)
         self.listener.messages_changed(self)
@@ -2319,6 +2776,10 @@ class P2PManager:
         packet = NetworkPacket(
             type="delete_message", message_id=message_id, sender_id=target.sender_id
         )
+        groupauth.sign_packet(
+            packet,
+            groupauth.delete_parts(self.current_group_id, target.sender_id, message_id),
+        )
         self._enqueue_send(packet)
         return True
 
@@ -2334,21 +2795,32 @@ class P2PManager:
                 return False
             target.content = new_content
             target.edited = True
+            # re-sign the local copy so mesh history pushes (which serialize
+            # this object) stay content-signature consistent after the edit
+            groupauth.sign_message(self.current_group_id, target)
         self.listener.messages_changed(self)
-        self._enqueue_send(
-            NetworkPacket(
-                type="edit_message",
-                group_id=self.current_group_id,
-                message_id=message_id,
-                sender_id=self.my_id,
-                new_content=new_content,
-            )
+        packet = NetworkPacket(
+            type="edit_message",
+            group_id=self.current_group_id,
+            message_id=message_id,
+            sender_id=self.my_id,
+            new_content=new_content,
         )
+        groupauth.sign_packet(
+            packet,
+            groupauth.edit_parts(self.current_group_id, self.my_id, message_id, new_content),
+        )
+        self._enqueue_send(packet)
         return True
 
-    def send_reaction(self, message_id: str, emoji: str, active: bool) -> bool:
+    def send_reaction(
+        self, message_id: str, emoji: str, active: bool, on_failed=None
+    ) -> bool:
         """Toggle an emoji reaction of ours on [message_id]. Advisory: never
-        queued offline (a member with no live path simply misses it)."""
+        queued offline by the relay itself (a member with no live path simply
+        misses it) — the ViewModel stages the op and replays it when the group
+        becomes reachable again. [on_failed] fires on the sender worker when
+        the packet could not be handed to the host relay."""
         emoji = sanitize_emoji(emoji)
         if not emoji:
             return False
@@ -2364,14 +2836,17 @@ class P2PManager:
                 sender_id=self.my_id,
                 emoji=emoji,
                 active=bool(active),
-            )
+            ),
+            on_failed=on_failed,
         )
         return True
 
-    def send_pin(self, message_id: str, active: bool) -> bool:
+    def send_pin(self, message_id: str, active: bool, on_failed=None) -> bool:
         """Pin/unpin a message in the group. Any member may pin (the group's
         trust model is its password), the claimed sender is validated by every
-        receiver against its authenticated identity."""
+        receiver against its authenticated identity. Same staging contract as
+        send_reaction: [on_failed] lets the ViewModel park the op when the
+        relay is unreachable."""
         with self._lock:
             known = any(m.id == message_id for m in self.messages)
         if not known:
@@ -2383,7 +2858,8 @@ class P2PManager:
                 message_id=message_id,
                 sender_id=self.my_id,
                 active=bool(active),
-            )
+            ),
+            on_failed=on_failed,
         )
         return True
 
@@ -2469,6 +2945,11 @@ class P2PManager:
                 self._send_worker.start()
             self._send_queue.put((packet, on_failed))
 
+    def enqueue_packet(self, packet: NetworkPacket, on_failed=None) -> None:
+        """Public enqueue for packets the ViewModel builds itself (the staged
+        offline op replay). Same delivery semantics as _enqueue_send."""
+        self._enqueue_send(packet, on_failed=on_failed)
+
     def send_targeted(self, peer_id: str, packet: NetworkPacket) -> None:
         """Send a packet addressed to a specific member (call signaling).
 
@@ -2510,6 +2991,10 @@ class P2PManager:
             group_name=new_name or None,
             announcement=announcement,
         )
+        groupauth.sign_packet(
+            packet,
+            groupauth.group_update_parts(self.group_id, self.my_id, new_name, announcement or ""),
+        )
         if self.is_host:
             # socket writes go to a worker thread: a slow member must not
             # block the GUI thread that runs this owner action
@@ -2537,6 +3022,10 @@ class P2PManager:
             group_id=self.group_id,
             sender_id=self.my_id,
             target_id=target_id,
+        )
+        groupauth.sign_packet(
+            packet,
+            groupauth.kick_parts(self.group_id, self.my_id, target_id),
         )
         try:
             # all socket writes go to a worker thread: a slow/stalled member
@@ -2623,6 +3112,18 @@ class P2PManager:
             )
             self._disconnect_from_host()
             return
+        # owner identity binding (TOFU): a signed owner packet must verify
+        # against the creatorId's remembered key; unsigned stays legacy
+        if not groupauth.verify_group_update(
+            self.current_group_id,
+            creator,
+            packet.group_name or "",
+            packet.announcement or "",
+            packet.sender_pub_id,
+            packet.sender_sig,
+        ):
+            self._disconnect_from_host()
+            return
         changed = False
         new_name = (packet.group_name or "").strip()
         if new_name and new_name != self.group_name:
@@ -2643,6 +3144,15 @@ class P2PManager:
                 packet.sender_id,
                 creator,
             )
+            self._disconnect_from_host()
+            return
+        if not groupauth.verify_kick(
+            self.current_group_id,
+            creator,
+            packet.target_id or "",
+            packet.sender_pub_id,
+            packet.sender_sig,
+        ):
             self._disconnect_from_host()
             return
         target = packet.target_id
@@ -2727,6 +3237,7 @@ class P2PManager:
         folder_name: str = "",
         relative_path: str = "",
         folder_total: int = 0,
+        forwarded: Optional[ForwardedInfo] = None,
     ) -> Optional[ChatMessage]:
         """Offer a local file to the group. Returns the created file message
         (or None if the file cannot be served) so the caller can also
@@ -2801,7 +3312,9 @@ class P2PManager:
             sender_name=self.my_name,
             is_from_me=True,
             file_info=file_info,
+            forwarded=forwarded,
         )
+        groupauth.sign_message(self.current_group_id, message)
         with self._lock:
             self.messages.append(message)
         self.listener.messages_changed(self)
@@ -3141,6 +3654,12 @@ class DirectChatManager:
         self._presence_started = False
         self._presence_lock = threading.Lock()
         self._presence_dialing: set = set()
+        # Scanned contact-QR expectations: (ip, port) -> 安全码 fingerprint the
+        # QR declared. The next completed handshake with that endpoint must
+        # present exactly this identity key (the QR is an out-of-band channel,
+        # so this pins TOFU *before* the first connection — a MITM between the
+        # scan and the first dial is rejected instead of silently remembered).
+        self._qr_expected_fps: Dict[tuple, str] = {}
         # Removed-contact marks: id / endpoint -> removal time. A peer that
         # keeps announcing must not resurrect a contact the local user
         # deleted; add_contact clears the marks (explicit re-add, group
@@ -3170,6 +3689,11 @@ class DirectChatManager:
         # Session-established callback (either direction): the ViewModel uses
         # this to start persistence for sessions the LOCAL user never opened.
         self.on_session_established = None
+        # Fired AFTER a freshly established session's outbox flush: callable
+        # (peer_id). The ViewModel replays the staged pending-op log here so
+        # edits/reactions/pins reach the peer strictly AFTER the messages they
+        # reference (receivers drop extras for unknown message ids).
+        self.on_ops_flush = None
         # A chat's state moved from an alias key (manually added "ip:..."
         # placeholder id) to the member's real device id, revealed by a
         # handshake: callable(from_id, to_id).
@@ -3698,6 +4222,17 @@ class DirectChatManager:
         with self._lock:
             self._chat_endpoints[contact.id] = f"{contact.ip_address}:{contact.port}"
 
+    def set_qr_expected_fingerprint(self, ip: str, port: int, fingerprint: str) -> None:
+        """Pin the 安全码 a scanned contact QR declared for [ip]:[port]. The
+        next completed handshake with that endpoint must present this exact
+        identity key, or the session is refused (see _dial_peer)."""
+        with self._lock:
+            self._qr_expected_fps[(ip, port)] = (fingerprint or "").upper()
+
+    def _take_qr_expected_fingerprint(self, ip: str, port: int) -> str:
+        with self._lock:
+            return self._qr_expected_fps.pop((ip, port), "")
+
     def start_chat(self, peer: Peer, quiet: bool = False) -> Optional[str]:
         """Pull up a chat with a member: connect and run the identity
         handshake. The other side auto-accepts. Returns the member's REAL
@@ -3749,6 +4284,17 @@ class DirectChatManager:
                     f"安全警告：{peer.name} 的设备身份发生变化，连接已拒绝（可能存在中间人攻击）"
                 ),
             )
+            # Scanned-QR pin (out-of-band TOFU): the handshake signature just
+            # proved WHICH key the endpoint holds; if a QR declared a different
+            # one, someone is intercepting between the scan and this dial.
+            qr_fp = self._take_qr_expected_fingerprint(peer.ip_address, peer.port)
+            if qr_fp and DeviceIdentity.peer_fingerprint(
+                secured.peer_ident or ""
+            ) != qr_fp:
+                self._emit_event(
+                    f"安全警告：{peer.name} 的安全码与二维码不一致，连接已拒绝（可能存在中间人攻击）"
+                )
+                raise WireException("对方安全码与二维码不一致")
             wire.send_packet(
                 NetworkPacket(type=Protocol.DIRECT_HELLO, peer=self.my_peer())
             )
@@ -3788,6 +4334,10 @@ class DirectChatManager:
                 session = self._sessions.get(remote.id)
             if session is not None and session["alive"]:
                 self._flush_outbox(remote.id, session)
+                # the alias merge above may have queued more messages after
+                # _on_established's flush: replay ops once more behind them
+                # (idempotent — receivers absorb repeats)
+                self._fire_ops_flush(remote.id)
             sock = None  # ownership transferred to the session
             return remote.id
         except Exception as e:
@@ -3940,13 +4490,18 @@ class DirectChatManager:
         reply_to: Optional[str] = None,
         reply_preview: Optional[str] = None,
         reply_sender: Optional[str] = None,
+        quote_sender: Optional[str] = None,
+        quote_kind: Optional[str] = None,
+        forwarded: Optional[ForwardedInfo] = None,
     ) -> bool:
         """Send a text message. The peer does NOT have to be online: with no
         live session the message is appended locally (marked pending), parked
         in the outbox, and delivered automatically once a session comes up —
         our redial or the peer dialing us. Returns False only when there is
         no known contact AND no session to deliver to. The optional reply_*
-        triple attaches a quoted header (see ChatMessage)."""
+        triple attaches a quoted header (see ChatMessage);
+        quote_sender/quote_kind fill the nested quote object; [forwarded]
+        carries display-only forward provenance."""
         # validate with the SAME rule the receiver enforces: the receiver
         # drops content longer than MAX_CONTENT_LENGTH, so without this check
         # a too-long message would "send" locally but silently never arrive
@@ -3970,6 +4525,9 @@ class DirectChatManager:
             reply_to=reply_to,
             reply_preview=reply_preview,
             reply_sender=reply_sender,
+            quote_sender=quote_sender,
+            quote_kind=quote_kind,
+            forwarded=forwarded,
         )
         # show the message locally right away (pending until delivered)
         self._append_message(peer_id, msg)
@@ -4032,16 +4590,19 @@ class DirectChatManager:
             pass
 
     def edit_message(self, peer_id: str, message_id: str, new_content: str) -> bool:
-        """Edit one of OUR direct-chat messages on a live session. Advisory
-        like typing: never queued offline — the peer must be online to see the
-        rewrite (deletes behave the same way). Applies locally first."""
+        """Edit one of OUR direct-chat messages. The edit applies locally in
+        every case the target is a valid own message; the return value says
+        whether it was handed to a live session. False means the peer was
+        offline — the ViewModel then stages the edit in the pending-op log so
+        it replays (in order, idempotently) once the session comes up, giving
+        offline edits the same convergence the direct outbox gives messages
+        (deletes keep their online-only semantics)."""
         if not is_valid_content(new_content):
             return False
         with self._lock:
             session = self._sessions.get(peer_id)
             my_id = self._my_id
-        if session is None or not session["alive"]:
-            return False
+        alive = session is not None and session["alive"]
         target = next(
             (m for m in self._messages.get(peer_id, []) if m.id == message_id), None
         )
@@ -4053,6 +4614,8 @@ class DirectChatManager:
         with self._lock:
             target.edited = True
         self._notify_messages(peer_id)
+        if not alive:
+            return False
         try:
             self._put_send(
                 session,
@@ -4065,7 +4628,7 @@ class DirectChatManager:
                 ),
             )
         except Exception:
-            pass
+            return False
         return True
 
     def send_direct_reaction(self, peer_id: str, message_id: str, emoji: str, active: bool) -> bool:
@@ -4135,6 +4698,7 @@ class DirectChatManager:
             session = self._sessions.get(peer_id)
         if session is not None and session["alive"]:
             self._flush_outbox(peer_id, session)
+            self._fire_ops_flush(peer_id)
 
     def _ensure_redial_loop(self, peer_id: str) -> None:
         """Keep dialing a peer while messages wait in its outbox, with growing
@@ -4160,6 +4724,7 @@ class DirectChatManager:
                         break
                     if session is not None and session["alive"]:
                         self._flush_outbox(peer_id, session)
+                        self._fire_ops_flush(peer_id)
                         break
                     # the contact may have been removed meanwhile — then there
                     # is no address left to dial and the loop must stop
@@ -4509,6 +5074,26 @@ class DirectChatManager:
             session = self._sessions.get(peer_id)
             return bool(session and session["alive"])
 
+    def send_packet_to(
+        self, peer_id: str, packet: NetworkPacket, on_sent=None, on_failed=None
+    ) -> bool:
+        """Hand one packet to the LIVE session with [peer_id] (False when the
+        session is gone — the caller keeps its pending op staged). The
+        session's writer thread runs [on_sent] after the line is written and
+        [on_failed] when the write failed, so the caller can delete a staged
+        op only once it actually left this device."""
+        with self._lock:
+            session = self._sessions.get(peer_id)
+            if session is None or not session["alive"]:
+                self._run_send_cb(on_failed)
+                return False
+        try:
+            self._put_send(session, packet, on_sent=on_sent, on_failed=on_failed)
+        except Exception:
+            self._run_send_cb(on_failed)
+            return False
+        return True
+
     def shutdown(self) -> None:
         self._stop_event.set()
         # release the presence loop so a shutdown process exits promptly
@@ -4561,11 +5146,23 @@ class DirectChatManager:
                 cb(peer.id)
             except Exception:
                 pass
-        # deliver everything that piled up while the peer was offline
+        # deliver everything that piled up while the peer was offline, then
+        # let the ViewModel replay its staged pending ops (they must follow
+        # the messages they reference)
         self._flush_outbox(peer.id, session)
+        self._fire_ops_flush(peer.id)
         _spawn(self._send_loop, session)
         _spawn(self._read_loop, session)
         _spawn(self._ping_loop, session)
+
+    def _fire_ops_flush(self, peer_id: str) -> None:
+        cb = self.on_ops_flush
+        if cb is None:
+            return
+        try:
+            cb(peer_id)
+        except Exception:
+            pass
 
     def _send_loop(self, session: dict) -> None:
         """The session's ONLY writer: one thread per session draining the send
@@ -4870,6 +5467,24 @@ class GroupMeshListener:
         mesh link (host-offline path)."""
         pass
 
+    def group_mesh_group_file_add(self, group_id: str, entry: GroupFileInfo) -> None:
+        """A member shared a file into the share area over a mesh link (the
+        mesh layer validated the sender against the link)."""
+        pass
+
+    def group_mesh_group_file_remove(
+        self, group_id: str, file_id: str, sender_id: str
+    ) -> bool:
+        """A group_file_remove arrived over a mesh link. The implementation
+        authorizes (uploader or owner) and returns whether it was applied."""
+        return False
+
+    def group_mesh_group_files(self, group_id: str, entries, removed_ids) -> None:
+        """history_reply carried share-area convergence data over a mesh
+        link: [entries] is the peer's index, [removed_ids] its removal
+        tombstones."""
+        pass
+
 
 class GroupMeshManager:
     """Group mesh: direct member-to-member links inside a group, so members
@@ -4918,6 +5533,12 @@ class GroupMeshManager:
         # Tombstone source for history pushes: callable(group_id) ->
         # [msgId, ...] (backed by the ViewModel's deleted_messages table).
         self.deleted_ids_provider = None
+        # Group file share area (群文件) sources for history pushes:
+        # callable(group_id) -> [GroupFileInfo, ...] (share index) and
+        # callable(group_id) -> [fileId, ...] (removal tombstones). None
+        # omits the fields.
+        self.group_files_provider = None
+        self.removed_file_ids_provider = None
         # Creator (group owner) id per group: callable(group_id) -> str. Owner
         # management packets (group_update / kick_member) are only accepted on
         # a link when their senderId is the creator; an unknown creator refuses
@@ -5088,6 +5709,7 @@ class GroupMeshManager:
         packet = NetworkPacket(
             type="delete_message", message_id=message_id, sender_id=my_id
         )
+        groupauth.sign_packet(packet, groupauth.delete_parts(group_id, my_id, message_id))
         for link in links:
             self._spawn(self._link_write, link, packet)
 
@@ -5128,6 +5750,17 @@ class GroupMeshManager:
             message_id=message_id,
             sender_id=my_id,
             new_content=new_content,
+        )
+        groupauth.sign_packet(
+            packet, groupauth.edit_parts(group_id, my_id, message_id, new_content)
+        )
+        self.update_mesh_message(
+            group_id,
+            message_id,
+            new_content,
+            my_id,
+            sender_pub_id=packet.sender_pub_id,
+            sender_sig=packet.sender_sig,
         )
         for link in links:
             self._spawn(self._link_write, link, packet)
@@ -5190,9 +5823,20 @@ class GroupMeshManager:
         for link in links:
             self._spawn(self._link_write, link, packet)
 
-    def update_mesh_message(self, group_id: str, message_id: str, new_content: str, sender_id: str) -> bool:
+    def update_mesh_message(
+        self,
+        group_id: str,
+        message_id: str,
+        new_content: str,
+        sender_id: str,
+        sender_pub_id: Optional[str] = None,
+        sender_sig: Optional[str] = None,
+    ) -> bool:
         """Apply an edit to this member's mesh history copy (author-validated
-        by the caller), so a later history push carries the new text."""
+        by the caller), so a later history push carries the new text. When
+        [sender_pub_id]/[sender_sig] are provided (the verified edit packet's
+        author fields) they replace the copy's signature so the pushed history
+        entry stays content-signature consistent."""
         with self._lock:
             state = self._groups.get(group_id)
             if state is None:
@@ -5204,6 +5848,9 @@ class GroupMeshManager:
                 return False
             target.content = new_content
             target.edited = True
+            if sender_pub_id and sender_sig:
+                target.sender_pub_id = sender_pub_id
+                target.sender_sig = sender_sig
         return True
 
     def apply_deleted_ids(self, group_id: str, deleted_ids) -> None:
@@ -5272,7 +5919,13 @@ class GroupMeshManager:
         everything the peer missed may have been deleted while it was away —
         so an offline member converges instead of resurrecting the message.
         Tombstones travel outside the batch size budget, which does not
-        account for them (Android parity: sendHistory/sendDeletedIds)."""
+        account for them (Android parity: sendHistory/sendDeletedIds).
+
+        The group file share area (群文件) rides the same push: index
+        batches (byte-budgeted like history), then the delete tombstones +
+        share-area removal tombstones packet LAST — the receiver applies
+        removals before/after entries idempotently, but sending removals
+        last mirrors "history then tombstones"."""
         batch = []
         estimated = 0
 
@@ -5301,21 +5954,77 @@ class GroupMeshManager:
             batch.append(msg)
             estimated += size
         flush()
+        self._send_group_files(wire, group_id)
         deleted_ids = []
         if self.deleted_ids_provider is not None:
             try:
                 deleted_ids = sanitize_deleted_ids(self.deleted_ids_provider(group_id))
             except Exception:
                 deleted_ids = []
-        if deleted_ids:
+        removed_ids = self._removed_file_ids(group_id)
+        if deleted_ids or removed_ids:
             try:
                 wire.send_packet(
                     NetworkPacket(
-                        type="history_reply", group_id=group_id, deleted_ids=deleted_ids
+                        type="history_reply",
+                        group_id=group_id,
+                        deleted_ids=deleted_ids or None,
+                        removed_ids=removed_ids or None,
                     )
                 )
             except Exception:
                 pass
+
+    def _removed_file_ids(self, group_id: str) -> list:
+        """The group's removed-share-file tombstone ids (capped), or [] when
+        no provider is wired."""
+        provider = self.removed_file_ids_provider
+        if provider is None:
+            return []
+        try:
+            return sanitize_id_list(
+                provider(group_id), MAX_GROUP_FILE_REMOVED
+            )
+        except Exception:
+            return []
+
+    def _send_group_files(self, wire: Wire, group_id: str) -> None:
+        """Push the share-area index in byte-budgeted batches (one entry is
+        far smaller than one message, but 500 entries still exceed a single
+        line, so the same chunking rule as history applies). Receivers merge
+        each batch independently and dedup by fileId."""
+        provider = self.group_files_provider
+        if provider is None:
+            return
+        try:
+            entries = sanitize_group_files(provider(group_id))
+        except Exception:
+            return
+        batch = []
+        estimated = 0
+
+        def flush() -> None:
+            nonlocal batch, estimated
+            if not batch:
+                return
+            try:
+                wire.send_packet(
+                    NetworkPacket(
+                        type="history_reply", group_id=group_id, group_files=batch
+                    )
+                )
+            except Exception:
+                pass
+            batch = []
+            estimated = 0
+
+        for entry in entries:
+            size = len(entry.name) * 4 + len(entry.sender_name) * 4 + 512
+            if estimated > 0 and estimated + size > GROUP_FILE_PUSH_BUDGET_BYTES:
+                flush()
+            batch.append(entry)
+            estimated += size
+        flush()
 
     # ------------------------------------------------------------- listeners
 
@@ -5543,10 +6252,21 @@ class GroupMeshManager:
                             packet.type, link["peer_id"], msg.sender_id, len(msg.content),
                         )
                         continue
+                    # author identity gate (TOFU) BEFORE the message is merged
+                    # or any listener fires
+                    if not groupauth.verify_message(group_id, msg):
+                        continue
                     self._handle_incoming(group_id, [msg])
                 elif packet.type == "delete_message":
                     if packet.message_id and packet.sender_id:
-                        self._handle_delete_incoming(group_id, link, packet.message_id, packet.sender_id)
+                        self._handle_delete_incoming(
+                            group_id,
+                            link,
+                            packet.message_id,
+                            packet.sender_id,
+                            packet.sender_pub_id,
+                            packet.sender_sig,
+                        )
                 elif packet.type == "edit_message" and packet.message_id and packet.new_content is not None:
                     self._handle_edit_incoming(group_id, link, packet)
                 elif packet.type == "reaction" and packet.message_id and packet.emoji:
@@ -5606,10 +6326,14 @@ class GroupMeshManager:
                             pass
                 elif packet.type == "history_reply":
                     # History legitimately contains messages from many senders,
-                    # but each message must still be well-formed and bounded.
+                    # but each message must still be well-formed and bounded —
+                    # and each author's device signature must verify (TOFU)
+                    # before it may enter history or fire a listener.
                     valid_history = [
                         m for m in (packet.messages or [])
-                        if m.sender_id and is_valid_content(m.content)
+                        if m.sender_id
+                        and is_valid_content(m.content)
+                        and groupauth.verify_message(group_id, m)
                     ]
                     edits = []
                     with self._lock:
@@ -5665,8 +6389,60 @@ class GroupMeshManager:
                         # tombstone convergence riding the history push (no
                         # rebroadcast — see apply_deleted_ids)
                         self.apply_deleted_ids(group_id, packet.deleted_ids)
+                    if packet.removed_ids or packet.group_files:
+                        # share-area convergence riding the history push:
+                        # the store applies removal tombstones first and
+                        # skips entries they cover (no rebroadcast)
+                        removed = sanitize_id_list(
+                            packet.removed_ids, MAX_GROUP_FILE_REMOVED
+                        )
+                        entries = sanitize_group_files(packet.group_files)
+                        if removed or entries:
+                            listener = self._listener
+                            if listener is not None:
+                                try:
+                                    listener.group_mesh_group_files(
+                                        group_id, entries, removed
+                                    )
+                                except Exception:
+                                    pass
                 elif packet.type == "mesh_announce" and packet.peer is not None:
                     self.add_peer(group_id, packet.peer)
+                elif packet.type == "group_file_add":
+                    # share area over a mesh link: only the linked member may
+                    # share as itself, and the entry must name that sender
+                    entry = None
+                    if (
+                        packet.sender_id == link["peer_id"]
+                        and packet.group_id == group_id
+                    ):
+                        entry = P2PManager._group_file_entry_from_packet(packet)
+                    if entry is None or entry.sender_id != packet.sender_id:
+                        logger.warning(
+                            "drop group_file_add on link %s: senderId=%r",
+                            link["peer_id"], packet.sender_id,
+                        )
+                    else:
+                        listener = self._listener
+                        if listener is not None:
+                            try:
+                                listener.group_mesh_group_file_add(group_id, entry)
+                            except Exception:
+                                pass
+                elif packet.type == "group_file_remove":
+                    if (
+                        packet.sender_id == link["peer_id"]
+                        and packet.file_id
+                        and packet.group_id == group_id
+                    ):
+                        listener = self._listener
+                        if listener is not None:
+                            try:
+                                listener.group_mesh_group_file_remove(
+                                    group_id, packet.file_id, packet.sender_id
+                                )
+                            except Exception:
+                                pass
                 elif packet.type in ("group_update", "kick_member"):
                     self._handle_admin_incoming(group_id, link, packet)
                 elif packet.type == "ping":
@@ -5710,6 +6486,29 @@ class GroupMeshManager:
             link["alive"] = False
             self._safe_close(link["sock"])
             return
+        # owner identity binding (TOFU): a signed owner packet must verify
+        # against the creatorId's remembered key; unsigned stays legacy
+        if packet.type == "group_update":
+            verified = groupauth.verify_group_update(
+                group_id,
+                creator,
+                packet.group_name or "",
+                packet.announcement or "",
+                packet.sender_pub_id,
+                packet.sender_sig,
+            )
+        else:
+            verified = groupauth.verify_kick(
+                group_id,
+                creator,
+                packet.target_id or "",
+                packet.sender_pub_id,
+                packet.sender_sig,
+            )
+        if not verified:
+            link["alive"] = False
+            self._safe_close(link["sock"])
+            return
         if packet.type == "kick_member":
             target = packet.target_id
             if not target:
@@ -5739,21 +6538,36 @@ class GroupMeshManager:
     def _handle_edit_incoming(self, group_id: str, link: dict, packet: NetworkPacket) -> None:
         """Apply a mesh-received edit locally: update this member's mesh
         history copy and relay to the ViewModel. Only the linked member may
-        edit as itself, and only its own message (stricter than the mesh
+        edit as itself, only its own message (stricter than the mesh
         delete rule: content rewrites demand the author on the authoring
-        link). No forwarding: the sender's broadcast already reached every
+        link), and the author's device signature must verify (TOFU).
+        No forwarding: the sender's broadcast already reached every
         link of the complete graph.
-        TRUST NOTE: the link peer id is self-claimed (password-only mesh
-        handshake), so like deletes this rule trusts holders of the group
-        password, not a proven author identity."""
+        TRUST NOTE: for UNSIGNED packets the link peer id is self-claimed
+        (password-only mesh handshake), so like deletes this rule trusts
+        holders of the group password; signed packets are author-true."""
         if packet.sender_id != link["peer_id"]:
             logger.warning(
                 "reject mesh edit %s: claimed senderId=%r on link %s",
                 packet.message_id, packet.sender_id, link["peer_id"],
             )
             return
+        if not groupauth.verify_edit(
+            group_id,
+            packet.sender_id,
+            packet.message_id,
+            packet.new_content,
+            packet.sender_pub_id,
+            packet.sender_sig,
+        ):
+            return
         if not self.update_mesh_message(
-            group_id, packet.message_id, packet.new_content, packet.sender_id
+            group_id,
+            packet.message_id,
+            packet.new_content,
+            packet.sender_id,
+            sender_pub_id=packet.sender_pub_id,
+            sender_sig=packet.sender_sig,
         ):
             logger.warning(
                 "reject mesh edit %s: message not found or not authored by %r",
@@ -5769,14 +6583,23 @@ class GroupMeshManager:
             except Exception:
                 pass
 
-    def _handle_delete_incoming(self, group_id: str, link: dict, message_id: str, sender_id: str) -> None:
+    def _handle_delete_incoming(
+        self,
+        group_id: str,
+        link: dict,
+        message_id: str,
+        sender_id: str,
+        sender_pub_id=None,
+        sender_sig=None,
+    ) -> None:
         """Apply a mesh-received delete locally: remove the message from this
         group's mesh state and relay it to the ViewModel. Only the original
-        sender may delete (same authorization as the host relay); a duplicate
-        delete for an already removed message is ignored. No forwarding: the
-        mesh links every member pair directly (the sender's broadcast already
-        reaches everyone), and relaying would only create a delete storm
-        through the complete graph."""
+        sender may delete (same authorization as the host relay), the author's
+        device signature must verify (TOFU), and a duplicate delete for an
+        already removed message is ignored. No forwarding: the mesh links
+        every member pair directly (the sender's broadcast already reaches
+        everyone), and relaying would only create a delete storm through the
+        complete graph."""
         target = None
         with self._lock:
             state = self._groups.get(group_id)
@@ -5791,6 +6614,10 @@ class GroupMeshManager:
                 "reject mesh delete %s: message senderId=%r != claimed %r",
                 message_id, target.sender_id, sender_id,
             )
+            return
+        if not groupauth.verify_delete(
+            group_id, sender_id, message_id, sender_pub_id, sender_sig
+        ):
             return
         with self._lock:
             if state is not None:

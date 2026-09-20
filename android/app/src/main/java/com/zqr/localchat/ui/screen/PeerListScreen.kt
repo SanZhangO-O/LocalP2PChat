@@ -54,12 +54,18 @@ fun PeerListScreen(
     onCallAudioPeer: (String) -> Unit = {},
     announcement: String = "",
     onUpdateGroupInfo: (String?, String?) -> Unit = { _, _ -> },
-    onKickMember: (String) -> Unit = {}
+    onKickMember: (String) -> Unit = {},
+    /** The group's canonical id: keys the member device-identity (TOFU)
+     *  bindings shown as 已验证 badges + 安全码 dialogs. Null disables. */
+    groupId: String? = null,
+    /** member device-id -> bound 安全码 (empty = not yet bound). */
+    memberFingerprints: Map<String, String> = emptyMap()
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     val clipboard = LocalClipboard.current
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var showFingerprint by remember { mutableStateOf<Pair<String, String>?>(null) }
 
     LaunchedEffect(connectionResult) {
         when (val result = connectionResult) {
@@ -402,6 +408,10 @@ fun PeerListScreen(
                     items(peers.entries.toList(), key = { it.key }) { entry ->
                         PeerItem(
                             peer = entry.value,
+                            fingerprint = memberFingerprints[entry.value.id],
+                            onShowFingerprint = { name, fp ->
+                                showFingerprint = name to fp
+                            },
                             onCall = {
                                 if (!connectionLost) onCallPeer(entry.value.id)
                             },
@@ -459,6 +469,46 @@ fun PeerListScreen(
             },
             dismissButton = {
                 TextButton(onClick = { pendingKick = null }) { Text("取消") }
+            }
+        )
+    }
+
+    showFingerprint?.let { (name, fp) ->
+        AlertDialog(
+            onDismissRequest = { showFingerprint = null },
+            title = { Text("成员安全码") },
+            text = {
+                Column {
+                    Text("$name 的设备安全码：")
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = fp,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.fillMaxWidth(),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "与对方设置页「本机安全码」当面比对一致，即可完全排除中间人。",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    scope.launch {
+                        clipboard.setClipEntry(
+                            ClipEntry(ClipData.newPlainText("LocalChat", fp))
+                        )
+                        Toast.makeText(context, "已复制安全码", Toast.LENGTH_SHORT).show()
+                    }
+                    showFingerprint = null
+                }) { Text("复制") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showFingerprint = null }) { Text("关闭") }
             }
         )
     }

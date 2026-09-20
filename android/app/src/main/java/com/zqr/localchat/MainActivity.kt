@@ -35,6 +35,7 @@ import com.zqr.localchat.data.FileKind
 import com.zqr.localchat.data.MAX_FOLDER_FILES
 import com.zqr.localchat.data.detectMediaKind
 import com.zqr.localchat.data.replyPreviewText
+import com.zqr.localchat.network.GroupAuth
 import com.zqr.localchat.network.P2PManager
 import com.zqr.localchat.ui.screen.CallOverlay
 import com.zqr.localchat.ui.screen.ChatScreen
@@ -230,6 +231,17 @@ fun LocalChatApp(
     val activeMessages by viewModel.activeMessages.collectAsState()
     val activeGroupName by viewModel.activeGroupName.collectAsState()
     val activeGroupId by viewModel.activeGroupId.collectAsState()
+    // Group member device-identity bindings (TOFU, GroupAuth): recomputed when
+    // the member set or the messages change, so a member that just sent its
+    // first signed message immediately shows the 已验证 badge + 安全码.
+    val activeMemberFingerprints: Map<String, String> = remember(
+        activeGroupId, activePeers, activeMessages
+    ) {
+        val gid = activeGroupId ?: return@remember emptyMap()
+        activePeers.keys.associateWith { pid ->
+            GroupAuth.memberFingerprint(gid, pid).orEmpty()
+        }
+    }
     val activeMyName by viewModel.activeMyName.collectAsState()
     val activeIsHost by viewModel.activeIsHost.collectAsState()
     val activeGroupPassword by viewModel.activeGroupPassword.collectAsState()
@@ -863,7 +875,9 @@ fun LocalChatApp(
                 },
                 announcement = groups.find { it.groupId == activeGroupId }?.announcement ?: "",
                 onUpdateGroupInfo = viewModel::updateGroupInfo,
-                onKickMember = viewModel::kickMember
+                onKickMember = viewModel::kickMember,
+                groupId = activeGroupId,
+                memberFingerprints = activeMemberFingerprints
             )
         }
         Screen.Chat -> {

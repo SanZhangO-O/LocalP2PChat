@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from . import secretbox
-from .models import FILE_KIND_FILE, MEDIA_VIDEO, ChatMessage
+from .models import FILE_KIND_FILE, MEDIA_VIDEO, ChatMessage, forwarded_to_json
 
 
 @dataclass
@@ -60,9 +60,20 @@ class SavedMessage:
     pending: bool = False
     # Reply/quote (empty when the message is not a reply): survives restart so
     # the quoted header still renders. Mirrors the wire ChatMessage fields.
+    # quote fields: reply_to = quoted id, reply_preview = snippet (encrypted
+    # at rest like the body), reply_sender = original sender DISPLAY NAME;
+    # quoted_sender = original sender DEVICE id and quoted_kind = the original
+    # message's content kind ("text"/file kind), both parsed from the nested
+    # wire quote object (empty when only the legacy flat triple arrived).
     reply_to: str = ""
     reply_preview: str = ""
     reply_sender: str = ""
+    quoted_sender: str = ""
+    quoted_kind: str = ""
+    # Forward provenance (compact JSON, "" = not a forward): display-only
+    # "转发" badge data, never used for authorization (plaintext like
+    # replySender — origin names are display metadata, not content).
+    forwarded: str = ""
     # Own direct-chat message read by the peer (set by a read_receipt):
     # survives restart so "已读" does not flip back after a relaunch.
     read: bool = False
@@ -87,12 +98,56 @@ class SavedCallLog:
     duration: int = 0  # seconds actually connected (0 when never answered)
 
 
+@dataclass
+class PendingOp:
+    """One staged message-experience operation (edit/reaction/pin) waiting
+    for its conversation to become reachable again. The UNIQUE key
+    (scope, kind, message_id, emoji) makes staging idempotent: toggling the
+    same reaction/pin (or re-editing the same message) while offline UPDATES
+    the staged row in place (latest payload + timestamp wins, queue position
+    kept), so one user action can never queue duplicates (Android parity:
+    PendingOpEntity)."""
+
+    op_id: int
+    scope: str  # group id or "direct:<peer_id>"
+    kind: str  # "edit" | "reaction" | "pin"
+    message_id: str
+    emoji: str = ""
+    active: bool = False
+    content: str = ""  # decrypted edit text (stored encrypted)
+    created_at: int = 0
+
+
+@dataclass
+class SavedGroupFile:
+    """One entry of a group's shared-file index (群文件). The metadata columns
+    are PLAINTEXT at rest (searchable with SQL LIKE); only the download
+    snapshot mirrors the wire offer. local_path is local-only (never synced):
+    the source path on the uploader, so it can re-serve the bytes."""
+
+    group_id: str
+    file_id: str
+    name: str
+    size: int
+    sender_id: str
+    sender_name: str = ""
+    ts: int = 0
+    download_host: str = ""
+    download_port: int = 0
+    file_key: str = ""
+    local_path: str = ""
+
+
 class ChatStore:
     # Delete tombstones kept per group: enough for convergence after a short
     # offline period without growing the table forever.
     TOMBSTONE_CAP = 200
     # Call-log history kept per conversation (newest kept, oldest trimmed).
     CALL_LOG_CAP = 200
+    # Group file share area (群文件): index entries and removal tombstones
+    # kept per group (newest kept by ts / removed_at).
+    GROUP_FILES_CAP = 500
+    REMOVED_GROUP_FILES_CAP = 500
 
     def __init__(self, db_path: str):
         self._lock = threading.RLock()
@@ -261,6 +316,21 @@ class ChatStore:
                 )
                 """
             )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_ops (
+                    opId INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    messageId TEXT NOT NULL,
+                    emoji TEXT NOT NULL DEFAULT '',
+                    active INTEGER NOT NULL DEFAULT 0,
+                    content TEXT NOT NULL DEFAULT '',
+                    createdAt INTEGER NOT NULL,
+                    UNIQUE (scope, kind, messageId, emoji)
+                )
+                """
+            )
             self._conn.commit()
             # Local call history: one row per finished call, keyed to the 1:1
             # conversation with the other participant ("direct:<peer_id>").
@@ -282,6 +352,48 @@ class ChatStore:
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_call_logs_conv ON call_logs(conversationKey, startTime)"
+            )
+            # Group file share area (群文件): a per-group persistent file
+            # index, separate from chat file messages. Metadata columns are
+            # plaintext at rest (searchable); downloadHost/downloadPort/
+            # fileKey snapshot the uploader's offer (per-file key + download
+            # token mechanism shared with chat files). localPath is the
+            # uploader's local source (never synced). FK-cascade off the
+            # group so removing the group removes its share index.
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS group_files (
+                    groupId TEXT NOT NULL,
+                    fileId TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    senderId TEXT NOT NULL,
+                    senderName TEXT NOT NULL DEFAULT '',
+                    ts INTEGER NOT NULL DEFAULT 0,
+                    downloadHost TEXT NOT NULL DEFAULT '',
+                    downloadPort INTEGER NOT NULL DEFAULT 0,
+                    fileKey TEXT NOT NULL DEFAULT '',
+                    localPath TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY (groupId) REFERENCES saved_groups(groupId) ON DELETE CASCADE,
+                    PRIMARY KEY (groupId, fileId)
+                )
+                """
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_group_files_group ON group_files(groupId)"
+            )
+            # Removal tombstones of the share area (offline-member convergence,
+            # join_ack / history_reply removedIds), same shape as
+            # deleted_messages but capped at REMOVED_GROUP_FILES_CAP.
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS removed_group_files (
+                    group_id TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
+                    removed_at INTEGER NOT NULL,
+                    PRIMARY KEY (group_id, file_id)
+                )
+                """
             )
             self._conn.commit()
 
@@ -338,6 +450,18 @@ class ChatStore:
                 c.execute(
                     "ALTER TABLE saved_messages ADD COLUMN replySender TEXT NOT NULL DEFAULT ''"
                 )
+            if "quotedSender" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN quotedSender TEXT NOT NULL DEFAULT ''"
+                )
+            if "quotedKind" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN quotedKind TEXT NOT NULL DEFAULT ''"
+                )
+            if "forwarded" not in cols:
+                c.execute(
+                    "ALTER TABLE saved_messages ADD COLUMN forwarded TEXT NOT NULL DEFAULT ''"
+                )
             if "read" not in cols:
                 c.execute(
                     "ALTER TABLE saved_messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0"
@@ -375,6 +499,9 @@ class ChatStore:
                 replyTo TEXT NOT NULL DEFAULT '',
                 replyPreview TEXT NOT NULL DEFAULT '',
                 replySender TEXT NOT NULL DEFAULT '',
+                quotedSender TEXT NOT NULL DEFAULT '',
+                quotedKind TEXT NOT NULL DEFAULT '',
+                forwarded TEXT NOT NULL DEFAULT '',
                 read INTEGER NOT NULL DEFAULT 0,
                 edited INTEGER NOT NULL DEFAULT 0,
                 mentions TEXT NOT NULL DEFAULT '',
@@ -393,14 +520,17 @@ class ChatStore:
                 (id, groupId, content, timestamp, senderId, senderName, isFromMe,
                  fileSize, downloadHost, downloadPort, kind,
                  folderId, folderName, relativePath, folderTotal, pending,
-                 replyTo, replyPreview, replySender, read, edited, mentions)
+                 replyTo, replyPreview, replySender, quotedSender, quotedKind,
+                 forwarded, read, edited, mentions)
             SELECT id, groupId, content, timestamp, senderId, senderName, isFromMe,
                    {_col('fileSize', '0')}, {_col('downloadHost', "''")},
                    {_col('downloadPort', '0')}, {_col('kind', "'file'")},
                    {_col('folderId', "''")}, {_col('folderName', "''")},
                    {_col('relativePath', "''")}, {_col('folderTotal', '0')}, 0,
                    {_col('replyTo', "''")}, {_col('replyPreview', "''")},
-                   {_col('replySender', "''")}, {_col('read', '0')},
+                   {_col('replySender', "''")}, {_col('quotedSender', "''")},
+                   {_col('quotedKind', "''")}, {_col('forwarded', "''")},
+                   {_col('read', '0')},
                    {_col('edited', '0')}, {_col('mentions', "''")}
             FROM saved_messages_old
             """
@@ -541,8 +671,9 @@ class ChatStore:
                 (id, groupId, content, timestamp, senderId, senderName, isFromMe,
                  fileSize, downloadHost, downloadPort, kind,
                  folderId, folderName, relativePath, folderTotal, pending,
-                 replyTo, replyPreview, replySender, read, edited, mentions)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 replyTo, replyPreview, replySender, quotedSender, quotedKind,
+                 forwarded, read, edited, mentions)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(groupId, id) DO UPDATE SET
                     content=excluded.content,
                     timestamp=excluded.timestamp,
@@ -561,6 +692,9 @@ class ChatStore:
                     replyTo=excluded.replyTo,
                     replyPreview=excluded.replyPreview,
                     replySender=excluded.replySender,
+                    quotedSender=excluded.quotedSender,
+                    quotedKind=excluded.quotedKind,
+                    forwarded=excluded.forwarded,
                     read=excluded.read,
                     edited=excluded.edited,
                     mentions=excluded.mentions
@@ -589,6 +723,9 @@ class ChatStore:
                         # the quote snippet is conversation content too
                         self._enc(m.reply_preview),
                         m.reply_sender,
+                        m.quoted_sender,
+                        m.quoted_kind,
+                        m.forwarded,
                         1 if m.read else 0,
                         1 if m.edited else 0,
                         m.mentions,
@@ -629,6 +766,9 @@ class ChatStore:
                     else ""
                 ),
                 reply_sender=r["replySender"] if "replySender" in r.keys() else "",
+                quoted_sender=r["quotedSender"] if "quotedSender" in r.keys() else "",
+                quoted_kind=r["quotedKind"] if "quotedKind" in r.keys() else "",
+                forwarded=r["forwarded"] if "forwarded" in r.keys() else "",
                 read=bool(r["read"]) if "read" in r.keys() else False,
                 edited=bool(r["edited"]) if "edited" in r.keys() else False,
                 mentions=r["mentions"] if "mentions" in r.keys() else "",
@@ -672,6 +812,9 @@ class ChatStore:
                     else ""
                 ),
                 reply_sender=r["replySender"] if "replySender" in r.keys() else "",
+                quoted_sender=r["quotedSender"] if "quotedSender" in r.keys() else "",
+                quoted_kind=r["quotedKind"] if "quotedKind" in r.keys() else "",
+                forwarded=r["forwarded"] if "forwarded" in r.keys() else "",
                 read=bool(r["read"]) if "read" in r.keys() else False,
                 edited=bool(r["edited"]) if "edited" in r.keys() else False,
                 mentions=r["mentions"] if "mentions" in r.keys() else "",
@@ -836,11 +979,13 @@ class ChatStore:
                     (id, groupId, content, timestamp, senderId, senderName, isFromMe,
                      fileSize, downloadHost, downloadPort, kind,
                      folderId, folderName, relativePath, folderTotal, pending,
-                     replyTo, replyPreview, replySender, read, edited, mentions)
+                     replyTo, replyPreview, replySender, quotedSender, quotedKind,
+                     forwarded, read, edited, mentions)
                 SELECT id, ?, content, timestamp, senderId, senderName, isFromMe,
                        fileSize, downloadHost, downloadPort, kind,
                        folderId, folderName, relativePath, folderTotal, pending,
-                       replyTo, replyPreview, replySender, read, edited, mentions
+                       replyTo, replyPreview, replySender, quotedSender, quotedKind,
+                       forwarded, read, edited, mentions
                 FROM saved_messages WHERE groupId = ?
                 ON CONFLICT(groupId, id) DO UPDATE SET
                     content=excluded.content,
@@ -860,6 +1005,9 @@ class ChatStore:
                     replyTo=excluded.replyTo,
                     replyPreview=excluded.replyPreview,
                     replySender=excluded.replySender,
+                    quotedSender=excluded.quotedSender,
+                    quotedKind=excluded.quotedKind,
+                    forwarded=excluded.forwarded,
                     read=excluded.read,
                     edited=excluded.edited,
                     mentions=excluded.mentions
@@ -907,6 +1055,7 @@ class ChatStore:
         with self._lock:
             self._conn.execute("DELETE FROM saved_messages WHERE groupId = ?", (group_id,))
             self._conn.execute("DELETE FROM deleted_messages WHERE group_id = ?", (group_id,))
+            self._conn.execute("DELETE FROM pending_ops WHERE scope = ?", (group_id,))
             self._conn.execute("DELETE FROM saved_groups WHERE groupId = ?", (group_id,))
             # local call history of a removed conversation must go with it
             self._conn.execute(
@@ -966,6 +1115,90 @@ class ChatStore:
                 (group_id,),
             ).fetchall()
         return [r["msg_id"] for r in rows]
+
+    # ------------------------------------------------------- pending op log
+
+    def stage_pending_op(
+        self,
+        scope: str,
+        kind: str,
+        message_id: str,
+        emoji: str = "",
+        active: bool = False,
+        content: str = "",
+        created_at: Optional[int] = None,
+    ) -> None:
+        """Stage one offline message-experience op for [scope]. Idempotent:
+        an op with the same (scope, kind, message_id, emoji) is updated in
+        place (latest payload/timestamp, queue position kept — Android parity:
+        ChatDao.stagePendingOp). The edit text is conversation content and is
+        encrypted at rest like the message bodies."""
+        ts = int(time.time() * 1000) if created_at is None else int(created_at)
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE pending_ops SET active = ?, content = ?, createdAt = ?
+                WHERE scope = ? AND kind = ? AND messageId = ? AND emoji = ?
+                """,
+                (1 if active else 0, self._enc(content), ts, scope, kind, message_id, emoji),
+            )
+            if cur.rowcount == 0:
+                self._conn.execute(
+                    """
+                    INSERT INTO pending_ops
+                        (scope, kind, messageId, emoji, active, content, createdAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (scope, kind, message_id, emoji, 1 if active else 0, self._enc(content), ts),
+                )
+            self._conn.commit()
+
+    def _row_to_pending_op(self, r) -> PendingOp:
+        return PendingOp(
+            op_id=int(r["opId"]),
+            scope=r["scope"],
+            kind=r["kind"],
+            message_id=r["messageId"],
+            emoji=r["emoji"],
+            active=bool(r["active"]),
+            content=self._dec(r["content"]),
+            created_at=int(r["createdAt"]),
+        )
+
+    def get_pending_ops(self, scope: str) -> List[PendingOp]:
+        """Staged ops of one conversation in staging order (oldest first)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM pending_ops WHERE scope = ? ORDER BY opId ASC",
+                (scope,),
+            ).fetchall()
+        return [self._row_to_pending_op(r) for r in rows]
+
+    def get_all_pending_ops(self) -> dict:
+        """{scope: [PendingOp, …]} across every conversation (startup view);
+        scopes keep their ops in staging order."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM pending_ops ORDER BY opId ASC"
+            ).fetchall()
+        out: dict = {}
+        for r in rows:
+            op = self._row_to_pending_op(r)
+            out.setdefault(op.scope, []).append(op)
+        return out
+
+    def delete_pending_op(self, op_id: int) -> None:
+        """Drop one staged op after it was replayed successfully."""
+        with self._lock:
+            self._conn.execute("DELETE FROM pending_ops WHERE opId = ?", (op_id,))
+            self._conn.commit()
+
+    def delete_pending_ops(self, scope: str) -> None:
+        """Drop every staged op of one conversation (e.g. the conversation was
+        removed while ops were still staged)."""
+        with self._lock:
+            self._conn.execute("DELETE FROM pending_ops WHERE scope = ?", (scope,))
+            self._conn.commit()
 
     # ------------------------------------------------------------- call logs
 
@@ -1139,6 +1372,9 @@ class ChatStore:
             # the quote snippet is conversation content too (encrypted at rest)
             reply_preview=self._dec(r["replyPreview"]) if "replyPreview" in keys else "",
             reply_sender=r["replySender"] if "replySender" in keys else "",
+            quoted_sender=r["quotedSender"] if "quotedSender" in keys else "",
+            quoted_kind=r["quotedKind"] if "quotedKind" in keys else "",
+            forwarded=r["forwarded"] if "forwarded" in keys else "",
             read=bool(r["read"]) if "read" in keys else False,
             edited=bool(r["edited"]) if "edited" in keys else False,
             mentions=r["mentions"] if "mentions" in keys else "",
@@ -1183,6 +1419,9 @@ def to_saved_message(group_id: str, msg: ChatMessage) -> SavedMessage:
         reply_to=msg.reply_to or "",
         reply_preview=msg.reply_preview or "",
         reply_sender=msg.reply_sender or "",
+        quoted_sender=msg.quote_sender or "",
+        quoted_kind=msg.quote_kind or "",
+        forwarded=forwarded_to_json(msg.forwarded),
         read=msg.read,
         edited=msg.edited,
         mentions=json.dumps(msg.mentions) if msg.mentions else "",

@@ -201,6 +201,22 @@ object DirectChatManager {
      *  peer already closed and messages silently never arrive. */
     private val dialLocks = ConcurrentHashMap<String, Any>()
 
+    /** Scanned contact-QR expectations: "ip:port" -> 安全码 fingerprint the
+     *  QR declared. The next completed handshake with that endpoint must
+     *  present exactly this identity key (the QR is an out-of-band channel,
+     *  so this pins TOFU *before* the first connection — a MITM between the
+     *  scan and the first dial is rejected instead of silently remembered).
+     *  Windows parity: DirectChatManager.set_qr_expected_fingerprint. */
+    private val qrExpectedFingerprints = ConcurrentHashMap<String, String>()
+
+    /** Pin the 安全码 a scanned contact QR declared for [ip]:[port]. */
+    fun setQrExpectedFingerprint(ip: String, port: Int, fingerprint: String) {
+        qrExpectedFingerprints["$ip:$port"] = fingerprint.uppercase()
+    }
+
+    private fun takeQrExpectedFingerprint(ip: String, port: Int): String? =
+        qrExpectedFingerprints.remove("$ip:$port")
+
     /** Removed-contact marks: ids (and endpoints) the LOCAL user deleted,
      *  with the removal time. A peer still announcing to us must not
      *  resurrect a deleted contact; [addContact] clears the marks (explicit
@@ -740,6 +756,17 @@ object DirectChatManager {
                     _events.tryEmit("安全警告：${peer.name} 的设备身份发生变化，连接已拒绝（可能存在中间人攻击）")
                 }
             )
+            // Scanned-QR pin (out-of-band TOFU): the handshake signature just
+            // proved WHICH key the endpoint holds; if a QR declared a
+            // different one, someone is intercepting between scan and dial
+            // (Windows parity: network.py _dial_peer).
+            val qrFingerprint = takeQrExpectedFingerprint(peer.ipAddress, peer.port)
+            if (qrFingerprint != null &&
+                DeviceIdentity.peerFingerprint(secured.peerIdent ?: "") != qrFingerprint
+            ) {
+                _events.tryEmit("安全警告：${peer.name} 的安全码与二维码不一致，连接已拒绝（可能存在中间人攻击）")
+                throw IllegalStateException("peer identity mismatch with scanned QR")
+            }
             wire.sendPacket(NetworkPacket(type = Protocol.DIRECT_HELLO, peer = myPeer()))
             val ack = wire.recvPacket() ?: throw IllegalStateException("no direct_ack")
             if (ack.type == Protocol.DIRECT_PENDING) {

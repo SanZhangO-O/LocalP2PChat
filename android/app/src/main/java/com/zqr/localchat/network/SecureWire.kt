@@ -702,4 +702,17 @@ object DeviceIdentity {
         return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .contains(KEY_PEER_PREFIX + peerId)
     }
+
+    /**
+     * The remembered identity key (Base64) for [peerId], null when unknown
+     * (pure lookup, no TOFU side effects). The group TOFU UI uses it to show
+     * a member's bound 安全码 (GroupAuth stores bindings under composite
+     * "group|<groupId>|<senderId>" keys).
+     */
+    fun peerIdent(peerId: String): String? {
+        if (peerId.isBlank()) return null
+        val ctx = appContext ?: return null
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_PEER_PREFIX + peerId, null)
+    }
 }

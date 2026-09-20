@@ -606,12 +606,15 @@ class P2PManager(
         if (name.isNotEmpty()) groupName = name
         if (announcement != null) groupAnnouncement = announcement
         if (groupName != oldName) hostServer.renameRegistration(this, oldName)
-        val packet = NetworkPacket(
-            type = "group_update",
-            groupId = groupId,
-            senderId = myId,
-            groupName = name.ifEmpty { null },
-            announcement = announcement
+        val packet = GroupAuth.signPacket(
+            NetworkPacket(
+                type = "group_update",
+                groupId = groupId,
+                senderId = myId,
+                groupName = name.ifEmpty { null },
+                announcement = announcement
+            ),
+            GroupAuth.groupUpdateParts(groupId, myId, name.ifEmpty { null }, announcement)
         )
         sendScope.launch {
             try {
@@ -635,11 +638,14 @@ class P2PManager(
         val conn = connectedClients.remove(targetId)
         if (!known && conn == null) return false
         _peers.update { it - targetId }
-        val packet = NetworkPacket(
-            type = "kick_member",
-            groupId = groupId,
-            senderId = myId,
-            targetId = targetId
+        val packet = GroupAuth.signPacket(
+            NetworkPacket(
+                type = "kick_member",
+                groupId = groupId,
+                senderId = myId,
+                targetId = targetId
+            ),
+            GroupAuth.kickParts(groupId, myId, targetId)
         )
         sendScope.launch {
             // the broadcast must not depend on the directed send: a target
@@ -1077,6 +1083,9 @@ class P2PManager(
     private fun processPacketAsClient(packet: NetworkPacket) {
         when (packet.type) {
             "chat", "file_message" -> packet.message?.let { msg ->
+                // author identity gate (TOFU) BEFORE the message reaches the
+                // list (LESSONS 2026-09-19 #3: gate listener/persistence)
+                if (!GroupAuth.verifyMessage(groupId, msg)) return
                 // idempotent insert: a member's message reaches us over the
                 // host relay AND over the mesh (whoever arrives first wins),
                 // so a plain append would show duplicate bubbles
@@ -1105,6 +1114,7 @@ class P2PManager(
                     Log.w(TAG, "reject delete_message $id from $sender: message senderId=${target.senderId}")
                     return
                 }
+                if (!GroupAuth.verifyDelete(groupId, sender, id, packet.senderPubId, packet.senderSig)) return
                 _messages.update { list -> list.filterNot { it.id == id } }
             }
             "ping" -> {
@@ -1156,11 +1166,21 @@ class P2PManager(
     }
 
     /** A relayed owner packet whose senderId is not the creator (or an unknown
-     *  creator) is ignored and the host connection dropped (fail-closed). */
+     *  creator) is ignored and the host connection dropped (fail-closed). A
+     *  signed owner packet must additionally verify against the creatorId's
+     *  remembered device key (TOFU). */
     private fun handleGroupUpdateAsClient(packet: NetworkPacket) {
         val creator = creatorId()
         if (creator.isEmpty() || packet.senderId != creator) {
             Log.w(TAG, "reject group_update from ${packet.senderId}: not the group owner ($creator)")
+            disconnectFromHost()
+            return
+        }
+        if (!GroupAuth.verifyGroupUpdate(
+                groupId, creator, packet.groupName, packet.announcement,
+                packet.senderPubId, packet.senderSig
+            )
+        ) {
             disconnectFromHost()
             return
         }
@@ -1183,6 +1203,10 @@ class P2PManager(
         val creator = creatorId()
         if (creator.isEmpty() || packet.senderId != creator) {
             Log.w(TAG, "reject kick_member from ${packet.senderId}: not the group owner ($creator)")
+            disconnectFromHost()
+            return
+        }
+        if (!GroupAuth.verifyKick(groupId, creator, packet.targetId, packet.senderPubId, packet.senderSig)) {
             disconnectFromHost()
             return
         }
@@ -1231,6 +1255,8 @@ class P2PManager(
                     Log.w(TAG, "drop invalid ${packet.type} from $senderId: senderId=${msg.senderId} contentLen=${msg.content.length}")
                     return
                 }
+                // author identity gate before the message is stored or relayed
+                if (!GroupAuth.verifyMessage(groupId, msg)) return
                 // idempotent insert (same message id can never arrive twice on
                 // the relay path, but being defensive here costs nothing)
                 _messages.update { list ->
@@ -1250,6 +1276,7 @@ class P2PManager(
                     Log.w(TAG, "reject delete_message $id from $senderId: message senderId=${target?.senderId}")
                     return
                 }
+                if (!GroupAuth.verifyDelete(groupId, senderId, id, packet.senderPubId, packet.senderSig)) return
                 _messages.update { list -> list.filterNot { it.id == id } }
                 broadcastToClients(packet, exclude = senderId)
             }
@@ -1286,6 +1313,7 @@ class P2PManager(
                     Log.w(TAG, "reject edit_message $id from $senderId: author=${target?.senderId}")
                     return
                 }
+                if (!GroupAuth.verifyEdit(groupId, senderId, id, content, packet.senderPubId, packet.senderSig)) return
                 applyEditLocal(id, content, senderId)
                 // the ViewModel persists the edit (Windows listener
                 // .message_edited parity) — without this the host's stored row
@@ -1397,7 +1425,7 @@ class P2PManager(
         mentions: List<String>? = null
     ): ChatMessage? {
         if (!isValidContent(content)) return null
-        val msg = ChatMessage(
+        var msg = ChatMessage(
             id = UUID.randomUUID().toString(),
             content = content,
             timestamp = System.currentTimeMillis(),
@@ -1409,6 +1437,9 @@ class P2PManager(
             replySender = replySender,
             mentions = mentions?.takeIf { it.isNotEmpty() }
         )
+        // author identity signature (TOFU binding, GroupAuth): no-op when this
+        // device has no identity key yet (legacy behavior)
+        msg = GroupAuth.signMessage(currentGroupId, msg)
         // Update local state synchronously so a delete issued right after the
         // send (removeMessage) can find this message immediately.
         _messages.update { it + msg }
@@ -1467,7 +1498,10 @@ class P2PManager(
         val target = _messages.value.firstOrNull { it.id == messageId }
         if (target == null || target.senderId != myId) return false
         _messages.update { list -> list.filterNot { it.id == messageId } }
-        val packet = NetworkPacket(type = "delete_message", messageId = messageId, senderId = myId)
+        val packet = GroupAuth.signPacket(
+            NetworkPacket(type = "delete_message", messageId = messageId, senderId = myId),
+            GroupAuth.deleteParts(currentGroupId, myId, messageId)
+        )
         // Network I/O must never run on the main thread: sendMessage() already
         // dispatches off the UI thread; do the same here so a UI-triggered
         // delete cannot hit NetworkOnMainThreadException and silently drop the
@@ -1493,20 +1527,29 @@ class P2PManager(
         if (!isValidContent(newContent)) return false
         val target = _messages.value.firstOrNull { it.id == messageId }
         if (target == null || target.senderId != myId) return false
+        val signedEdit = GroupAuth.signParts(
+            GroupAuth.editParts(currentGroupId, myId, messageId, newContent)
+        )
         _messages.update { list ->
             list.map {
-                if (it.id == messageId) it.copy(content = newContent, edited = true) else it
+                if (it.id == messageId) {
+                    // re-sign the local copy so mesh history pushes stay
+                    // content-signature consistent after the edit
+                    GroupAuth.signMessage(currentGroupId, it.copy(content = newContent, edited = true))
+                } else it
             }
         }
-        enqueueSend(
-            NetworkPacket(
-                type = "edit_message",
-                groupId = currentGroupId,
-                messageId = messageId,
-                senderId = myId,
-                newContent = newContent
-            )
+        var packet = NetworkPacket(
+            type = "edit_message",
+            groupId = currentGroupId,
+            messageId = messageId,
+            senderId = myId,
+            newContent = newContent
         )
+        if (signedEdit != null) {
+            packet = packet.copy(senderPubId = signedEdit.first, senderSig = signedEdit.second)
+        }
+        enqueueSend(packet)
         return true
     }
 
@@ -1562,15 +1605,26 @@ class P2PManager(
     }
 
     /** Apply an edit to the local list because an edit_message arrived (relay
-     *  or mesh path; both validated the author). Idempotent. */
-    fun applyEditLocal(messageId: String, newContent: String, senderId: String): Boolean {
+     *  or mesh path; both validated the author). Idempotent. When the verified
+     *  packet carried author identity fields, the copy adopts them so a later
+     *  mesh history push stays content-signature consistent. */
+    fun applyEditLocal(
+        messageId: String,
+        newContent: String,
+        senderId: String,
+        senderPubId: String? = null,
+        senderSig: String? = null
+    ): Boolean {
         var changed = false
         _messages.update { list ->
             list.map { msg ->
                 if (msg.id == messageId) {
                     if (msg.senderId == senderId && (msg.content != newContent || !msg.edited)) {
                         changed = true
-                        msg.copy(content = newContent, edited = true)
+                        val editedMsg = msg.copy(content = newContent, edited = true)
+                        if (!senderPubId.isNullOrBlank() && !senderSig.isNullOrBlank()) {
+                            editedMsg.copy(senderPubId = senderPubId, senderSig = senderSig)
+                        } else editedMsg
                     } else msg
                 } else msg
             }
@@ -1602,7 +1656,8 @@ class P2PManager(
             )
             return
         }
-        applyEditLocal(id, content, sender)
+        if (!GroupAuth.verifyEdit(groupId, sender, id, content, packet.senderPubId, packet.senderSig)) return
+        applyEditLocal(id, content, sender, packet.senderPubId, packet.senderSig)
         editListener?.invoke(id, content, sender)
     }
 
@@ -1770,14 +1825,17 @@ class P2PManager(
             folderTotal = folderTotal
         )
         fileServers[fileId] = server
-        val msg = ChatMessage(
-            id = fileId,
-            content = safeName,
-            timestamp = System.currentTimeMillis(),
-            senderId = myId,
-            senderName = myName,
-            fileInfo = fileInfo,
-            isFromMe = true
+        val msg = GroupAuth.signMessage(
+            currentGroupId,
+            ChatMessage(
+                id = fileId,
+                content = safeName,
+                timestamp = System.currentTimeMillis(),
+                senderId = myId,
+                senderName = myName,
+                fileInfo = fileInfo,
+                isFromMe = true
+            )
         )
         _messages.update { it + msg }
         val packet = NetworkPacket(type = "file_message", message = msg)

@@ -10,6 +10,14 @@ TCP_PORT = 9999
 # snippet so one huge quoted message cannot bloat every reply packet
 # (Android parity: Models.MAX_REPLY_PREVIEW).
 MAX_REPLY_PREVIEW = 120
+# Quoted ids/sender ids/names are sender-supplied strings inside the nested
+# quote object: capped so a crafted quote cannot bloat packets or storage
+# (Android parity: Models.MAX_QUOTE_FIELD_LEN).
+MAX_QUOTE_FIELD_LEN = 128
+# Quoted-message content kind carried by quote.quotedKind: "text" or one of
+# the file kinds. "text" is the default and is omitted on the wire so the
+# bytes match kotlinx.serialization (Android parity).
+CONTENT_KIND_TEXT = "text"
 
 
 def _strict_int(value, field: str) -> int:
@@ -68,6 +76,17 @@ MAX_EMOJI_LEN = 16
 # Omitted on the wire for video so a plain video offer stays byte-identical.
 MEDIA_AUDIO = "audio"
 MEDIA_VIDEO = "video"
+
+# Group file share area (群文件): a per-group persistent file index that is
+# separate from chat file messages. Sharing = any member (group_file_add),
+# removal = the uploader or the group owner (group_file_remove); offline
+# members converge via join_ack / history_reply groupFiles + removedIds
+# (tombstone-style, idempotent). Index and removed-tombstone caps are per
+# group; a wire list must never exceed them (Android parity: GroupFiles).
+MAX_GROUP_FILES = 500
+MAX_GROUP_FILE_REMOVED = 500
+MAX_FILE_ID_LEN = 128
+MAX_SENDER_NAME_LEN = 64
 
 # Call log direction/result vocabulary (local-only, shared with the UI and
 # storage: never sent over the wire).
@@ -131,6 +150,18 @@ def sanitize_mentions(raw) -> List[str]:
         if len(out) >= MAX_MENTIONS:
             break
     return out
+
+
+def make_quote_preview(text: str) -> str:
+    """The quoted-message snippet carried by the nested quote object
+    (quotedPreview) and the legacy flat replyPreview: newlines flattened,
+    capped at MAX_REPLY_PREVIEW CODE POINTS with a trailing ellipsis when
+    truncated (Android parity: Models.quotePreviewText). A file message with
+    no text falls back to its file name (callers pass that already)."""
+    flat = str(text or "").replace("\n", " ").strip()
+    if len(flat) <= MAX_REPLY_PREVIEW:
+        return flat
+    return flat[:MAX_REPLY_PREVIEW] + "\u2026"
 
 
 _EMOJI_MODIFIER_ORDS = frozenset((0xFE0F, 0x200D, 0x20E3, 0x2764, 0x00A9, 0x00AE, 0x2122))
@@ -323,6 +354,137 @@ class FileInfo:
 
 
 @dataclass
+class ForwardedInfo:
+    """Forward provenance carried by an optional ChatMessage.forwarded object:
+    the ORIGINAL message's sender display name, source group display name
+    (empty for a direct-chat origin) and original timestamp (0 = unknown).
+    Display-only metadata: receivers render a "转发" badge with it and never
+    trust it for authorization. Serialized with default-omitted fields so the
+    bytes match kotlinx.serialization on the Android side (Android parity:
+    Models.ForwardedInfo)."""
+
+    origin_sender: str
+    origin_group: str = ""
+    origin_time: int = 0
+
+    def to_dict(self) -> dict:
+        d = {"originSender": self.origin_sender}
+        if self.origin_group:
+            d["originGroup"] = self.origin_group
+        if self.origin_time:
+            d["originTime"] = self.origin_time
+        return d
+
+    @staticmethod
+    def from_dict(d: dict) -> "ForwardedInfo":
+        origin_time = d.get("originTime", 0)
+        try:
+            origin_time = int(origin_time)
+        except (TypeError, ValueError):
+            origin_time = 0
+        return ForwardedInfo(
+            origin_sender=str(d.get("originSender", ""))[:MAX_QUOTE_FIELD_LEN],
+            origin_group=str(d.get("originGroup", ""))[:MAX_QUOTE_FIELD_LEN],
+            origin_time=max(0, origin_time),
+        )
+
+
+def parse_forwarded(raw) -> Optional[ForwardedInfo]:
+    """Inbound forwarded provenance: a dict decodes (malformed shapes are
+    ignored -> None); anything else fails closed to None so a crafted value
+    can never break the message decode."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return ForwardedInfo.from_dict(raw)
+    except Exception:
+        return None
+
+
+def forwarded_to_json(forwarded: Optional[ForwardedInfo]) -> str:
+    """Persist [forwarded] as one compact JSON text column ("" = none). The
+    origin names are display metadata (like replySender), so the column stays
+    plaintext on both platforms (Android parity: Models.storedForwardedJson)."""
+    if forwarded is None:
+        return ""
+    try:
+        return json.dumps(forwarded.to_dict(), ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return ""
+
+
+def parse_stored_forwarded(raw: str) -> Optional[ForwardedInfo]:
+    """Inverse of forwarded_to_json for the persisted column."""
+    if not raw:
+        return None
+    try:
+        return parse_forwarded(json.loads(raw))
+    except Exception:
+        return None
+
+
+@dataclass
+class GroupFileInfo:
+    """One entry of a group's shared-file index (群文件). The metadata is
+    what every member stores and converges on; download_host/download_port/
+    file_key snapshot the uploader's offer so the entry is downloadable with
+    the SAME per-file-key AES-GCM + download-token mechanism as chat files —
+    shared files are served from the uploader's regular listener port, which
+    is stable across restarts, so the snapshot stays valid while the
+    uploader's app runs. All fields are sanitized on parse (wire input)."""
+
+    file_id: str
+    name: str
+    size: int
+    sender_id: str
+    sender_name: str = ""
+    ts: int = 0
+    download_host: str = ""
+    download_port: int = 0
+    file_key: str = ""
+
+    def to_dict(self) -> dict:
+        d = {
+            "fileId": self.file_id,
+            "name": self.name,
+            "size": self.size,
+            "senderId": self.sender_id,
+        }
+        if self.sender_name:
+            d["senderName"] = self.sender_name
+        if self.ts:
+            d["ts"] = self.ts
+        if self.download_host:
+            d["downloadHost"] = self.download_host
+        if self.download_port:
+            d["downloadPort"] = self.download_port
+        if self.file_key:
+            d["fileKey"] = self.file_key
+        return d
+
+    @staticmethod
+    def from_dict(d: dict) -> "GroupFileInfo":
+        file_id = str(d.get("fileId", ""))[:MAX_FILE_ID_LEN]
+        if not file_id:
+            raise ValueError("group file entry missing fileId")
+        sender_id = str(d.get("senderId", ""))[:MAX_MENTION_ID_LEN]
+        name = sanitize_file_name(str(d.get("name", "")))
+        if not name:
+            raise ValueError("group file entry missing name")
+        return GroupFileInfo(
+            file_id=file_id,
+            name=name,
+            size=_strict_size(d.get("size", 0), "size"),
+            sender_id=sender_id,
+            sender_name=str(d.get("senderName", ""))[:MAX_SENDER_NAME_LEN],
+            ts=_strict_int(d.get("ts", 0), "ts"),
+            download_host=str(d.get("downloadHost", "")),
+            download_port=_strict_port(d.get("downloadPort", 0), "downloadPort"),
+            file_key=str(d.get("fileKey", ""))[:128],
+        )
+
+
+@dataclass
 class ChatMessage:
     id: str
     content: str
@@ -341,12 +503,31 @@ class ChatMessage:
     reply_to: Optional[str] = None
     reply_preview: Optional[str] = None
     reply_sender: Optional[str] = None
+    # Rich quote extras (parsed from the nested wire quote object, never sent
+    # as flat fields): quote_sender is the ORIGINAL sender's device id and
+    # quote_kind the original message's content kind ("text"/file kinds) so
+    # the receiver can label media quotes and jump to the target. Both stay
+    # None when only the legacy flat triple arrived (old peer).
+    quote_sender: Optional[str] = None
+    quote_kind: Optional[str] = None
+    # Forward provenance (optional, omitted from the wire when unset so a
+    # plain message stays byte-identical): display-only "转发" badge data,
+    # see ForwardedInfo. Never used for authorization.
+    forwarded: Optional[ForwardedInfo] = None
     # Message edit: mentions is the optional list of mentioned peer ids
     # (MENTION_ALL = everyone); edited marks a message whose content was
     # changed by its author via edit_message (set by the receiver, and carried
     # on the wire only when True so a plain message stays byte-identical).
     mentions: Optional[List[str]] = None
     edited: bool = False
+    # Group sender identity binding (TOFU, see groupauth.py): the author's
+    # long-term identity public key (Base64 SPKI, same key as the direct-mode
+    # handshake) and the ECDSA signature over the group signing transcript.
+    # Optional, omitted from the wire when unset so a plain message stays
+    # byte-identical (Android parity: ChatMessage.senderPubId/senderSig).
+    # Direct chats never set them.
+    sender_pub_id: Optional[str] = None
+    sender_sig: Optional[str] = None
     # Local-only delivery state (like is_from_me, never sent over the wire):
     # true while an offline-sent message still waits in the direct chat
     # outbox for the peer to come online (Android parity).
@@ -372,10 +553,29 @@ class ChatMessage:
                 d["replyPreview"] = self.reply_preview
             if self.reply_sender is not None:
                 d["replySender"] = self.reply_sender
+            # The nested self-contained quote object (new): the legacy flat
+            # triple above still travels for mixed-version peers, which render
+            # the quote card from it. Defaults are omitted so the bytes match
+            # kotlinx.serialization (Android parity).
+            quote = {"quotedId": self.reply_to, "quotedSender": self.quote_sender or ""}
+            kind = self.quote_kind or CONTENT_KIND_TEXT
+            if kind != CONTENT_KIND_TEXT:
+                quote["quotedKind"] = kind
+            if self.reply_sender:
+                quote["quotedName"] = self.reply_sender
+            if self.reply_preview:
+                quote["quotedPreview"] = self.reply_preview
+            d["quote"] = quote
+        if self.forwarded is not None:
+            d["forwarded"] = self.forwarded.to_dict()
         if self.mentions:
             d["mentions"] = list(self.mentions)
         if self.edited:
             d["edited"] = True
+        if self.sender_pub_id:
+            d["senderPubId"] = self.sender_pub_id
+        if self.sender_sig:
+            d["senderSig"] = self.sender_sig
         return d
 
     @staticmethod
@@ -387,19 +587,48 @@ class ChatMessage:
         file_info = None
         if d.get("fileInfo") is not None:
             file_info = FileInfo.from_dict(d["fileInfo"])
-        reply_to = None if d.get("replyTo") is None else str(d["replyTo"])
-        reply_preview = (
-            None if d.get("replyPreview") is None else str(d["replyPreview"])
-        )
-        reply_sender = (
-            None if d.get("replySender") is None else str(d["replySender"])
-        )
+        # The nested quote object wins over the legacy flat triple (a mixed
+        # peer sends both): it additionally carries the original sender id and
+        # content kind. A malformed quote shape is ignored (flat fallback).
+        quote = d.get("quote")
+        quote_sender = None
+        quote_kind = None
+        if isinstance(quote, dict):
+            reply_to = str(quote.get("quotedId", "")) or None
+            reply_preview = str(quote.get("quotedPreview", "")) or None
+            reply_sender = str(quote.get("quotedName", "")) or None
+            quote_sender = str(quote.get("quotedSender", ""))[:MAX_QUOTE_FIELD_LEN] or None
+            kind = str(quote.get("quotedKind", CONTENT_KIND_TEXT))
+            quote_kind = kind if kind in (
+                CONTENT_KIND_TEXT, FILE_KIND_FILE, FILE_KIND_IMAGE,
+                FILE_KIND_VIDEO, FILE_KIND_AUDIO,
+            ) else CONTENT_KIND_TEXT
+        else:
+            reply_to = None if d.get("replyTo") is None else str(d["replyTo"])
+            reply_preview = (
+                None if d.get("replyPreview") is None else str(d["replyPreview"])
+            )
+            reply_sender = (
+                None if d.get("replySender") is None else str(d["replySender"])
+            )
+        # cap the self-contained snippet so one crafted quote cannot bloat
+        # storage or rendering
+        if reply_preview is not None:
+            reply_preview = reply_preview[:MAX_REPLY_PREVIEW]
+        if reply_sender is not None:
+            reply_sender = reply_sender[:MAX_QUOTE_FIELD_LEN]
+        if reply_to is not None:
+            reply_to = reply_to[:MAX_QUOTE_FIELD_LEN]
         mentions = sanitize_mentions(d.get("mentions"))
         edited = d.get("edited", False)
         if not isinstance(edited, bool):
             # like the typing/call flags: only a real boolean passes, so a
             # crafted "true"/1 cannot forge the edited marker
             raise ValueError("chat field edited must be a boolean")
+        # group sender identity (optional): kept as opaque strings — an
+        # overlong/garbled value simply fails signature verification
+        sender_pub_id = None if d.get("senderPubId") is None else str(d["senderPubId"])
+        sender_sig = None if d.get("senderSig") is None else str(d["senderSig"])
         return ChatMessage(
             id=msg_id,
             content=str(d.get("content", "")),
@@ -410,8 +639,13 @@ class ChatMessage:
             reply_to=reply_to,
             reply_preview=reply_preview,
             reply_sender=reply_sender,
+            quote_sender=quote_sender,
+            quote_kind=quote_kind,
+            forwarded=parse_forwarded(d.get("forwarded")),
             mentions=mentions or None,
             edited=edited,
+            sender_pub_id=sender_pub_id,
+            sender_sig=sender_sig,
         )
 
     def marked_from_me(self, my_id: str) -> "ChatMessage":
@@ -509,6 +743,11 @@ class CallInfo:
     # "audio" | "video"; empty = video (omitted on the wire so a plain video
     # offer stays byte-identical to the pre-media-field format).
     media: str = ""
+    # Group voice conference (group_call_* packets + the conference media
+    # hello): the meeting this packet belongs to. Empty for 1:1 calls and
+    # omitted on the wire, so 1:1 call packets stay byte-identical
+    # (Android parity: CallInfo.meetingId).
+    meeting_id: str = ""
 
     def to_dict(self) -> dict:
         d = {
@@ -525,6 +764,8 @@ class CallInfo:
             d["audioEnabled"] = False
         if self.media:
             d["media"] = self.media
+        if self.meeting_id:
+            d["meetingId"] = self.meeting_id
         return d
 
     @staticmethod
@@ -549,6 +790,7 @@ class CallInfo:
             accepted=accepted,
             audio_enabled=audio_enabled,
             media=media,
+            meeting_id=str(d.get("meetingId", "")),
         )
 
 
@@ -624,6 +866,31 @@ class NetworkPacket:
     # reaction packet: the emoji being toggled on/off for [message_id] by
     # [sender_id] (with [active]). Sanitized + length-capped on parse.
     emoji: Optional[str] = None
+    # Group sender identity binding (TOFU, see groupauth.py) for packets that
+    # carry an authorship claim WITHOUT a ChatMessage object (delete_message /
+    # edit_message / group_update / kick_member): the author's long-term
+    # identity public key (Base64 SPKI) plus the ECDSA signature over the
+    # packet's signing transcript. Optional, omitted when unset so a plain
+    # packet stays byte-identical (Android parity). Chat/file messages carry
+    # the same pair inside ChatMessage instead.
+    sender_pub_id: Optional[str] = None
+    sender_sig: Optional[str] = None
+    # group_file_add: the shared file's summary fields (the index data). All
+    # optional so old peers decode the packet fine and ignore it; the
+    # downloader actually fetches via the embedded fileInfo offer (same
+    # per-file key + download token mechanism as chat files).
+    name: Optional[str] = None
+    size: Optional[int] = None
+    ts: Optional[int] = None
+    # group_file_add: the uploader's display name (advisory, for the index).
+    sender_name: Optional[str] = None
+    # join_ack / history_reply convergence payload for the group file share
+    # area: groupFiles is the sender's current index (capped newest-first),
+    # removedIds the file ids removed while the receiver was away (tombstone
+    # style — mirrors deletedIds). Both omitted from the wire when empty
+    # (byte-compat with older peers).
+    group_files: Optional[List["GroupFileInfo"]] = None
+    removed_ids: Optional[List[str]] = None
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
@@ -687,6 +954,22 @@ class NetworkPacket:
             d["newContent"] = self.new_content
         if self.emoji is not None:
             d["emoji"] = self.emoji
+        if self.sender_pub_id is not None:
+            d["senderPubId"] = self.sender_pub_id
+        if self.sender_sig is not None:
+            d["senderSig"] = self.sender_sig
+        if self.name is not None:
+            d["name"] = self.name
+        if self.size is not None:
+            d["size"] = self.size
+        if self.ts is not None:
+            d["ts"] = self.ts
+        if self.sender_name is not None:
+            d["senderName"] = self.sender_name
+        if self.group_files:
+            d["groupFiles"] = [e.to_dict() for e in self.group_files]
+        if self.removed_ids:
+            d["removedIds"] = list(self.removed_ids)
         return d
 
     def to_json(self) -> str:
@@ -769,6 +1052,39 @@ class NetworkPacket:
             pkt.new_content = str(d["newContent"])
         if d.get("emoji") is not None:
             pkt.emoji = sanitize_emoji(d["emoji"])
+        if d.get("senderPubId") is not None:
+            pkt.sender_pub_id = str(d["senderPubId"])
+        if d.get("senderSig") is not None:
+            pkt.sender_sig = str(d["senderSig"])
+        if d.get("name") is not None:
+            pkt.name = str(d["name"])
+        if d.get("size") is not None:
+            pkt.size = _strict_size(d["size"], "size")
+        if d.get("ts") is not None:
+            pkt.ts = _strict_int(d["ts"], "ts")
+        if d.get("senderName") is not None:
+            pkt.sender_name = str(d["senderName"])
+        if d.get("groupFiles") is not None:
+            raw = d["groupFiles"]
+            # a list of objects is the only valid shape (the Kotlin side
+            # declares List<GroupFileInfo>?); malformed entries are skipped
+            # so one crafted entry cannot break the whole convergence packet
+            if isinstance(raw, (list, tuple)):
+                entries = []
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        entries.append(GroupFileInfo.from_dict(item))
+                    except (ValueError, TypeError):
+                        continue
+                    if len(entries) >= MAX_GROUP_FILES:
+                        break
+                pkt.group_files = entries
+        if d.get("removedIds") is not None:
+            raw = d["removedIds"]
+            if isinstance(raw, (list, tuple)):
+                pkt.removed_ids = [str(i) for i in raw]
         if pkt_type == "error" and pkt.error_message is None:
             raise ValueError("error packet missing required field: errorMessage")
         if pkt_type == "chat" and pkt.message is None:

@@ -740,6 +740,17 @@ class DeviceIdentity:
             return peer_id in cls._peers
 
     @classmethod
+    def peer_ident(cls, peer_id: str) -> str:
+        """The remembered identity key (Base64) for [peer_id], "" when unknown
+        (pure lookup, no TOFU side effects). The group TOFU UI uses it to show
+        a member's bound 安全码 (groupauth stores bindings under composite
+        "group|<groupId>|<senderId>" keys)."""
+        if not peer_id:
+            return ""
+        with cls._lock:
+            return cls._peers.get(peer_id, "")
+
+    @classmethod
     def check_peer(cls, peer_id: str, ident_b64: str, remember: bool = True) -> bool:
         """TOFU check (and first-contact remember) when [remember] is true;
         when false, an unknown peer is accepted but NOT persisted — callers

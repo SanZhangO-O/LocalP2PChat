@@ -14,6 +14,7 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from .call import CallManager
 from .crypto import random_password
 from .download_state import FileResumeStore
+from .group_call import GroupCallManager
 from .hardware import get_hardware_id, get_local_ip_address
 from .models import (
     FILE_KIND_AUDIO,
@@ -33,8 +34,17 @@ from .models import (
     sanitize_relative_path,
 )
 from . import network as network_module
+from . import groupauth
 from .network import DirectChatListener, DirectChatManager, P2PListener, P2PManager, Protocol
 from .punch import DEFAULT_SIGNALING_PORT, parse_server_endpoint
+from .qrshare import (
+    ContactInvite,
+    GroupInvite,
+    QrPayloadError,
+    encode_contact_invite,
+    encode_group_invite,
+    parse_invite,
+)
 from .securewire import DeviceIdentity
 from .storage import ChatStore, SavedCallLog, SavedGroup, to_saved_message
 
@@ -227,6 +237,12 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # conversation with the other participant); missed incoming calls also
         # surface as a system row in that conversation (Android parity).
         self.call_manager.call_finished.connect(self._on_call_finished)
+        # Group voice conference engine (audio only, star topology: the
+        # initiator hosts and mixes). Kept separate from CallManager so the
+        # 1:1 call path is untouched; the two are mutually exclusive because
+        # they share the microphone (busy_check / the start_call guards).
+        self.group_call = GroupCallManager(self)
+        self.group_call.busy_check = lambda: self.call_manager.state != "idle"
 
         # Direct member chats: members are first-class — the shared listener
         # must be reachable even with no host group, and the identity must
@@ -382,6 +398,41 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         compare it with the peer's code out-of-band (e.g. read it aloud) to
         rule out a man-in-the-middle on the first direct chat / call."""
         return DeviceIdentity.fingerprint()
+
+    def parse_qr_invite(self, text: str):
+        """Decode a scanned QR payload into a ContactInvite / GroupInvite,
+        or None when it is not a valid (current-format) invite."""
+        try:
+            return parse_invite(text)
+        except QrPayloadError:
+            return None
+
+    def qr_contact_payload(self) -> str:
+        """The contact QR this device shows: name, 安全码 and LAN endpoint.
+        The fingerprint in it lets the scanner pin TOFU before dialing."""
+        return encode_contact_invite(
+            name=self.nickname or "用户",
+            fingerprint=self.security_code,
+            ip=get_local_ip_address(),
+            port=self.port,
+        )
+
+    def qr_group_invite_payload(self) -> Optional[str]:
+        """The group invite QR for the active (hosted) group: numeric join id
+        + host endpoint + configured relay. The group password is NEVER part
+        of it — joiners still type the password themselves."""
+        if not self.active_is_host or self.active_group_id is None:
+            return None
+        group_id = self.active_group_numeric_id()
+        if not group_id:
+            return None
+        return encode_group_invite(
+            group_id=group_id,
+            name=self.active_group_name,
+            ip=get_local_ip_address(),
+            port=self.port,
+            relay=self.signaling_server,
+        )
 
     def _password_lookup(self, mode: str, group_id: Optional[str]) -> Optional[str]:
         """Resolve the group password for an incoming handshake on the shared
@@ -943,7 +994,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     def delete_direct_message(self, peer_id: str, message_id: str, sender_id: str) -> None:
         self.direct.delete_message(peer_id, message_id, sender_id)
 
-    def add_direct_contact(self, ip_port: str, name: str) -> bool:
+    def add_direct_contact(
+        self, ip_port: str, name: str, expected_fingerprint: str = ""
+    ) -> bool:
         ip, parsed_port = self._parse_host_port(ip_port)
         # validate: a syntactically broken endpoint (mangled IP, bad port)
         # used to be accepted silently — the member row then appeared in the
@@ -951,6 +1004,12 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # no effect". Reject it here; the dialog surfaces 地址无效.
         if not ip or not self._is_valid_host(ip) or not 1 <= parsed_port <= 65535:
             return False
+        if expected_fingerprint:
+            # scanned QR: pin the 安全码 the QR declared so the first
+            # handshake with this endpoint must present exactly that key
+            self.direct.set_qr_expected_fingerprint(
+                ip, parsed_port, expected_fingerprint
+            )
         contact = Peer(
             id=f"ip:{ip}:{parsed_port}",
             name=name.strip()[:MAX_NAME_LENGTH] or ip,
@@ -1051,6 +1110,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             return
         if not self.direct.is_chat_alive(peer_id):
             self.status_message.emit("未连接到该成员，无法发起通话")
+            return
+        if self.group_call.state != "idle":
+            self.status_message.emit("语音会议进行中，请先挂断会议")
             return
         self.call_manager.start_direct_call(
             channel_send=self._direct_channel(),
@@ -1656,6 +1718,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             meta = self._find_group(gid)
             name = meta.group_name if meta is not None else p2p.current_group_name
             self.call_manager.end_if_on(p2p, "已离开群组")
+            self.group_call.end_if_on(p2p, "已离开群组")
             self.group_p2p_map.pop(gid, None)
             self.persisted_peer_counts.pop(gid, None)
             self.replay_done.pop(gid, None)
@@ -2115,6 +2178,19 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         p2p = self._active_p2p()
         return dict(p2p.peers) if p2p is not None else {}
 
+    def group_member_verified(self, group_id: Optional[str], peer_id: str) -> bool:
+        """True when the member has a TOFU-bound device identity in this group
+        (it has sent at least one validly signed packet). UI only."""
+        if not group_id or not peer_id:
+            return False
+        return groupauth.member_verified(group_id, peer_id)
+
+    def group_member_fingerprint(self, group_id: Optional[str], peer_id: str) -> str:
+        """The member's bound 安全码 ("" when unbound). UI only."""
+        if not group_id or not peer_id:
+            return ""
+        return groupauth.member_fingerprint(group_id, peer_id)
+
     def active_host_peer(self) -> Optional[Peer]:
         """The active group's host (creator) as a member entry: for a host
         group that is this device itself (never inside active_peers); for a
@@ -2278,6 +2354,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             hardware_id=self._hardware_fingerprint(),
         )
         self.call_manager.attach(p2p)
+        self.group_call.attach(p2p)
         # join_acks carry the group's delete tombstones (convergence)
         p2p.deleted_ids_provider = self.store.get_deleted_ids
         p2p.initialize_as_host(nick, name, password)
@@ -2293,6 +2370,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         old = self.group_p2p_map.pop(group_id, None)
         if old is not None:
             self.call_manager.end_if_on(old, "通话已结束")
+            self.group_call.end_if_on(old, "通话已结束")
             old.stop()
         self.store.set_group_password(group_id, password)
         # a re-created same-id group is a fresh one: no announcement, and a
@@ -2388,6 +2466,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             self, port=self.port, device_id=self._device_id(), hardware_id=self._hardware_fingerprint()
         )
         self.call_manager.attach(p2p)
+        self.group_call.attach(p2p)
         p2p.initialize_as_client(nick, "", password)
         p2p.set_join_id(join_id)
         self._attach_admin_hooks(p2p)
@@ -2487,6 +2566,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             self, port=self.port, device_id=self._device_id(), hardware_id=self._hardware_fingerprint()
         )
         self.call_manager.attach(p2p)
+        self.group_call.attach(p2p)
         p2p.initialize_as_client(nick, "", password)
         p2p.set_join_id(join_id)
         self._attach_admin_hooks(p2p)
@@ -2592,6 +2672,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             self, port=self.port, device_id=self._device_id(), hardware_id=self._hardware_fingerprint()
         )
         self.call_manager.attach(p2p)
+        self.group_call.attach(p2p)
         p2p.initialize_as_client(
             sg.my_name or "用户",
             sg.group_name,
@@ -2615,6 +2696,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         old = self.group_p2p_map.pop(gid, None)
         if old is not None:
             self.call_manager.end_if_on(old, "连接已断开")
+            self.group_call.end_if_on(old, "连接已断开")
             old.stop()
         meta = self._find_group(gid)
         if meta is not None:
@@ -2634,6 +2716,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         p2p = self.group_p2p_map.pop(gid, None)
         if p2p is not None:
             self.call_manager.end_if_on(p2p, "通话已结束")
+            self.group_call.end_if_on(p2p, "通话已结束")
             p2p.stop()
         self._teardown_group_mesh(gid)
         # Leaving stops this group's server; the group stays in the list and
@@ -2664,6 +2747,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         p2p = self.group_p2p_map.pop(group_id, None)
         if p2p is not None:
             self.call_manager.end_if_on(p2p, "通话已结束")
+            self.group_call.end_if_on(p2p, "通话已结束")
             p2p.stop()
         self._teardown_group_mesh(group_id)
         self.removed_group_ids.add(group_id)
@@ -3169,6 +3253,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         if p2p is None or p2p.connection_lost:
             self.status_message.emit("未连接到群组，无法发起通话")
             return
+        if self.group_call.state != "idle":
+            self.status_message.emit("语音会议进行中，请先挂断会议")
+            return
         self.call_manager.start_call(p2p, peer_id, media=media)
 
     def accept_call(self) -> None:
@@ -3185,6 +3272,33 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
 
     def toggle_video_muted(self, muted: bool) -> None:
         self.call_manager.set_video_muted(muted)
+
+    # -------------------------------------------------- group voice meeting
+
+    def start_group_call(self) -> None:
+        """Start a group voice conference in the active group (this device
+        becomes the meeting host / mixer)."""
+        gid = self.active_group_id
+        if gid is None:
+            self.status_message.emit("请先进入一个群组")
+            return
+        p2p = self.group_p2p_map.get(gid)
+        if p2p is None or p2p.connection_lost:
+            self.status_message.emit("未连接到群组，无法发起语音会议")
+            return
+        self.group_call.start_meeting(p2p)
+
+    def accept_group_call(self) -> None:
+        self.group_call.accept_invite()
+
+    def decline_group_call(self) -> None:
+        self.group_call.decline_invite()
+
+    def hangup_group_call(self) -> None:
+        self.group_call.leave_meeting()
+
+    def toggle_group_call_muted(self, muted: bool) -> None:
+        self.group_call.set_audio_muted(muted)
 
     def clear_unread(self, group_id: str) -> None:
         meta = self._find_group(group_id)
@@ -3364,6 +3478,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         gid = p2p.current_group_id
         # a call riding this connection cannot continue without signaling
         self.call_manager.end_if_on(p2p, "连接已断开")
+        self.group_call.end_if_on(p2p, "连接已断开")
         if gid:
             with self._lock:
                 meta = self._find_group(gid)
@@ -3514,6 +3629,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     def shutdown(self) -> None:
         self._shutdown_done = True
         self.call_manager.hangup()
+        self.group_call.leave_meeting()
         if self.pending_p2p is not None:
             self.pending_p2p.stop()
         for p2p in self.group_p2p_map.values():

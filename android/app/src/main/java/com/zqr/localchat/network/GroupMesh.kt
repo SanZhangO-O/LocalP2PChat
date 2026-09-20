@@ -250,7 +250,10 @@ object GroupMeshManager {
         synchronized(state) {
             state.messages.value = state.messages.value.filterNot { it.id == messageId }
         }
-        val packet = NetworkPacket(type = "delete_message", messageId = messageId, senderId = myId)
+        val packet = GroupAuth.signPacket(
+            NetworkPacket(type = "delete_message", messageId = messageId, senderId = myId),
+            GroupAuth.deleteParts(groupId, myId, messageId)
+        )
         val links = state.links.values.toList()
         thread(name = "mesh-delete") {
             links.forEach { link ->
@@ -287,13 +290,19 @@ object GroupMeshManager {
     fun broadcastEdit(groupId: String, messageId: String, newContent: String) {
         val state = groups[groupId] ?: return
         val myId = state.myPeer?.id ?: return
-        updateMeshMessage(groupId, messageId, newContent, myId)
-        val packet = NetworkPacket(
-            type = "edit_message",
-            groupId = groupId,
-            messageId = messageId,
-            senderId = myId,
-            newContent = newContent
+        val packet = GroupAuth.signPacket(
+            NetworkPacket(
+                type = "edit_message",
+                groupId = groupId,
+                messageId = messageId,
+                senderId = myId,
+                newContent = newContent
+            ),
+            GroupAuth.editParts(groupId, myId, messageId, newContent)
+        )
+        updateMeshMessage(
+            groupId, messageId, newContent, myId,
+            packet.senderPubId, packet.senderSig
         )
         val links = state.links.values.toList()
         sendExecutor.execute {
@@ -363,16 +372,31 @@ object GroupMeshManager {
     }
 
     /** Apply an edit to this member's mesh history copy (author-validated by
-     *  the caller), so a later history push carries the new text. */
-    fun updateMeshMessage(groupId: String, messageId: String, newContent: String, senderId: String): Boolean {
+     *  the caller), so a later history push carries the new text. When the
+     *  verified packet carried author identity fields, the copy adopts them. */
+    fun updateMeshMessage(
+        groupId: String,
+        messageId: String,
+        newContent: String,
+        senderId: String,
+        senderPubId: String? = null,
+        senderSig: String? = null
+    ): Boolean {
         val state = groups[groupId] ?: return false
         synchronized(state) {
             val messages = state.messages.value
-            val target = messages.firstOrNull { it.id == messageId }
-            if (target == null || target.senderId != senderId) return false
+            val target = messages.firstOrNull { it.id == messageId } ?: return false
+            if (target.senderId != senderId) return false
+            var replacement = target
             if (target.content != newContent || !target.edited) {
+                replacement = replacement.copy(content = newContent, edited = true)
+            }
+            if (!senderPubId.isNullOrBlank() && !senderSig.isNullOrBlank()) {
+                replacement = replacement.copy(senderPubId = senderPubId, senderSig = senderSig)
+            }
+            if (replacement != target) {
                 state.messages.value = messages.map {
-                    if (it.id == messageId) it.copy(content = newContent, edited = true) else it
+                    if (it.id == messageId) replacement else it
                 }
             }
         }
@@ -659,26 +683,33 @@ object GroupMeshManager {
                         // gets the same sender validation as plain chat
                         if (msg.senderId != link.peerId || !P2PManager.isValidContent(msg.content)) {
                             Log.w(TAG, "drop ${packet.type} on link ${link.peerId}: senderId=${msg.senderId} len=${msg.content.length}")
-                        } else {
-                            handleIncoming(state, P2PManager.markFromMe(msg.withSanitizedExtras(), state.myPeer?.id ?: ""))
+                            return@let
                         }
+                        // author identity gate (TOFU) BEFORE the message is
+                        // merged or any listener fires
+                        if (!GroupAuth.verifyMessage(state.groupId, msg)) return@let
+                        handleIncoming(state, P2PManager.markFromMe(msg.withSanitizedExtras(), state.myPeer?.id ?: ""))
                     }
                     "delete_message" -> {
                         // a delete arrives on the author's own link; the claimed
-                        // sender is validated against the message's author in
-                        // handleDeleteIncoming
+                        // sender is validated against the message's author and
+                        // its device signature (TOFU) in handleDeleteIncoming
                         val id = packet.messageId
                         val sender = packet.senderId
                         if (id != null && sender != null) {
-                            handleDeleteIncoming(state, id, sender)
+                            handleDeleteIncoming(state, id, sender, packet.senderPubId, packet.senderSig)
                         }
                     }
                     "history_reply" -> {
                         // 历史里合法包含多个发送者的消息，但每条仍须形状
                         // 合法：senderId 非空白且内容不超限（与 Windows 端
-                        // 过滤一致），防止伪造 senderId 注入或超长内容入库
+                        // 过滤一致），防止伪造 senderId 注入或超长内容入库；
+                        // 每条还须通过作者设备签名校验（TOFU）才可入历史
                         val incoming = packet.messages.orEmpty()
-                            .filter { it.senderId.isNotBlank() && P2PManager.isValidContent(it.content) }
+                            .filter {
+                                it.senderId.isNotBlank() && P2PManager.isValidContent(it.content) &&
+                                    GroupAuth.verifyMessage(state.groupId, it)
+                            }
                         // Same rule as the Windows client: a batch entry
                         // reusing a locally-known id with DIFFERENT content is
                         // a forged overwrite UNLESS the author pushes its OWN
@@ -790,10 +821,10 @@ object GroupMeshManager {
 
     /** Apply a mesh-received edit locally: update this member's mesh history
      *  copy and relay to the ViewModel. Only the linked member may edit as
-     *  itself, and only its own message (stricter than the mesh delete rule:
-     *  content rewrites demand the author on the authoring link). No
-     *  forwarding: the sender's broadcast already reached every link of the
-     *  complete graph. */
+     *  itself, only its own message (stricter than the mesh delete rule:
+     *  content rewrites demand the author on the authoring link), and the
+     *  author's device signature must verify (TOFU). No forwarding: the
+     *  sender's broadcast already reached every link of the complete graph. */
     private fun handleEditIncoming(state: GroupState, link: Link, packet: NetworkPacket) {
         val id = packet.messageId
         val content = packet.newContent
@@ -803,7 +834,10 @@ object GroupMeshManager {
             Log.w(TAG, "reject mesh edit $id: senderId=$sender on link ${link.peerId}")
             return
         }
-        if (!updateMeshMessage(state.groupId, id, content, sender)) {
+        if (!GroupAuth.verifyEdit(state.groupId, sender, id, content, packet.senderPubId, packet.senderSig)) {
+            return
+        }
+        if (!updateMeshMessage(state.groupId, id, content, sender, packet.senderPubId, packet.senderSig)) {
             Log.w(TAG, "reject mesh edit $id: message not found or not authored by $sender")
             return
         }
@@ -813,15 +847,25 @@ object GroupMeshManager {
     /** Apply a mesh-received delete locally: remove the message from this
      *  group's mesh state and relay it to the ViewModel so the owning group's
      *  list + database follow. Only the original sender may delete (same
-     *  authorization as the host relay); a duplicate delete for an already
-     *  removed message is ignored. No forwarding: the mesh links every member
-     *  pair directly (the sender's broadcast already reaches everyone), and
-     *  relaying would only create a delete storm through the complete graph. */
-    private fun handleDeleteIncoming(state: GroupState, messageId: String, senderId: String) {
+     *  authorization as the host relay) and its device signature must verify
+     *  (TOFU); a duplicate delete for an already removed message is ignored.
+     *  No forwarding: the mesh links every member pair directly (the sender's
+     *  broadcast already reaches everyone), and relaying would only create a
+     *  delete storm through the complete graph. */
+    private fun handleDeleteIncoming(
+        state: GroupState,
+        messageId: String,
+        senderId: String,
+        senderPubId: String? = null,
+        senderSig: String? = null
+    ) {
         val target = state.messages.value.firstOrNull { it.id == messageId }
         if (target == null) return
         if (target.senderId != senderId) {
             Log.w(TAG, "reject delete_message $messageId: message senderId=${target.senderId} != claimed $senderId")
+            return
+        }
+        if (!GroupAuth.verifyDelete(state.groupId, senderId, messageId, senderPubId, senderSig)) {
             return
         }
         synchronized(state) {
@@ -896,9 +940,10 @@ object GroupMeshManager {
     }
 
     /** Owner management packet over a mesh link: only the group creator may
-     *  originate it (senderId must match the persisted creator id), otherwise
-     *  the link is dropped. Applied packets are handed to the ViewModel and
-     *  never re-forwarded. */
+     *  originate it (senderId must match the persisted creator id, and a
+     *  signed packet must verify against the creatorId's remembered device
+     *  key — TOFU), otherwise the link is dropped. Applied packets are handed
+     *  to the ViewModel and never re-forwarded. */
     private fun handleAdminIncoming(state: GroupState, link: Link, packet: NetworkPacket) {
         val creator = creatorIdProvider?.invoke(state.groupId).orEmpty()
         if (creator.isEmpty() || packet.senderId != creator) {
@@ -906,6 +951,21 @@ object GroupMeshManager {
                 TAG,
                 "reject ${packet.type} on mesh link ${link.peerId}: senderId=${packet.senderId} is not the creator ($creator)"
             )
+            link.alive = false
+            closeSocket(link.socket)
+            return
+        }
+        val verified = if (packet.type == "group_update") {
+            GroupAuth.verifyGroupUpdate(
+                state.groupId, creator, packet.groupName, packet.announcement,
+                packet.senderPubId, packet.senderSig
+            )
+        } else {
+            GroupAuth.verifyKick(
+                state.groupId, creator, packet.targetId, packet.senderPubId, packet.senderSig
+            )
+        }
+        if (!verified) {
             link.alive = false
             closeSocket(link.socket)
             return
