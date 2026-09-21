@@ -1,6 +1,18 @@
 from PyQt6.QtCore import QEvent, Qt, QTimer
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
-from PyQt6.QtWidgets import QApplication, QMainWindow, QMenu, QStackedWidget, QSystemTrayIcon
+from PyQt6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
+    QFrame,
+    QHBoxLayout,
+    QMainWindow,
+    QMenu,
+    QPushButton,
+    QStackedWidget,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
 
 from ..view_model import ChatViewModel
 from .call_window import CallWindow, IncomingCallDialog
@@ -24,6 +36,31 @@ PAGE_MEMBERS = 4
 PAGE_DIRECT = 5
 PAGE_SETTINGS = 6
 PAGE_SEARCH = 7
+
+NAV_MEMBERS = "members"
+NAV_GROUPS = "groups"
+NAV_SEARCH = "search"
+NAV_SETTINGS = "settings"
+
+# every stack page highlights one global nav entry: the member home and the
+# 1:1 chats belong to 成员, the group flow (list/lobby/chat/join) to 群组
+NAV_BY_PAGE = {
+    PAGE_MEMBERS: NAV_MEMBERS,
+    PAGE_DIRECT: NAV_MEMBERS,
+    PAGE_GROUPS: NAV_GROUPS,
+    PAGE_SETUP: NAV_GROUPS,
+    PAGE_LOBBY: NAV_GROUPS,
+    PAGE_CHAT: NAV_GROUPS,
+    PAGE_SEARCH: NAV_SEARCH,
+    PAGE_SETTINGS: NAV_SETTINGS,
+}
+
+NAV_ENTRIES = (
+    (NAV_MEMBERS, "成员", "直聊成员（首页）"),
+    (NAV_GROUPS, "群组", "群组列表"),
+    (NAV_SEARCH, "搜索", "搜索聊天记录"),
+    (NAV_SETTINGS, "设置", "应用设置"),
+)
 
 
 def app_icon_pixmap(size: int = 64) -> QPixmap:
@@ -55,10 +92,22 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(720, 520)
 
         self.stack = QStackedWidget(self)
-        self.setCentralWidget(self.stack)
+        self._setup_nav_bar()
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        container_layout.addWidget(self.nav_bar)
+        container_layout.addWidget(self.stack, 1)
+        self.setCentralWidget(container)
 
         self.pages = {}
-        self.pages[PAGE_GROUPS] = GroupListPage(vm, self._go_setup, on_open_members=self._go_members)
+        self.pages[PAGE_GROUPS] = GroupListPage(
+            vm,
+            self._go_setup,
+            on_open_members=self._go_members,
+            on_open_search=self._go_search,
+        )
         self.pages[PAGE_GROUPS].on_open_group = self._go_lobby
         self.pages[PAGE_GROUPS].on_open_settings = self._go_settings
         self.pages[PAGE_SETUP] = SetupPage(vm, self._go_groups, self._on_group_entered)
@@ -100,8 +149,48 @@ class MainWindow(QMainWindow):
         self._setup_group_call_ui()
         # member-first: the home page is the member list
         self._go_members()
+        self.stack.currentChanged.connect(self._sync_nav)
+        self._sync_nav()
 
         QTimer.singleShot(300, self._check_host_hint)
+
+    def _setup_nav_bar(self):
+        """Global navigation strip above every page: 成员 / 群组 / 搜索 / 设置
+        are reachable from anywhere without back-tracking through the flow."""
+        self.nav_bar = QFrame()
+        self.nav_bar.setObjectName("navBar")
+        nav_layout = QHBoxLayout(self.nav_bar)
+        nav_layout.setContentsMargins(16, 6, 16, 6)
+        nav_layout.setSpacing(6)
+        self.nav_buttons = {}
+        self.nav_group = QButtonGroup(self)
+        self.nav_group.setExclusive(True)
+        for key, label, tip in NAV_ENTRIES:
+            btn = QPushButton(label)
+            btn.setObjectName("navButton")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.clicked.connect(lambda checked=False, k=key: self._nav_go(k))
+            self.nav_group.addButton(btn)
+            self.nav_buttons[key] = btn
+            nav_layout.addWidget(btn)
+        nav_layout.addStretch(1)
+
+    def _sync_nav(self, _index=None):
+        key = NAV_BY_PAGE.get(self.stack.currentIndex())
+        for nav_key, btn in self.nav_buttons.items():
+            btn.setChecked(nav_key == key)
+
+    def _nav_go(self, key):
+        if key == NAV_MEMBERS:
+            self._go_members()
+        elif key == NAV_GROUPS:
+            self._go_groups()
+        elif key == NAV_SEARCH:
+            self._go_search()
+        elif key == NAV_SETTINGS:
+            self._go_settings()
 
     def _setup_call_ui(self):
         cm = self.vm.call_manager

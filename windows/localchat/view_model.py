@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import shutil
@@ -6,13 +7,13 @@ import socket
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from .call import CallManager
-from .crypto import random_password
+from .crypto import KEY_LEN, random_bytes, random_password, to_b64
 from .download_state import FileResumeStore
 from .group_call import GroupCallManager
 from .hardware import get_hardware_id, get_local_ip_address
@@ -26,6 +27,8 @@ from .models import (
     ChatMessage,
     ContactRequest,
     FileInfo,
+    ForwardedInfo,
+    GroupFileInfo,
     GroupInfo,
     NetworkPacket,
     Peer,
@@ -46,7 +49,15 @@ from .qrshare import (
     parse_invite,
 )
 from .securewire import DeviceIdentity
-from .storage import ChatStore, SavedCallLog, SavedGroup, to_saved_message
+from .storage import (
+    ChatStore,
+    SavedCallLog,
+    SavedGroup,
+    SavedGroupFile,
+    to_saved_message,
+)
+
+logger = logging.getLogger(__name__)
 
 # Display-name cap for nicknames, group names and contact remarks — Android
 # parity (20 chars). Enforced by truncation here plus QLineEdit.maxLength in
@@ -142,6 +153,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # group read receipt was applied or removed): carries the conversation
     # key (group id or "direct:<peer_id>") so the open page re-renders.
     extras_changed = pyqtSignal(str)
+    # A group's shared-file index (群文件) changed (a file was shared, removed
+    # or convergence applied): carries the group id so the share page reloads.
+    group_files_changed = pyqtSignal(str)
 
     # Burst window in ms: incoming notifications within this span are merged
     # into a single tray bubble instead of one popup per message.
@@ -251,6 +265,8 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.direct.attach(self)
         self.host_server.direct_manager = self.direct
         self.host_server.ensure_running()
+        # re-serve group files this device uploaded before a restart
+        self._restore_shared_files()
         self._direct_persisted_ids: Dict[str, set] = {}
         self._direct_pending: Dict[str, Dict[str, bool]] = {}
         # Own direct messages' persisted read state (peer read_receipts):
@@ -279,6 +295,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # history pushes carry the group's delete tombstones so members that
         # were offline during a delete converge instead of resurrecting it
         self.mesh.deleted_ids_provider = self.store.get_deleted_ids
+        # group file share area (群文件): history pushes carry the group's
+        # share index and removal tombstones so an offline member converges
+        self.mesh.group_files_provider = self.store.get_group_files
+        self.mesh.removed_file_ids_provider = self.store.get_removed_group_file_ids
         # owner management packets (group_update / kick_member) are only
         # accepted over a mesh link when senderId is the group's creator
         self.mesh.creator_id_provider = lambda gid: self.store.get_setting(
@@ -975,6 +995,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         reply_to: Optional[str] = None,
         reply_preview: Optional[str] = None,
         reply_sender: Optional[str] = None,
+        forwarded: Optional[ForwardedInfo] = None,
     ) -> bool:
         # peers are first-class: a message may queue as pending while the peer
         # is offline and deliver automatically once it comes online (Android
@@ -985,6 +1006,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             reply_to=reply_to,
             reply_preview=reply_preview,
             reply_sender=reply_sender,
+            forwarded=forwarded,
         )
         if sent:
             # the message supersedes any "typing" we were showing
@@ -1512,6 +1534,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             p2p.merge_incoming(msgs)
 
     def group_mesh_links_changed(self, group_id: str) -> None:
+        # a mesh link came up: flush any ops staged while fully offline
+        if self.mesh.has_links(group_id):
+            self._replay_pending_ops(group_id)
         if group_id == self.active_group_id:
             self.active_connection_lost_changed.emit()
 
@@ -1583,6 +1608,101 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
 
     def group_mesh_read_receipt(self, group_id: str, reader_id: str, up_to_id: str) -> None:
         self._apply_group_read_receipt(group_id, reader_id, up_to_id)
+
+    # ------------------------------------------------- group file share (群文件)
+    # The relay/mesh layers already bound the claimed senderId to the
+    # authenticated connection; these callbacks persist the convergence and
+    # refresh the UI. Removal authorization (uploader or group owner) is
+    # re-checked here against the STORED entry, and the return value gates the
+    # relay's rebroadcast (LESSONS 2026-09-19 #3: a rejected packet must
+    # neither persist nor propagate).
+
+    def group_file_add_received(self, p2p: P2PManager, entry: GroupFileInfo) -> None:
+        gid = p2p.current_group_id
+        if gid:
+            self._apply_group_file_add(gid, entry)
+
+    def group_mesh_group_file_add(self, group_id: str, entry: GroupFileInfo) -> None:
+        self._apply_group_file_add(group_id, entry)
+
+    def group_file_remove_received(
+        self, p2p: P2PManager, file_id: str, sender_id: str
+    ) -> bool:
+        gid = p2p.current_group_id
+        return bool(gid) and self._apply_group_file_remove(gid, file_id, sender_id)
+
+    def group_mesh_group_file_remove(
+        self, group_id: str, file_id: str, sender_id: str
+    ) -> bool:
+        return self._apply_group_file_remove(group_id, file_id, sender_id)
+
+    def group_files_received(self, p2p: P2PManager, entries, removed_ids) -> None:
+        gid = p2p.current_group_id
+        if gid:
+            self._apply_group_files_convergence(gid, entries, removed_ids)
+
+    def group_mesh_group_files(self, group_id: str, entries, removed_ids) -> None:
+        self._apply_group_files_convergence(group_id, entries, removed_ids)
+
+    @staticmethod
+    def _saved_group_file(group_id: str, entry: GroupFileInfo) -> SavedGroupFile:
+        """Wire entry -> storage row (no local source: receivers never serve)."""
+        return SavedGroupFile(
+            group_id=group_id,
+            file_id=entry.file_id,
+            name=entry.name,
+            size=entry.size,
+            sender_id=entry.sender_id,
+            sender_name=entry.sender_name,
+            ts=entry.ts,
+            download_host=entry.download_host,
+            download_port=entry.download_port,
+            file_key=entry.file_key,
+        )
+
+    def _group_creator_id(self, group_id: str) -> str:
+        p2p = self.group_p2p_map.get(group_id)
+        if p2p is not None and p2p.is_host:
+            return p2p.my_id
+        return self.store.get_setting(f"group_creator_id_{group_id}", "")
+
+    def _apply_group_file_add(self, group_id: str, entry: GroupFileInfo) -> None:
+        with self._lock:
+            self.store.upsert_group_file(self._saved_group_file(group_id, entry))
+        self.group_files_changed.emit(group_id)
+
+    def _apply_group_file_remove(self, group_id: str, file_id: str, sender_id: str) -> bool:
+        with self._lock:
+            entry = self.store.get_group_file(group_id, file_id)
+        if entry is None:
+            # unknown / already removed: never authorize a no-op rebroadcast
+            return False
+        if not network_module.can_remove_group_file(
+            sender_id, entry.sender_id, self._group_creator_id(group_id)
+        ):
+            return False
+        with self._lock:
+            self.store.record_removed_group_files(group_id, [file_id])
+        # our own share: stop serving the bytes too
+        if entry.local_path:
+            try:
+                self.host_server.unregister_shared_file(file_id)
+            except Exception:
+                pass
+        self.group_files_changed.emit(group_id)
+        return True
+
+    def _apply_group_files_convergence(self, group_id: str, entries, removed_ids) -> None:
+        """join_ack / history_reply share-area convergence: apply the removal
+        tombstones FIRST, then the index entries (a tombstoned id stays hidden
+        so a removed file never resurrects). No rebroadcast."""
+        removed = [str(i) for i in removed_ids or [] if i]
+        with self._lock:
+            if removed:
+                self.store.record_removed_group_files(group_id, removed)
+            for entry in entries or []:
+                self.store.upsert_group_file(self._saved_group_file(group_id, entry))
+        self.group_files_changed.emit(group_id)
 
     def direct_message_edited(self, peer_id: str, message_id: str, new_content: str) -> None:
         # the network layer only reports an edit its author check accepted;
@@ -1849,6 +1969,11 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             return self.store.get_setting(f"group_creator_id_{gid}", "")
 
         p2p.creator_id_provider = creator
+
+        # group file share area (群文件): join_ack carries this group's share
+        # index and removal tombstones so a rejoining member converges
+        p2p.group_files_provider = self.store.get_group_files
+        p2p.removed_file_ids_provider = self.store.get_removed_group_file_ids
 
         def forward(packet) -> None:
             gid = packet.group_id or p2p.current_group_id or ""
@@ -2777,6 +2902,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         reply_preview: Optional[str] = None,
         reply_sender: Optional[str] = None,
         mentions: Optional[List[str]] = None,
+        forwarded: Optional[ForwardedInfo] = None,
     ) -> bool:
         if not content.strip():
             return False
@@ -2794,6 +2920,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             reply_preview=reply_preview,
             reply_sender=reply_sender,
             mentions=mentions,
+            forwarded=forwarded,
         )
         if msg is not None:
             self.mesh.broadcast(gid, msg)
@@ -2801,13 +2928,15 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             self._end_active_typing(gid)
         return True
 
-    def send_message_to_group(self, group_id: str, content: str) -> bool:
+    def send_message_to_group(
+        self, group_id: str, content: str, forwarded: Optional[ForwardedInfo] = None
+    ) -> bool:
         if not content.strip():
             return False
         p2p = self.group_p2p_map.get(group_id)
         if p2p is None or (p2p.connection_lost and not self.mesh.has_links(group_id)):
             return False
-        msg = p2p.send_message(content)
+        msg = p2p.send_message(content, forwarded=forwarded)
         if msg is not None:
             self.mesh.broadcast(group_id, msg)
             self._end_active_typing(group_id)
@@ -2832,11 +2961,70 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
 
     # ------------------------------------------------------- message experience
 
+    def _stage_pending_op(
+        self,
+        scope: str,
+        kind: str,
+        message_id: str,
+        emoji: str = "",
+        active: bool = False,
+        content: str = "",
+    ) -> None:
+        """Park one offline message-experience op (edit/reaction/pin) in the
+        durable log; replayed in order once the conversation is reachable
+        again. Idempotent by (scope, kind, messageId, emoji) in the store."""
+        try:
+            with self._lock:
+                self.store.stage_pending_op(
+                    scope, kind, message_id, emoji=emoji, active=active, content=content
+                )
+        except Exception:
+            logger.warning("stage pending op failed", exc_info=True)
+
+    def _replay_pending_ops(self, group_id: str) -> None:
+        """Replay a group's staged ops in staging order now that it is
+        reachable. Each op is dropped after the attempt: applied+handed off,
+        or permanently dead (target gone) — it must never loop forever."""
+        p2p = self.group_p2p_map.get(group_id)
+        if p2p is None:
+            return
+        if p2p.connection_lost and not self.mesh.has_links(group_id):
+            return
+        try:
+            ops = self.store.get_pending_ops(group_id)
+        except Exception:
+            return
+        for op in ops:
+            ok = False
+            try:
+                if op.kind == "edit":
+                    ok = p2p.edit_message(op.message_id, op.content)
+                    if ok:
+                        self.mesh.broadcast_edit(group_id, op.message_id, op.content)
+                elif op.kind == "reaction":
+                    ok = p2p.send_reaction(op.message_id, op.emoji, op.active)
+                    if ok:
+                        self.mesh.broadcast_reaction(
+                            group_id, op.message_id, op.emoji, op.active
+                        )
+                elif op.kind == "pin":
+                    ok = p2p.send_pin(op.message_id, op.active)
+                    if ok:
+                        self.mesh.broadcast_pin(group_id, op.message_id, op.active)
+            except Exception:
+                ok = False
+            try:
+                with self._lock:
+                    self.store.delete_pending_op(op.op_id)
+            except Exception:
+                pass
+
     def edit_message(self, message_id: str, new_content: str) -> bool:
         """Edit one of OUR text messages in the active group: apply locally,
         relay, and mirror over the mesh (a member offline now converges via
         the mesh history push, whose merge accepts author-consistent
-        rewrites)."""
+        rewrites). With no live path at all the edit is staged and replayed
+        on reconnect."""
         gid = self.active_group_id
         if gid is None:
             return False
@@ -2848,33 +3036,52 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.mesh.broadcast_edit(gid, message_id, new_content)
         with self._lock:
             self.store.update_message_content(gid, message_id, new_content)
+        if p2p.connection_lost and not self.mesh.has_links(gid):
+            self._stage_pending_op(gid, "edit", message_id, content=new_content)
         return True
 
     def toggle_group_reaction(self, message_id: str, emoji: str, active: bool) -> bool:
         """Toggle OUR emoji reaction on a group message (relay + mesh mirror,
-        both advisory). Local store follows immediately."""
+        both advisory). Local store follows immediately. An op that cannot be
+        handed to any live path is staged and replayed on reconnect
+        (idempotent: re-applying the same active state is a no-op)."""
         gid = self.active_group_id
         if gid is None:
             return False
         p2p = self.group_p2p_map.get(gid)
         if p2p is None:
             return False
-        sent = p2p.send_reaction(message_id, emoji, active)
+
+        def on_failed() -> None:
+            self._stage_pending_op(
+                gid, "reaction", message_id, emoji=emoji, active=active
+            )
+
+        sent = p2p.send_reaction(message_id, emoji, active, on_failed=on_failed)
         self.mesh.broadcast_reaction(gid, message_id, emoji, active)
         self._apply_reaction(gid, message_id, emoji, p2p.my_id, active)
+        if not sent and not self.mesh.has_links(gid):
+            on_failed()
         return sent or self.mesh.has_links(gid)
 
     def toggle_group_pin(self, message_id: str, active: bool) -> bool:
-        """Pin/unpin a group message (any member; relay + mesh mirror)."""
+        """Pin/unpin a group message (any member; relay + mesh mirror). Same
+        offline staging contract as toggle_group_reaction."""
         gid = self.active_group_id
         if gid is None:
             return False
         p2p = self.group_p2p_map.get(gid)
         if p2p is None:
             return False
-        sent = p2p.send_pin(message_id, active)
+
+        def on_failed() -> None:
+            self._stage_pending_op(gid, "pin", message_id, active=active)
+
+        sent = p2p.send_pin(message_id, active, on_failed=on_failed)
         self.mesh.broadcast_pin(gid, message_id, active)
         self._apply_pin(gid, message_id, p2p.my_id, active)
+        if not sent and not self.mesh.has_links(gid):
+            on_failed()
         return sent or self.mesh.has_links(gid)
 
     def notify_group_read_receipt(self) -> None:
@@ -2978,6 +3185,218 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.mesh.broadcast(gid, msg)
         self._mirror_own_media(msg, path)
         return True
+
+    # ------------------------------------------------- group file share (群文件)
+
+    def group_files(self, group_id: Optional[str] = None) -> List[SavedGroupFile]:
+        """The group's shared-file index (newest first) for the UI/history
+        providers. Tombstoned entries are already filtered out."""
+        gid = self.active_group_id if group_id is None else group_id
+        if not gid:
+            return []
+        return self.store.get_group_files(gid)
+
+    def can_remove_shared_file(self, entry: SavedGroupFile) -> bool:
+        """True when THIS device may remove [entry] (uploader or group owner);
+        the UI hides the action otherwise."""
+        return network_module.can_remove_group_file(
+            self.my_device_id, entry.sender_id, self._group_creator_id(entry.group_id)
+        )
+
+    def _restore_shared_files(self) -> None:
+        """Startup: re-register the share-area files this device uploaded so
+        they stay downloadable after a restart, and refresh their advertised
+        address/port (the shared listener port and the local IP can change)."""
+        try:
+            entries = self.store.get_local_group_files()
+        except Exception:
+            return
+        if not entries:
+            return
+        host = get_local_ip_address()
+        for entry in entries:
+            path = entry.local_path
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                size = os.path.getsize(path)
+                self.host_server.register_shared_file(
+                    entry.file_id, path, size, entry.file_key
+                )
+            except Exception:
+                continue
+            if host and (entry.download_host != host or entry.download_port != self.port):
+                try:
+                    with self._lock:
+                        self.store.upsert_group_file(
+                            replace(
+                                entry,
+                                size=size,
+                                download_host=host,
+                                download_port=self.port,
+                            )
+                        )
+                except Exception:
+                    pass
+
+    def share_group_file(self, path: str) -> bool:
+        """Share a local file into the active group's share area (群文件).
+        The bytes are served from the shared listener (stable port, unlike the
+        ephemeral chat-file servers), so an index entry stays downloadable
+        while this app runs. Returns False when offline or the file is
+        unusable."""
+        gid = self.active_group_id
+        if gid is None or not path or not os.path.isfile(path):
+            return False
+        p2p = self.group_p2p_map.get(gid)
+        if p2p is None or (p2p.connection_lost and not self.mesh.has_links(gid)):
+            return False
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return False
+        if size <= 0 or size > network_module.MAX_DOWNLOAD_BYTES:
+            return False
+        name = sanitize_file_name(os.path.basename(path))
+        if not name:
+            return False
+        file_id = str(uuid.uuid4())
+        file_key = to_b64(random_bytes(KEY_LEN))
+        host = get_local_ip_address() or getattr(p2p, "my_ip_address", "") or ""
+        try:
+            self.host_server.register_shared_file(file_id, path, size, file_key)
+        except Exception:
+            return False
+        ts = int(time.time() * 1000)
+        with self._lock:
+            self.store.upsert_group_file(
+                SavedGroupFile(
+                    group_id=gid,
+                    file_id=file_id,
+                    name=name,
+                    size=size,
+                    sender_id=self.my_device_id,
+                    sender_name=self.nickname,
+                    ts=ts,
+                    download_host=host,
+                    download_port=self.port,
+                    file_key=file_key,
+                    local_path=path,
+                )
+            )
+        packet = NetworkPacket(
+            type="group_file_add",
+            group_id=gid,
+            file_id=file_id,
+            name=name,
+            size=size,
+            sender_id=self.my_device_id,
+            sender_name=self.nickname,
+            ts=ts,
+            file_info=FileInfo(
+                file_id,
+                name,
+                size,
+                host,
+                self.port,
+                file_key,
+            ),
+        )
+        # dual delivery like a chat send: host relay + mesh (receivers dedup
+        # by fileId and the mesh layer binds senderId to the link identity)
+        p2p.send_group_packet(packet)
+        self.mesh.broadcast_admin(gid, packet)
+        self.group_files_changed.emit(gid)
+        return True
+
+    def remove_group_file(self, file_id: str) -> bool:
+        """Remove one entry from the active group's share area. Authorized for
+        the uploader or the group owner; the tombstone is persisted so an
+        offline member converges instead of resurrecting the entry."""
+        gid = self.active_group_id
+        if gid is None:
+            return False
+        p2p = self.group_p2p_map.get(gid)
+        if p2p is None:
+            return False
+        with self._lock:
+            entry = self.store.get_group_file(gid, file_id)
+        if entry is None or not self.can_remove_shared_file(entry):
+            return False
+        packet = NetworkPacket(
+            type="group_file_remove",
+            group_id=gid,
+            file_id=file_id,
+            sender_id=self.my_device_id,
+            ts=int(time.time() * 1000),
+        )
+        p2p.send_group_packet(packet)
+        self.mesh.broadcast_admin(gid, packet)
+        with self._lock:
+            self.store.record_removed_group_files(gid, [file_id])
+        if entry.local_path:
+            try:
+                self.host_server.unregister_shared_file(file_id)
+            except Exception:
+                pass
+        self.group_files_changed.emit(gid)
+        return True
+
+    def download_group_file(self, file_id: str, target_path: str) -> None:
+        """Download one shared file of the active group to [target_path] on a
+        worker thread; file_download_finished(file_id, ok, message) fires on
+        completion and file_progress reports bytes (same contract as
+        download_file)."""
+        gid = self.active_group_id
+        if gid is None:
+            self.file_download_finished.emit(file_id, False, "未连接到群组")
+            return
+        p2p = self.group_p2p_map.get(gid)
+        if p2p is None:
+            self.file_download_finished.emit(file_id, False, "未连接到群组")
+            return
+        with self._lock:
+            entry = self.store.get_group_file(gid, file_id)
+        if entry is None:
+            self.file_download_finished.emit(file_id, False, "文件不存在")
+            return
+        if not entry.download_host or entry.download_port <= 0:
+            self.file_download_finished.emit(
+                file_id, False, "文件已过期，请上传者重新分享"
+            )
+            return
+        file_info = FileInfo(
+            entry.file_id,
+            entry.name,
+            entry.size,
+            entry.download_host,
+            entry.download_port,
+            entry.file_key,
+        )
+        try:
+            os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+        except OSError:
+            self.file_download_finished.emit(file_id, False, "无法创建保存目录")
+            return
+        offset = self._resume_offset(file_id, target_path)
+        event, socks = self._register_download((gid, file_id))
+        progress = self._make_file_progress(file_id)
+
+        def run() -> None:
+            self._sync_resume(file_info, target_path, keep_empty=True)
+            ok, message = p2p.download_file(
+                file_info,
+                target_path,
+                progress=progress,
+                cancel=event,
+                sock_holder=socks,
+                offset=offset,
+            )
+            self._sync_resume(file_info, target_path)
+            self._finish_download((gid, file_id))
+            self.file_download_finished.emit(file_id, ok, message)
+
+        threading.Thread(target=run, daemon=True).start()
 
     def send_folder(self, path: str) -> None:
         """Offer a folder to the active group as one file_message per entry
@@ -3610,6 +4029,9 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
                 # state seeds with the full local history and can backfill it
                 # to members that come online later.
                 self._setup_group_mesh(gid, p2p)
+                # the join is the (re)connection point: flush ops staged while
+                # the group was unreachable
+                self._replay_pending_ops(gid)
                 self.setup_p2p = None
                 self.groups_changed.emit()
                 self.status_message.emit("已成功加入群组")

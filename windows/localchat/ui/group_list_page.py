@@ -103,13 +103,20 @@ class GroupCard(QFrame):
 
 
 class GroupListPage(QWidget):
-    def __init__(self, vm: ChatViewModel, on_add_group, on_open_members=None):
+    def __init__(
+        self,
+        vm: ChatViewModel,
+        on_add_group,
+        on_open_members=None,
+        on_open_search=None,
+    ):
         super().__init__()
         self.vm = vm
         self.on_add_group = on_add_group
         self.on_open_group = None
         self.on_open_settings = None
         self.on_open_members = on_open_members
+        self.on_open_search = on_open_search
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -122,6 +129,12 @@ class GroupListPage(QWidget):
         title.setObjectName("appTitle")
         header_layout.addWidget(title)
         header_layout.addStretch()
+        if self.on_open_search is not None:
+            self.search_btn = QPushButton("搜索")
+            self.search_btn.setObjectName("ghost")
+            self.search_btn.setToolTip("搜索消息（群聊与私聊记录）")
+            self.search_btn.clicked.connect(self.on_open_search)
+            header_layout.addWidget(self.search_btn)
         self.members_btn = QPushButton("成员")
         self.members_btn.setObjectName("ghost")
         self.members_btn.setToolTip("返回成员列表（直聊首页）")

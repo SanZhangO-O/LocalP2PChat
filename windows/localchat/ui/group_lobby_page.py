@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 from .. import network as network_module
 from ..models import MEDIA_AUDIO, Peer
 from ..view_model import MAX_NAME_LENGTH, ChatViewModel
+from .group_files_dialog import GroupFilesDialog
 from .qr_dialogs import GroupInviteQrDialog
 from .theme import ERROR, PRIMARY, TEXT_SUBTLE
 from .widgets import AvatarLabel, Toast
@@ -219,6 +220,11 @@ class GroupLobbyPage(QWidget):
         self.settings_btn.setToolTip("修改群名称与群公告")
         self.settings_btn.clicked.connect(self._open_group_settings)
         header_layout.addWidget(self.settings_btn)
+        self.files_btn = QPushButton("群文件")
+        self.files_btn.setObjectName("ghost")
+        self.files_btn.setToolTip("查看并分享群内文件")
+        self.files_btn.clicked.connect(self._open_group_files)
+        header_layout.addWidget(self.files_btn)
         self.leave_btn = QPushButton("退出群组")
         self.leave_btn.setObjectName("danger")
         self.leave_btn.clicked.connect(self._confirm_leave)
@@ -406,6 +412,11 @@ class GroupLobbyPage(QWidget):
             return
         dialog = GroupSettingsDialog(self.vm, self.window())
         dialog.exec()
+
+    def _open_group_files(self):
+        if self.vm.active_group_id is None:
+            return
+        GroupFilesDialog(self.vm, self.window()).exec()
 
     def _confirm_kick(self, peer_id: str):
         if not self.vm.active_is_host or self.vm.active_group_id is None:

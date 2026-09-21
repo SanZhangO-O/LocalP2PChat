@@ -145,10 +145,17 @@ class PolicyTest(unittest.TestCase):
     def test_tampered_timestamp_or_id_fails_signature(self):
         msg = make_msg("honest", "aaa-member", "A", "t-2")
         groupauth.sign_message(GRP, msg)
+        self.assertTrue(msg.sender_sig, "the local identity must sign")
+        # replay the SAME signature with a tampered timestamp / id: the
+        # transcript covers both, so the signature must not verify
         clone = make_msg("honest", "aaa-member", "A", "t-2")
+        clone.sender_pub_id = msg.sender_pub_id
+        clone.sender_sig = msg.sender_sig
         clone.timestamp = msg.timestamp + 1
         self.assertFalse(groupauth.verify_message(GRP, clone))
         clone2 = make_msg("honest", "aaa-member", "A", "t-3")
+        clone2.sender_pub_id = msg.sender_pub_id
+        clone2.sender_sig = msg.sender_sig
         clone2.timestamp = msg.timestamp
         self.assertFalse(groupauth.verify_message(GRP, clone2))
 

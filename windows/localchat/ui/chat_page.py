@@ -44,6 +44,7 @@ from ..models import (
     MAX_REPLY_PREVIEW,
     MENTION_ALL,
     ChatMessage,
+    ForwardedInfo,
     FILE_KIND_AUDIO,
     FILE_KIND_IMAGE,
     FILE_KIND_VIDEO,
@@ -53,6 +54,8 @@ from ..models import (
 )
 from ..view_model import ChatViewModel
 from .emoji_panel import EmojiPanel
+from .group_files_dialog import GroupFilesDialog
+from .group_lobby_page import GroupSettingsDialog
 from .theme import (
     BUBBLE_MINE,
     BUBBLE_NAME,
@@ -85,6 +88,8 @@ MEDIA_IMAGE_MAX = 240
 # line) and the width of its left accent bar.
 REPLY_H = 28
 REPLY_ACCENT_W = 3
+# "转发自 X" badge line reserved above a forwarded bubble's content.
+FORWARD_H = 15
 # Reactions pill row reserved under a bubble that carries reactions.
 REACTIONS_H = 20
 # Voice-message bubble (play glyph + duration), fixed size like a file card.
@@ -544,7 +549,7 @@ class MessageDelegate(QStyledItemDelegate):
         through to the normal bubble so every marker stays visible."""
         if not isinstance(msg, ChatMessage) or not is_big_emoji(msg.content):
             return False
-        if msg.reply_to or msg.edited or msg.pending:
+        if msg.reply_to or msg.edited or msg.pending or msg.forwarded:
             return False
         if msg.is_from_me and (self.show_read_state or self.read_labels.get(msg.id)):
             return False
@@ -597,6 +602,9 @@ class MessageDelegate(QStyledItemDelegate):
         if msg.reply_to:
             # quoted header strip above the content
             height += REPLY_H + 2
+        if msg.forwarded:
+            # "转发自 X" provenance badge line
+            height += FORWARD_H
         return bubble_w, height, bounding
 
     def sizeHint(self, option, index) -> QSize:
@@ -925,6 +933,25 @@ class MessageDelegate(QStyledItemDelegate):
                 msg.is_from_me,
             )
             y += REPLY_H + 2
+            painter.setFont(font)
+        if msg.forwarded:
+            fwd_font = QFont(font)
+            fwd_font.setPointSize(7)
+            fwd_font.setBold(True)
+            painter.setFont(fwd_font)
+            fwd_color = QColor("#FFFFFF" if msg.is_from_me else PRIMARY)
+            fwd_color.setAlpha(215 if msg.is_from_me else 235)
+            painter.setPen(fwd_color)
+            origin = (msg.forwarded.origin_sender or "").strip()
+            label = f"\u8f6c\u53d1\u81ea {origin}" if origin else "\u8f6c\u53d1"
+            painter.drawText(
+                QRectF(inner.x(), y, inner.width(), FORWARD_H),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                QFontMetrics(fwd_font).elidedText(
+                    label, Qt.TextElideMode.ElideRight, int(inner.width())
+                ),
+            )
+            y += FORWARD_H
             painter.setFont(font)
         painter.setPen(QColor("#FFFFFF" if msg.is_from_me else BUBBLE_TEXT_OTHER))
         content_rect = QRectF(inner.x(), y, inner.width(), inner.height() - (y - inner.y()) - TIME_H - 2)
@@ -1384,6 +1411,29 @@ class ChatPage(QWidget):
         self.title_label = QLabel("")
         self.title_label.setObjectName("chatTitle")
         header_layout.addWidget(self.title_label, 1)
+        # quick entries so the group features never need a lobby round trip:
+        # the lobby stays the full member screen; 群设置 only exists for the
+        # owner (visibility follows in _on_group_changed)
+        self.members_btn = QPushButton("群成员")
+        self.members_btn.setObjectName("ghost")
+        self.members_btn.setToolTip("查看群组成员")
+        self.members_btn.clicked.connect(self.on_back)
+        header_layout.addWidget(self.members_btn)
+        self.conference_btn = QPushButton("语音会议")
+        self.conference_btn.setObjectName("ghost")
+        self.conference_btn.setToolTip("发起多人语音会议（仅音频）")
+        self.conference_btn.clicked.connect(self._start_group_call)
+        header_layout.addWidget(self.conference_btn)
+        self.files_btn = QPushButton("群文件")
+        self.files_btn.setObjectName("ghost")
+        self.files_btn.setToolTip("查看并分享群内文件")
+        self.files_btn.clicked.connect(self._open_group_files)
+        header_layout.addWidget(self.files_btn)
+        self.gsettings_btn = QPushButton("群设置")
+        self.gsettings_btn.setObjectName("ghost")
+        self.gsettings_btn.setToolTip("修改群名称与群公告")
+        self.gsettings_btn.clicked.connect(self._open_group_settings)
+        header_layout.addWidget(self.gsettings_btn)
         layout.addWidget(header)
 
         # Typing indicator line (group chat): "xx 正在输入…" while a member is
@@ -1654,6 +1704,7 @@ class ChatPage(QWidget):
         # not auto-send into the new one at the 60 s cap
         self._abort_voice_recording()
         self.title_label.setText(self.vm.active_group_name)
+        self._sync_quick_entries()
         self.model.setRowCount(0)
         self.input_edit.clear()
         self._file_states.clear()
@@ -1679,6 +1730,32 @@ class ChatPage(QWidget):
         self._stick_to_bottom = True
         self._rebuild()
         self._refresh_typing()
+
+    # ------------------------------------------------------ quick entries
+
+    def _sync_quick_entries(self):
+        """Header quick entries follow the active group: hidden without one,
+        群设置 additionally only for the group owner."""
+        has_group = self.vm.active_group_id is not None
+        self.members_btn.setVisible(has_group)
+        self.conference_btn.setVisible(has_group)
+        self.files_btn.setVisible(has_group)
+        self.gsettings_btn.setVisible(has_group and self.vm.active_is_host)
+
+    def _start_group_call(self):
+        if self.vm.active_group_id is None:
+            return
+        self.vm.start_group_call()
+
+    def _open_group_files(self):
+        if self.vm.active_group_id is None:
+            return
+        GroupFilesDialog(self.vm, self.window()).exec()
+
+    def _open_group_settings(self):
+        if not self.vm.active_is_host or self.vm.active_group_id is None:
+            return
+        GroupSettingsDialog(self.vm, self.window()).exec()
 
     # ------------------------------------------------------ page lifecycle
 
@@ -2529,7 +2606,7 @@ class ChatPage(QWidget):
         elif chosen is copy_action:
             QApplication.clipboard().setText(msg.content)
         elif chosen is forward_action:
-            self._show_forward_dialog(msg.content)
+            self._show_forward_dialog(msg)
         elif edit_action is not None and chosen is edit_action:
             self._edit_message_dialog(msg)
         elif chosen is pin_action:
@@ -2628,33 +2705,55 @@ class ChatPage(QWidget):
             for entry in list(group.entries):
                 self.vm.delete_message(entry.id)
 
-    def _show_forward_dialog(self, content: str):
+    def _show_forward_dialog(self, msg):
         gid = self.vm.active_group_id
-        targets = [g for g in self.vm.groups_list() if g.group_id != gid and g.connected]
+        groups = [g for g in self.vm.groups_list() if g.group_id != gid and g.connected]
+        contacts = list(self.vm.direct_contacts_list())
         dialog = QDialog(self.window())
         dialog.setObjectName("confirmDialog")
         dialog.setWindowTitle("转发消息")
         dialog.setModal(True)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(20, 16, 20, 12)
+        content = msg.content
         preview = content if len(content) <= 20 else content[:20] + "..."
         preview_label = QLabel(f'"{preview}"')
         preview_label.setObjectName("hint")
         preview_label.setWordWrap(True)
         layout.addWidget(preview_label)
         layout.addSpacing(8)
-        if not targets:
-            none_label = QLabel("没有其他可转发的群组（未连接的群组无法转发）")
+        if not groups and not contacts:
+            none_label = QLabel("没有其他可转发的群组或联系人")
             none_label.setObjectName("hint")
             none_label.setWordWrap(True)
             layout.addWidget(none_label)
         else:
-            for group in targets:
+            if groups:
+                group_title = QLabel("群组")
+                group_title.setObjectName("faint")
+                layout.addWidget(group_title)
+            for group in groups:
                 btn = QPushButton(group.group_name)
                 btn.setObjectName("outline")
                 btn.setStyleSheet("text-align: left;")
                 btn.clicked.connect(
-                    lambda checked=False, gid_=group.group_id: self._forward(gid_, content, dialog)
+                    lambda checked=False, gid_=group.group_id: self._forward_group(
+                        gid_, msg, dialog
+                    )
+                )
+                layout.addWidget(btn)
+            if contacts:
+                contact_title = QLabel("联系人")
+                contact_title.setObjectName("faint")
+                layout.addWidget(contact_title)
+            for peer in contacts:
+                btn = QPushButton(peer.name or peer.id)
+                btn.setObjectName("outline")
+                btn.setStyleSheet("text-align: left;")
+                btn.clicked.connect(
+                    lambda checked=False, pid=peer.id: self._forward_direct(
+                        pid, msg, dialog
+                    )
                 )
                 layout.addWidget(btn)
         layout.addSpacing(8)
@@ -2664,10 +2763,28 @@ class ChatPage(QWidget):
         layout.addWidget(cancel_btn, alignment=Qt.AlignmentFlag.AlignRight)
         dialog.exec()
 
-    def _forward(self, target_group_id: str, content: str, dialog: QDialog):
+    def _forward_provenance(self, msg) -> ForwardedInfo:
+        """The display-only 转发 provenance of a message forwarded from this
+        chat: its original sender, this conversation's group name (empty for a
+        direct-chat origin) and the original timestamp."""
+        group_name = self.vm.active_group_name if self.vm.active_group_id else ""
+        return ForwardedInfo(
+            origin_sender=msg.sender_name if not msg.is_from_me else self.vm.nickname,
+            origin_group=group_name,
+            origin_time=msg.timestamp,
+        )
+
+    def _forward_group(self, target_group_id: str, msg, dialog: QDialog):
         dialog.accept()
-        if not self.vm.send_message_to_group(target_group_id, content):
+        forwarded = self._forward_provenance(msg)
+        if not self.vm.send_message_to_group(target_group_id, msg.content, forwarded=forwarded):
             Toast(self.window()).show_message("消息未发送：已断开连接")
+
+    def _forward_direct(self, peer_id: str, msg, dialog: QDialog):
+        dialog.accept()
+        forwarded = self._forward_provenance(msg)
+        if not self.vm.send_direct_message(peer_id, msg.content, forwarded=forwarded):
+            Toast(self.window()).show_message("消息未发送：联系人不可用")
 
     def _confirm_delete(self, message_id: str):
         box = QMessageBox(self.window())

@@ -3,7 +3,7 @@ import os
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional
 
 from . import secretbox
@@ -1056,6 +1056,12 @@ class ChatStore:
             self._conn.execute("DELETE FROM saved_messages WHERE groupId = ?", (group_id,))
             self._conn.execute("DELETE FROM deleted_messages WHERE group_id = ?", (group_id,))
             self._conn.execute("DELETE FROM pending_ops WHERE scope = ?", (group_id,))
+            # group_files cascades off saved_groups, but its removal tombstones
+            # have no FK: clear them explicitly so a re-created group does not
+            # inherit stale tombstones
+            self._conn.execute(
+                "DELETE FROM removed_group_files WHERE group_id = ?", (group_id,)
+            )
             self._conn.execute("DELETE FROM saved_groups WHERE groupId = ?", (group_id,))
             # local call history of a removed conversation must go with it
             self._conn.execute(
@@ -1115,6 +1121,171 @@ class ChatStore:
                 (group_id,),
             ).fetchall()
         return [r["msg_id"] for r in rows]
+
+    # --------------------------------------------------- group file share area
+
+    def upsert_group_file(self, entry: SavedGroupFile) -> None:
+        """Insert or refresh one entry of a group's share index (dedup by
+        (groupId, fileId)). A newer row never loses the local source path we
+        already had: the wire entry carries no localPath, so an upsert from
+        the network keeps the stored one (only the uploader knows it)."""
+        with self._lock:
+            if not entry.local_path:
+                row = self._conn.execute(
+                    "SELECT localPath FROM group_files WHERE groupId = ? AND fileId = ?",
+                    (entry.group_id, entry.file_id),
+                ).fetchone()
+                if row is not None:
+                    entry = replace(entry, local_path=row["localPath"] or "")
+            self._conn.execute(
+                """
+                INSERT INTO group_files
+                    (groupId, fileId, name, size, senderId, senderName, ts,
+                     downloadHost, downloadPort, fileKey, localPath)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(groupId, fileId) DO UPDATE SET
+                    name = excluded.name,
+                    size = excluded.size,
+                    senderId = excluded.senderId,
+                    senderName = excluded.senderName,
+                    ts = excluded.ts,
+                    downloadHost = excluded.downloadHost,
+                    downloadPort = excluded.downloadPort,
+                    fileKey = excluded.fileKey,
+                    localPath = excluded.localPath
+                """,
+                (
+                    entry.group_id,
+                    entry.file_id,
+                    entry.name,
+                    int(entry.size),
+                    entry.sender_id,
+                    entry.sender_name,
+                    int(entry.ts),
+                    entry.download_host,
+                    int(entry.download_port),
+                    entry.file_key,
+                    entry.local_path,
+                ),
+            )
+            self._prune_group_files_locked(entry.group_id)
+            self._conn.commit()
+
+    def get_group_files(self, group_id: str) -> List[SavedGroupFile]:
+        """The group's share index, newest first, tombstoned ids excluded.
+        This is the source fed to join_ack/history_reply convergence packets."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM group_files
+                WHERE groupId = ?
+                  AND fileId NOT IN (
+                      SELECT file_id FROM removed_group_files WHERE group_id = ?
+                  )
+                ORDER BY ts DESC, fileId DESC
+                """,
+                (group_id, group_id),
+            ).fetchall()
+        return [self._row_to_group_file(r) for r in rows]
+
+    def get_group_file(self, group_id: str, file_id: str) -> Optional[SavedGroupFile]:
+        """One share-index entry, or None. Tombstoned ids are invisible (a
+        removed file never reappears through a lookup)."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM group_files
+                WHERE groupId = ? AND fileId = ?
+                  AND fileId NOT IN (
+                      SELECT file_id FROM removed_group_files WHERE group_id = ?
+                  )
+                """,
+                (group_id, file_id, group_id),
+            ).fetchone()
+        return None if row is None else self._row_to_group_file(row)
+
+    def get_local_group_files(self) -> List[SavedGroupFile]:
+        """Every share-index entry this device itself uploaded (it has a local
+        source path). Startup uses it to re-register the served bytes and
+        refresh the advertised address/port (the shared listener port and the
+        local IP can change across restarts)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM group_files WHERE localPath != ''"
+            ).fetchall()
+        return [self._row_to_group_file(r) for r in rows]
+
+    @staticmethod
+    def _row_to_group_file(r) -> SavedGroupFile:
+        return SavedGroupFile(
+            group_id=r["groupId"],
+            file_id=r["fileId"],
+            name=r["name"],
+            size=int(r["size"]),
+            sender_id=r["senderId"],
+            sender_name=r["senderName"],
+            ts=int(r["ts"]),
+            download_host=r["downloadHost"],
+            download_port=int(r["downloadPort"]),
+            file_key=r["fileKey"],
+            local_path=r["localPath"],
+        )
+
+    def record_removed_group_files(
+        self, group_id: str, file_ids, removed_at: Optional[int] = None
+    ) -> None:
+        """Persist share-area removal tombstones and drop the matching index
+        rows. A member that was offline during the removal replays them on
+        rejoin (join_ack / history_reply removedIds) so removed files converge
+        instead of resurrecting (message-tombstone semantics)."""
+        ids = [str(i) for i in dict.fromkeys(file_ids or []) if i]
+        if not ids:
+            return
+        ts = int(time.time() * 1000) if removed_at is None else int(removed_at)
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO removed_group_files (group_id, file_id, removed_at) "
+                "VALUES (?, ?, ?)",
+                [(group_id, i, ts) for i in ids],
+            )
+            self._conn.executemany(
+                "DELETE FROM group_files WHERE groupId = ? AND fileId = ?",
+                [(group_id, i) for i in ids],
+            )
+            self._conn.execute(
+                """
+                DELETE FROM removed_group_files
+                WHERE group_id = ? AND file_id NOT IN (
+                    SELECT file_id FROM removed_group_files WHERE group_id = ?
+                    ORDER BY removed_at DESC LIMIT ?
+                )
+                """,
+                (group_id, group_id, self.REMOVED_GROUP_FILES_CAP),
+            )
+            self._conn.commit()
+
+    def get_removed_group_file_ids(self, group_id: str) -> List[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT file_id FROM removed_group_files WHERE group_id = ? "
+                "ORDER BY removed_at DESC",
+                (group_id,),
+            ).fetchall()
+        return [r["file_id"] for r in rows]
+
+    def _prune_group_files_locked(self, group_id: str) -> None:
+        """Keep only the newest GROUP_FILES_CAP entries of one group (caller
+        holds the lock)."""
+        self._conn.execute(
+            """
+            DELETE FROM group_files
+            WHERE groupId = ? AND fileId NOT IN (
+                SELECT fileId FROM group_files WHERE groupId = ?
+                ORDER BY ts DESC, fileId DESC LIMIT ?
+            )
+            """,
+            (group_id, group_id, self.GROUP_FILES_CAP),
+        )
 
     # ------------------------------------------------------- pending op log
 

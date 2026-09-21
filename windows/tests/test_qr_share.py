@@ -23,6 +23,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication, QPushButton  # noqa: F401  (offscreen app)
 
+import localchat.models as models_module
 import localchat.network as network_module
 import localchat.qrshare as qrshare
 from localchat.models import Peer
@@ -67,7 +68,10 @@ class QrContactCodecTest(unittest.TestCase):
         self.assertNotRegex(text, r"[?&]n=")
         self.assertNotRegex(text, r"[?&]f=")
         invite = parse_invite(text)
-        self.assertEqual(invite.port, network_module.TCP_PORT)
+        # compare against the codec's own default (models.TCP_PORT), never the
+        # mutable network_module.TCP_PORT: other tests override that global to
+        # pick ephemeral ports and do not restore it.
+        self.assertEqual(invite.port, models_module.TCP_PORT)
         self.assertEqual(invite.name, "")
         self.assertEqual(invite.fingerprint, "")
 
@@ -199,12 +203,14 @@ class QrViewModelTest(unittest.TestCase):
     def setUp(self):
         install_identity()
         port = _free_port()
+        self._orig_tcp_port = network_module.TCP_PORT
         network_module.TCP_PORT = port
         self.vm = make_vm(_fresh_db("lc_qr_vm.db"))
         self.vm.set_nickname("\u626b\u7801\u673a")
 
     def tearDown(self):
         self.vm.shutdown()
+        network_module.TCP_PORT = self._orig_tcp_port
 
     def test_contact_payload_roundtrip(self):
         invite = self.vm.parse_qr_invite(self.vm.qr_contact_payload())
@@ -305,11 +311,13 @@ class QrDialogEntryTest(unittest.TestCase):
 
     def setUp(self):
         install_identity()
+        self._orig_tcp_port = network_module.TCP_PORT
         network_module.TCP_PORT = _free_port()
         self.vm = make_vm(_fresh_db("lc_qr_ui.db"))
 
     def tearDown(self):
         self.vm.shutdown()
+        network_module.TCP_PORT = self._orig_tcp_port
 
     def _buttons(self, widget):
         return {b.text(): b for b in widget.findChildren(QPushButton)}

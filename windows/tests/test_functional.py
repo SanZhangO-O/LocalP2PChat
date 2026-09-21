@@ -2543,6 +2543,74 @@ class ViewModelFlowTest(unittest.TestCase):
         self.assertEqual(win.pages[PAGE_DIRECT].delegate.highlight_id, "d-1")
         win.close()
 
+    def test_global_nav_bar_and_chat_quick_entries(self):
+        """The global nav strip switches pages from anywhere and follows the
+        stack on back navigation; the group chat header carries quick entries
+        (member/call/files/settings) that hide without an active group, with
+        settings owner-only."""
+        from localchat.ui.main_window import (
+            PAGE_CHAT,
+            PAGE_GROUPS,
+            PAGE_MEMBERS,
+            PAGE_SEARCH,
+            PAGE_SETTINGS,
+            MainWindow,
+        )
+
+        network_module.TCP_PORT = 10058
+        vm = make_vm(_fresh_db("lc_nav_bar.db"))
+        self._vms = [vm]
+        win = MainWindow(vm)
+
+        nav = win.nav_buttons
+        # home page with the members entry checked
+        self.assertEqual(win.stack.currentIndex(), PAGE_MEMBERS)
+        self.assertTrue(nav["members"].isChecked())
+        self.assertFalse(nav["groups"].isChecked())
+
+        # nav click switches pages and moves the highlight
+        nav["groups"].click()
+        self.assertEqual(win.stack.currentIndex(), PAGE_GROUPS)
+        self.assertTrue(nav["groups"].isChecked())
+        # the group list header now carries the search entry too
+        self.assertEqual(win.pages[PAGE_GROUPS].search_btn.text(), "\u641c\u7d22")
+
+        nav["settings"].click()
+        self.assertEqual(win.stack.currentIndex(), PAGE_SETTINGS)
+        # back from settings returns to the recorded origin; highlight follows
+        win.pages[PAGE_SETTINGS].on_back()
+        self.assertEqual(win.stack.currentIndex(), PAGE_GROUPS)
+        self.assertTrue(nav["groups"].isChecked())
+
+        # chat page quick entries: visible for the owner
+        vm.create_group("\u4e3b\u673a", "\u5bfc\u822a\u6d4b\u8bd5")
+        win._go_chat()
+        chat = win.pages[PAGE_CHAT]
+        for btn in (
+            chat.members_btn,
+            chat.conference_btn,
+            chat.files_btn,
+            chat.gsettings_btn,
+        ):
+            self.assertFalse(btn.isHidden())
+        # clicking through the real button path opens the files dialog
+        # indirectly is modal-blocking; only assert the handlers exist
+        self.assertTrue(callable(chat._open_group_files))
+
+        # after leaving the group the entries hide (settings stays hidden for
+        # a non-owner too)
+        win._on_left_group()
+        win._go_chat()
+        self.assertTrue(chat.members_btn.isHidden())
+        self.assertTrue(chat.conference_btn.isHidden())
+        self.assertTrue(chat.files_btn.isHidden())
+        self.assertTrue(chat.gsettings_btn.isHidden())
+
+        # direct chats belong to the members entry
+        win._go_members()
+        self.assertTrue(nav["members"].isChecked())
+        win.close()
+
     def test_emoji_recents_persist_and_insert_at_cursor(self):
         """Emoji: inserting lands at the cursor; the 24 most recent picks are
         persisted (newest first, deduped, capped) and survive a reload."""

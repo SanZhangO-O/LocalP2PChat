@@ -46,6 +46,28 @@ QFrame#chatHeader {{
     background: {SURFACE};
     border-bottom: 1px solid #ECEAF1;
 }}
+QFrame#navBar {{
+    background: {SURFACE};
+    border-bottom: 1px solid #ECEAF1;
+}}
+QPushButton#navButton {{
+    background: transparent;
+    color: {TEXT_SUBTLE};
+    border: none;
+    border-radius: 8px;
+    padding: 6px 18px;
+    font-size: 14px;
+    font-weight: 500;
+}}
+QPushButton#navButton:hover {{
+    background: rgba(103, 80, 164, 0.08);
+    color: {PRIMARY};
+}}
+QPushButton#navButton:checked {{
+    background: {PRIMARY_CONTAINER};
+    color: {ON_PRIMARY_CONTAINER};
+    font-weight: 600;
+}}
 QFrame#composer {{
     background: {SURFACE};
     border-top: 1px solid #ECEAF1;
