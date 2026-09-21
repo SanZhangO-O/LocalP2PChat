@@ -30,6 +30,7 @@ from localchat.models import (
     sanitize_emoji,
     sanitize_mentions,
 )
+from localchat import groupauth
 from localchat.network import (
     DirectChatListener,
     DirectChatManager,
@@ -381,7 +382,7 @@ class MeshRec(GroupMeshListener):
         for m in msgs:
             self.messages.append((group_id, m))
 
-    def group_mesh_edit(self, group_id, message_id, new_content, sender_id):
+    def group_mesh_edit(self, group_id, message_id, new_content, sender_id, message_sig=None):
         self.edits.append((group_id, message_id, new_content, sender_id))
 
     def group_mesh_reaction(self, group_id, message_id, emoji, sender_id, active):
@@ -411,6 +412,9 @@ class MeshExtrasTest(unittest.TestCase):
     PASSWORD = "123456"
 
     def setUp(self):
+        # edits are signature-mandatory now (no legacy tolerance): the mesh
+        # paths exercise the real identity throughout this class
+        install_identity()
         self._old_retry = GroupMeshManager.RETRY_INTERVAL
         GroupMeshManager.RETRY_INTERVAL = 0.05
         self.server_a = HostGroupServer(self.PORT_A)
@@ -442,8 +446,13 @@ class MeshExtrasTest(unittest.TestCase):
         self.server_b.shutdown()
         GroupMeshManager.RETRY_INTERVAL = self._old_retry
 
+    def _signed_msg(self, content, sender_id, sender_name, mid):
+        msg = make_msg(content, sender_id, sender_name, mid)
+        groupauth.sign_message(self.GRP, msg)
+        return msg
+
     def test_edit_delivery_and_author_validation(self):
-        msg = make_msg("original", "aaa-member", "A", "em-1")
+        msg = self._signed_msg("original", "aaa-member", "A", "em-1")
         self.a.broadcast(self.GRP, msg)
         self.assertTrue(wait_until(lambda: any(m.id == "em-1" for _, m in self.rec_b.messages)))
         # the author edits: B's copy follows
@@ -466,21 +475,10 @@ class MeshExtrasTest(unittest.TestCase):
         stored = [m for _, m in self.rec_b.messages if m.id == "em-1"]
         self.assertTrue(all(m.content == "edited text" for m in stored))
 
-    def test_edit_updates_own_mesh_history(self):
-        msg = make_msg("before", "aaa-member", "A", "em-2")
-        self.a.broadcast(self.GRP, msg)
-        self.assertTrue(wait_until(lambda: self.a.update_mesh_message(
-            self.GRP, "em-2", "after", "aaa-member"
-        )))
-        history = self.a._groups[self.GRP]["messages"]
-        target = next(m for m in history if m.id == "em-2")
-        self.assertEqual(target.content, "after")
-        self.assertTrue(target.edited)
-        # a non-author cannot rewrite through update_mesh_message either
-        self.assertFalse(self.a.update_mesh_message(self.GRP, "em-2", "x", "bbb-member"))
-
     def test_reaction_pin_and_read_receipt_delivery(self):
-        self.a.broadcast(self.GRP, make_msg("react-me", "aaa-member", "A", "rx-1"))
+        self.a.broadcast(
+            self.GRP, self._signed_msg("react-me", "aaa-member", "A", "rx-1")
+        )
         self.assertTrue(wait_until(lambda: any(m.id == "rx-1" for _, m in self.rec_b.messages)))
         self.a.broadcast_reaction(self.GRP, "rx-1", "\U0001F389", True)
         self.assertTrue(
@@ -496,6 +494,235 @@ class MeshExtrasTest(unittest.TestCase):
         self.assertTrue(
             wait_until(lambda: any(r[2] == "rx-1" for r in self.rec_a.reads)),
             "group read receipt must reach the linked member",
+        )
+
+
+class EditConvergenceTest(unittest.TestCase):
+    """LESSONS 2026-09-21 #1: an edited message must survive the mesh
+    history push. The author's edit packet signature covers the EDITED
+    body's message transcript, so receivers store it on their copies and
+    every pushed history entry passes verify_message. The project is
+    unreleased: there is no legacy tolerance — an edit (or a pushed entry)
+    without a verifiable signature is dropped, never accepted."""
+
+    GRP = "\u7f16\u8f91\u7fa4"  # unique group id: groupauth enforcement state
+    PASSWORD = "123456"         # is process-global, so never reuse others'
+    PORT_A = 19641
+    PORT_B = 19642
+    PORT_C = 19643
+
+    def setUp(self):
+        install_identity()
+        self._old_retry = GroupMeshManager.RETRY_INTERVAL
+        GroupMeshManager.RETRY_INTERVAL = 0.05
+        self.servers = []
+        self.managers = []
+        self.recs = []
+        self.peers = {}
+        for i, port in enumerate((self.PORT_A, self.PORT_B, self.PORT_C)):
+            server = HostGroupServer(port)
+            server.ensure_running()
+            rec = MeshRec()
+            mgr = GroupMeshManager()
+            mgr.attach(rec)
+            server.mesh_manager = mgr
+            server.password_lookup = lambda mode, gid, m=mgr: m.password_for(gid)
+            self.servers.append(server)
+            self.managers.append(mgr)
+            self.recs.append(rec)
+            self.peers[mgr] = Peer(f"sig-member-{i}", f"S{i}", "127.0.0.1", port)
+        self.a, self.b, self.c = self.managers
+        self.rec_a, self.rec_b, self.rec_c = self.recs
+        # A and B are online and linked; C joins later (was offline)
+        self.b.enter_group(
+            self.GRP, self.peers[self.b], [self.peers[self.a]], [], self.PASSWORD
+        )
+        self.a.enter_group(
+            self.GRP, self.peers[self.a], [self.peers[self.b]], [], self.PASSWORD
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: self.a.has_links(self.GRP) and self.b.has_links(self.GRP)
+            )
+        )
+
+    def tearDown(self):
+        for mgr in self.managers:
+            mgr.shutdown()
+        for server in self.servers:
+            server.shutdown()
+        GroupMeshManager.RETRY_INTERVAL = self._old_retry
+
+    def _signed_msg(self, content, mid, member=0):
+        msg = ChatMessage(
+            id=mid,
+            content=content,
+            timestamp=int(time.time() * 1000),
+            sender_id=f"sig-member-{member}",
+            sender_name=f"S{member}",
+        )
+        groupauth.sign_message(self.GRP, msg)
+        return msg
+
+    def test_offline_member_receives_edited_text_via_history_push(self):
+        """The full convergence path: A sends (signed), edits (the packet
+        signature covers the edited body's message transcript and is stored
+        on the mesh copies), C comes online EMPTY and must backfill the
+        EDITED text — the pushed entry passes verify_message."""
+        msg = self._signed_msg("original", "conv-1", member=0)
+        self.a.broadcast(self.GRP, msg)
+        self.assertTrue(
+            wait_until(lambda: any(m.id == "conv-1" for _, m in self.rec_b.messages))
+        )
+        self.a.broadcast_edit(self.GRP, "conv-1", "edited")
+        self.assertTrue(
+            wait_until(
+                lambda: any(
+                    m.id == "conv-1" and m.content == "edited"
+                    for _, m in self.rec_b.messages
+                )
+            ),
+            "the live edit must still reach the linked member",
+        )
+        # the author's mesh history copy must carry a verify_message-valid
+        # signature over the NEW content (regression: it held the edit
+        # transcript signature, so every push of the entry was dropped)
+        target = next(
+            m for m in self.a._groups[self.GRP]["messages"] if m.id == "conv-1"
+        )
+        self.assertTrue(groupauth.verify_message(self.GRP, target))
+        # C comes online with empty history
+        self.c.enter_group(
+            self.GRP, self.peers[self.c],
+            [self.peers[self.a], self.peers[self.b]], [], self.PASSWORD,
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: any(
+                    m.id == "conv-1" and m.content == "edited" and m.edited
+                    for _, m in self.rec_c.messages
+                )
+            ),
+            "the offline member must backfill the EDITED text",
+        )
+
+    def test_update_mesh_message_requires_valid_signature(self):
+        """update_mesh_message is strict: the edit signature must verify as
+        the edited body's message transcript (against the copy's timestamp
+        and the author key) or the rewrite is refused — a missing, invalid,
+        or non-author edit can never enter this member's history."""
+        original = self._signed_msg("before", "conv-0", member=0)
+        self.a.note_message(self.GRP, original)
+        pub, sig = groupauth.sign_parts(
+            groupauth.message_fields_parts(
+                self.GRP, "sig-member-0", "conv-0",
+                original.timestamp, "after",
+            )
+        )
+        self.assertTrue(pub and sig)
+        # unsigned / wrongly-signed / foreign-key edits are all refused
+        self.assertFalse(
+            self.a.update_mesh_message(self.GRP, "conv-0", "after", "sig-member-0")
+        )
+        self.assertFalse(
+            self.a.update_mesh_message(
+                self.GRP, "conv-0", "other", "sig-member-0", pub, sig
+            )
+        )
+        other_pub, other_sig = groupauth.sign_parts(
+            groupauth.message_fields_parts(
+                self.GRP, "bbb-member", "conv-0",
+                original.timestamp, "after",
+            )
+        )
+        self.assertFalse(
+            self.a.update_mesh_message(
+                self.GRP, "conv-0", "after", "sig-member-0", other_pub, other_sig
+            )
+        )
+        self.assertEqual(
+            next(
+                m for m in self.a._groups[self.GRP]["messages"]
+                if m.id == "conv-0"
+            ).content,
+            "before",
+        )
+        # the author's valid edit signature is applied AND stored, so the
+        # copy stays verify_message-valid for later history pushes
+        self.assertTrue(
+            self.a.update_mesh_message(
+                self.GRP, "conv-0", "after", "sig-member-0", pub, sig
+            )
+        )
+        target = next(
+            m for m in self.a._groups[self.GRP]["messages"] if m.id == "conv-0"
+        )
+        self.assertEqual(target.content, "after")
+        self.assertTrue(target.edited)
+        self.assertTrue(groupauth.verify_message(self.GRP, target))
+
+    def test_history_push_strictly_verifies_every_entry(self):
+        """A pushed batch is filtered per entry: a properly signed rewrite of
+        a locally-known id converges (and adopts the entry's signature), an
+        unsigned entry from the enforced author is dropped, and a valid
+        brand-new entry is accepted — all in one batch."""
+        original = self._signed_msg("before", "conv-2", member=0)
+        self.a.broadcast(self.GRP, original)
+        self.assertTrue(
+            wait_until(lambda: any(m.id == "conv-2" for _, m in self.rec_b.messages))
+        )
+        rewritten_pub, rewritten_sig = groupauth.sign_parts(
+            groupauth.message_fields_parts(
+                self.GRP, "sig-member-0", "conv-2",
+                original.timestamp, "edited",
+            )
+        )
+        rewritten = ChatMessage(
+            id="conv-2",
+            content="edited",
+            timestamp=original.timestamp,
+            sender_id="sig-member-0",
+            sender_name="S0",
+            sender_pub_id=rewritten_pub,
+            sender_sig=rewritten_sig,
+        )
+        # stripped signature: the author signed before, so an unsigned entry
+        # is a replay-class violation and must be dropped
+        stripped = ChatMessage(
+            id="conv-2",
+            content="stripped",
+            timestamp=original.timestamp,
+            sender_id="sig-member-0",
+            sender_name="S0",
+        )
+        fresh = self._signed_msg("fresh", "conv-2x", member=0)
+        links = list(self.a._groups[self.GRP]["links"].values())
+        self.assertTrue(links, "A must have a live link to push over")
+        for link in links:
+            link["wire"].send_packet(
+                NetworkPacket(
+                    type="history_reply",
+                    group_id=self.GRP,
+                    messages=[rewritten, stripped, fresh],
+                )
+            )
+        self.assertTrue(
+            wait_until(
+                lambda: any(
+                    m.id == "conv-2" and m.content == "edited"
+                    for _, m in self.rec_b.messages
+                )
+            ),
+            "the author's signed rewrite must converge over its own link",
+        )
+        time.sleep(0.3)
+        self.assertFalse(
+            any(m.content == "stripped" for _, m in self.rec_b.messages),
+            "an unsigned entry from an enforced author must be dropped",
+        )
+        self.assertTrue(
+            any(m.id == "conv-2x" for _, m in self.rec_b.messages),
+            "a valid brand-new entry in the same batch is still accepted",
         )
 
 
@@ -527,6 +754,7 @@ class DirectExtrasTest(unittest.TestCase):
 
     def setUp(self):
         install_identity()
+        self._b_down = False
         self.server = HostGroupServer(self.PORT)
         self.server.ensure_running()
         self.rec_b = DirectRec()
@@ -547,7 +775,8 @@ class DirectExtrasTest(unittest.TestCase):
 
     def tearDown(self):
         self.a.shutdown()
-        self.b.shutdown()
+        if not self._b_down:
+            self.b.shutdown()
         self.server.shutdown()
 
     def _send_and_wait(self):
@@ -652,6 +881,23 @@ class DirectExtrasTest(unittest.TestCase):
         )
         mine = next(m for m in self.a.messages_for("dev-B") if m.id == msg.id)
         self.assertTrue(mine.edited)
+
+    def test_offline_direct_edit_changes_nothing(self):
+        """LESSONS 2026-09-21 #2: with the peer offline the edit is refused
+        WHOLE — no local rewrite (the list used to show the new text while
+        the persisted copy kept the old one, so the edit visibly reverted on
+        restart while the peer never learned about it)."""
+        msg = self._send_and_wait()
+        self._b_down = True
+        self.b.shutdown()
+        self.assertTrue(
+            wait_until(lambda: not self.a.is_chat_alive("dev-B")),
+            "the session must be dead before the offline edit is attempted",
+        )
+        self.assertFalse(self.a.edit_message("dev-B", msg.id, "offline-edit"))
+        copy = next(m for m in self.a.messages_for("dev-B") if m.id == msg.id)
+        self.assertEqual(copy.content, "to-edit")
+        self.assertFalse(copy.edited)
 
     def test_reaction_and_pin_reach_the_peer(self):
         msg = self._send_and_wait()

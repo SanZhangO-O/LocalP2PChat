@@ -868,11 +868,15 @@ class NetworkPacket:
     emoji: Optional[str] = None
     # Group sender identity binding (TOFU, see groupauth.py) for packets that
     # carry an authorship claim WITHOUT a ChatMessage object (delete_message /
-    # edit_message / group_update / kick_member): the author's long-term
-    # identity public key (Base64 SPKI) plus the ECDSA signature over the
-    # packet's signing transcript. Optional, omitted when unset so a plain
-    # packet stays byte-identical (Android parity). Chat/file messages carry
-    # the same pair inside ChatMessage instead.
+    # group_update / kick_member): the author's long-term identity public key
+    # (Base64 SPKI) plus the ECDSA signature over the packet's signing
+    # transcript. edit_message uses the same pair with the MESSAGE transcript
+    # of the edited body (message_parts over the receiver's copy identity +
+    # new content) so the verified signature can be stored on the mesh
+    # history copy and later history pushes pass verify_message. Optional,
+    # omitted when unset so a plain packet stays byte-identical (Android
+    # parity). Chat/file messages carry the same pair inside ChatMessage
+    # instead.
     sender_pub_id: Optional[str] = None
     sender_sig: Optional[str] = None
     # group_file_add: the shared file's summary fields (the index data). All

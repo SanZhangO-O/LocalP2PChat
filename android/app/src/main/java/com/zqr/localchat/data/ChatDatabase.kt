@@ -16,8 +16,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         MessageReaction::class,
         PinnedMessage::class,
         GroupRead::class,
+        PendingOp::class,
     ],
-    version = 6,
+    version = 7,
     exportSchema = false
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -194,6 +195,33 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v6 -> v7: the pending_ops table (staged offline message-experience
+         * ops, Windows `pending_ops` parity): an edit issued while the group
+         * is unreachable is replayed once it becomes reachable. Created
+         * empty, FK-cascade off saved_messages — no existing data is touched
+         * (NEVER destructive).
+         */
+        private val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `pending_ops` (" +
+                        "`groupId` TEXT NOT NULL, `kind` TEXT NOT NULL, " +
+                        "`msgId` TEXT NOT NULL, `emoji` TEXT NOT NULL DEFAULT '', " +
+                        "`active` INTEGER NOT NULL DEFAULT 0, " +
+                        "`content` TEXT NOT NULL DEFAULT '', " +
+                        "`createdAt` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`groupId`, `kind`, `msgId`, `emoji`), " +
+                        "FOREIGN KEY(`groupId`, `msgId`) REFERENCES `saved_messages`(`groupId`, `id`) " +
+                        "ON UPDATE NO ACTION ON DELETE CASCADE)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_pending_ops_groupId` " +
+                        "ON `pending_ops` (`groupId`)"
+                )
+            }
+        }
+
         @Volatile
         private var INSTANCE: ChatDatabase? = null
 
@@ -206,7 +234,7 @@ abstract class ChatDatabase : RoomDatabase() {
                 )
                     .addMigrations(
                         MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
-                        MIGRATION_5_6
+                        MIGRATION_5_6, MIGRATION_6_7
                     )
                     .build()
                 INSTANCE = instance

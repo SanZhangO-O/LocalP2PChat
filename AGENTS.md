@@ -19,26 +19,35 @@
 - 固定参数不要单方面改动：PBKDF2-HMAC-SHA1 210k 迭代、HKDF info
   `localchat-session-v1` / `lc-direct-v1`、端口 9999、换行分帧 + 紧凑 JSON。
 
-## 2. 向后兼容是硬约束
+## 2. 协议演进（2026-09-21 起：未发布、无历史包袱）
 
-README「版本兼容说明」承诺：**聊天、文件、群组在版本不一致时仍可用**（只有通话要求两端同为最新版）。
+**项目尚未发布：协议改动不需要为旧版本保留兼容路径**——字段可以直接改语义、
+校验可以直接强制，不再遵循「可选字段默认旧行为 / 先观察后强制」的旧约定；
+两端仍必须**同步修改、同步升级**（同一套协议的两份实现）。本节余下内容是
+历史教训与仍生效的实现细节：
 
-- 新增字段必须可选、默认值保持旧行为；旧对端缺字段时要正常处理，而不是拒绝。
-  Android 解码器已开 `ignoreUnknownKeys`，Python `from_dict` 忽略未知键。
-- 新增校验一律「先观察后强制」，不要一上来就硬拒。参考 `seq`（防重放序号）的教训：
-  - 发送端：`send_packet` / `sendPacket` 对每个加密包打 `seq`（1,2,3,…），不要移除。
-  - 接收端：`securewire.py` 的 `recv_packet()`、`SecureWire.kt` 的 `recvPacket()`——
-    旧对端（`seq` 缺失）始终放行；**对端首次携带 `seq` 之后**才按严格 `last+1` 校验，
-    之后再缺 `seq` 按重放拒绝。旧流仍受每连接 nonce 缓存保护。
+- README「版本兼容说明」已改为「未发布、无兼容兜底，两端同步升级」。
+- Android 解码器 `ignoreUnknownKeys`、Python `from_dict` 忽略未知键仍保留
+  （对未知字段优雅忽略是健壮性，不是旧版本兼容）。
+- `seq`（防重放序号）的现状：发送端 `send_packet` / `sendPacket` 对每个加密
+  包打 `seq`（1,2,3,…），不要移除；接收端对 `seq` 缺失的包按重放拒绝；
+  每连接 nonce 缓存继续保护旧流。
+- 新增「内容类」字段/类型的正确姿势参考 `audio`（语音消息）与
+  `mentions`/`edited`：发送端省略默认值（普通消息字节不变），接收端未知
+  kind normalize 后退化为 `file` 卡片照常下载/外部播放。
+- 编辑收敛与签名（LESSONS 2026-09-21）：edit_message 的 `senderSig` 覆盖
+  **编辑后完整消息**的 message transcript（`message_fields_parts`/
+  `messageParts`，按接收副本时间戳+新内容重建后验证），验证通过后存为
+  mesh 历史副本签名，历史推送天然通过 `verify_message`；relay 收到的编辑
+  要镜像进 mesh 副本；**无签名/验签不过的编辑一律拒绝**（编辑改写历史，
+  不做任何无签名容忍）。群编辑离线暂存/重放：Windows `pending_ops`，
+  Android `pending_ops`（DB v7，`ChatViewModel.replayPendingOps`），两端
+  语义保持一致。改动 `history_reply` 合并规则必须两端同步并跑互通 E2E。
   - 历史事故：`a37413e` 把 `seq` 设为强制字段，旧手机 APK 的每个加密包都被新版 PC 拒绝
-    （`direct_hello` 都进不来），表现为「手机电脑完全不互通」。
-- 兼容只针对「缺失的新字段」，**不针对校验失败**：密码错误、TOFU 身份不符、签名不合法
-  等必须继续拒绝（见第 5 节）。
-- 新增「内容类」可选字段/类型的正确姿势参考 `audio`（语音消息）与 `mentions`/`edited`：
-  发送端省略默认值（普通消息字节不变），接收端旧版本忽略未知字段、未知 kind
-  normalize 后退化为 `file` 卡片照常下载/外部播放；编辑收敛走
-  `edit_message` + 历史推送的「作者本人经自己链路改写才接受」规则，其余来源一律按
-  伪造丢弃（改动 `history_reply` 合并规则必须两端同步并跑互通 E2E）。
+    （`direct_hello` 都进不来），表现为「手机电脑完全不互通」——当时两端
+    版本不一致；现在既然未发布、两端同步升级，校验可以直接强制。
+- 校验失败**永远拒绝**：密码错误、TOFU 身份不符、签名不合法/缺失
+  （编辑）等不因任何考虑放宽（见第 5 节）。
 
 ## 3. 握手细节必须逐字节一致
 
@@ -159,14 +168,8 @@ cd android; .\gradlew.bat testDebugUnitTest
 | `windows/tests/win_emu_accept_e2e.py` | 手机先拨 → PC 请求卡片点「接受」→ 会话建立 + 双向聊天 |
 | `android/tools/emulator_e2e.py` | 双 Android 模拟器全流程 |
 
-**改协议必须做混合版本验证**（老对端 + 新代码）：
-
-1. `git worktree add <临时目录> <旧提交>`，复制 `android/local.properties` 后构建旧 APK 并在
-   模拟器覆盖安装；
-2. 用当前 Windows 代码跑 `win_emu_accept_e2e.py`，应全过；
-3. 负面对照：用旧提交的 Windows 代码跑同一脚本，修复前应复现失败（证明测试有效）。
-4. 验证完 `git worktree remove --force <临时目录>`；Android 构建目录路径过长，必要时用
-   `cmd /c rmdir /s /q` 清理。
+**改协议两端必须同步改**（§2：未发布、无旧版本兼容兜底，不再做混合版本
+验证；两端跑各自全量单测 + 互通 E2E 即可）。
 
 测试文件约定：Windows 测试保持纯 ASCII（中文写 `\uXXXX` 转义）；辅助脚本写成 UTF-8 文件再
 执行，不要用 PowerShell here-string 传中文（会按 GBK 进管道）。

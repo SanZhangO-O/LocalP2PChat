@@ -56,6 +56,7 @@ import com.zqr.localchat.data.SavedChatMessage
 import com.zqr.localchat.data.GroupRead
 import com.zqr.localchat.data.MessageReaction
 import com.zqr.localchat.data.PinnedMessage
+import com.zqr.localchat.data.PendingOp
 import com.zqr.localchat.data.SavedGroup
 import com.zqr.localchat.data.sanitizeEmoji
 import com.zqr.localchat.data.sanitizeRelativePath
@@ -2842,8 +2843,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         // Message experience relayed by the host (the host validated the
         // member identities before forwarding)
-        p2p.editListener = { messageId, newContent, senderId ->
-            applyGroupEdit(groupId, messageId, newContent, senderId)
+        p2p.editListener = { messageId, newContent, senderId, messageSig ->
+            applyGroupEdit(groupId, messageId, newContent, senderId, messageSig)
         }
         p2p.reactionListener = { messageId, emoji, senderId, active ->
             applyReaction(groupId, messageId, emoji, senderId, active)
@@ -3678,6 +3679,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         GroupMeshManager.broadcastEdit(gid, messageId, newContent)
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { persistEditedContent(gid, messageId, newContent) }
+            // Windows _stage_pending_op parity: with BOTH paths down the edit
+            // cannot reach anyone right now — stage it durably and replay it
+            // when the group becomes reachable again (LESSONS 2026-09-21).
+            if (p2p.connectionLost.value && !GroupMeshManager.hasLinks(gid)) {
+                runCatching {
+                    chatDao.stagePendingOp(
+                        PendingOp(
+                            groupId = gid,
+                            kind = "edit",
+                            msgId = messageId,
+                            emoji = "",
+                            active = false,
+                            content = StoreCipher.protect(newContent),
+                            createdAt = System.currentTimeMillis()
+                        )
+                    )
+                }
+            }
         }
         return true
     }
@@ -3778,12 +3797,31 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val groupReceiptSent = ConcurrentHashMap<String, String>()
 
-    private fun applyGroupEdit(groupId: String, messageId: String, newContent: String, senderId: String) {
+    private fun applyGroupEdit(
+        groupId: String,
+        messageId: String,
+        newContent: String,
+        senderId: String,
+        messageSig: String? = null
+    ) {
         groupP2pMap[groupId]?.applyEditLocal(messageId, newContent, senderId)
         viewModelScope.launch(Dispatchers.IO) {
-            // author-gated persist: a forged edit can never rewrite stored
-            // history even if an upstream caller missed the authorization
             runCatching {
+                // mirror the verified edit into the mesh history copy so this
+                // member's own later history pushes carry the edited text
+                // instead of reverting it for rejoining members (Windows
+                // _apply_group_edit parity, LESSONS 2026-09-21); messageSig is
+                // the edit packet's senderSig (signature over the edited
+                // body's message transcript), verified again inside
+                // updateMeshMessage against the copy's identity fields
+                if (messageSig != null) {
+                    GroupMeshManager.updateMeshMessage(
+                        groupId, messageId, newContent, senderId,
+                        senderSig = messageSig
+                    )
+                }
+                // author-gated persist: a forged edit can never rewrite stored
+                // history even if an upstream caller missed the authorization
                 persistEditedContent(groupId, messageId, newContent, senderId = senderId)
             }
         }
@@ -4087,12 +4125,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (lost) {
                     CallManager.endIfOn(p2p, "连接已断开")
                     GroupCallManager.endIfOn(p2p, "连接已断开")
+                } else {
+                    // (re)connection point: flush ops staged while the group
+                    // was unreachable (Windows join-time replay parity)
+                    replayPendingOps(groupId)
                 }
                 _groups.update { list ->
                     list.map { g ->
                         if (g.groupId == groupId) g.copy(connected = !lost) else g
                     }
                 }
+            }
+        }
+        val jobMeshLinks = viewModelScope.launch {
+            // a mesh link coming up also makes the group reachable
+            GroupMeshManager.hasLinksFlow(groupId).collect { linked ->
+                if (linked) replayPendingOps(groupId)
             }
         }
         val jobMessages = viewModelScope.launch {
@@ -4222,7 +4270,30 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        monitoringJobs[groupId] = listOf(jobPeers, jobConnection, jobMessages)
+        monitoringJobs[groupId] = listOf(jobPeers, jobConnection, jobMeshLinks, jobMessages)
+    }
+
+    /** Replay staged offline ops in staging order now that the group is
+     *  reachable again (Windows _replay_pending_ops parity). Each op is
+     *  dropped after the attempt: applied+handed off, or permanently dead
+     *  (target gone — the FK cascade already removed it) — it must never
+     *  loop forever. */
+    private fun replayPendingOps(groupId: String) {
+        val p2p = groupP2pMap[groupId] ?: return
+        if (p2p.connectionLost.value && !GroupMeshManager.hasLinks(groupId)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val ops = runCatching { chatDao.getPendingOps(groupId) }.getOrDefault(emptyList())
+            for (op in ops) {
+                if (op.kind == "edit") {
+                    val content = runCatching { StoreCipher.unprotect(op.content) }.getOrDefault("")
+                    if (content.isNotEmpty()) {
+                        val ok = p2p.editMessage(op.msgId, content)
+                        if (ok) GroupMeshManager.broadcastEdit(groupId, op.msgId, content)
+                    }
+                }
+                runCatching { chatDao.deletePendingOp(groupId, op.kind, op.msgId, op.emoji) }
+            }
+        }
     }
 
     // ------------------------------------------------ message notifications

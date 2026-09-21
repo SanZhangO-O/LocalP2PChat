@@ -24,9 +24,10 @@ prefixed so "|" inside ids/content can never split them):
                hex(sha256(utf8(content)))]
   delete tombstone:
       parts = ["del", groupId, senderId, messageId]
-  edit rewrite:
-      parts = ["edit", groupId, senderId, messageId,
-               hex(sha256(utf8(newContent)))]
+  edit rewrite (edit_message senderSig covers the EDITED body's message
+  transcript, so the verified signature can be stored on the mesh history
+  copy and later history pushes pass verify_message):
+      parts = message transcript of the edited body (see message_fields_parts)
   group_update (owner only):
       parts = ["gupd", groupId, senderId, groupName-or-"", announcement-or-""]
   kick_member (owner only):
@@ -113,16 +114,6 @@ def message_parts(group_id: str, msg) -> list:
 
 def delete_parts(group_id: str, sender_id: str, message_id: str) -> list:
     return ["del", str(group_id), str(sender_id), str(message_id)]
-
-
-def edit_parts(group_id: str, sender_id: str, message_id: str, new_content: str) -> list:
-    return [
-        "edit",
-        str(group_id),
-        str(sender_id),
-        str(message_id),
-        content_digest(new_content),
-    ]
 
 
 def group_update_parts(
@@ -214,6 +205,23 @@ def _check(group_id: str, sender_id: str, pub_b64, sig_b64, parts) -> bool:
     return True
 
 
+def message_fields_parts(
+    group_id: str, sender_id: str, message_id: str, timestamp: int, content: str
+) -> list:
+    """Transcript parts for a message known only by its fields: an
+    edit_message packet carries the author's signature over the EDITED body's
+    message transcript (no ChatMessage object exists on the wire). Byte-parity
+    with message_parts."""
+    return [
+        "msg",
+        str(group_id),
+        str(sender_id),
+        str(message_id),
+        str(int(timestamp)),
+        content_digest(content),
+    ]
+
+
 def verify_message(group_id: str, message) -> bool:
     """Full policy check for an inbound group ChatMessage."""
     return _check(
@@ -225,21 +233,34 @@ def verify_message(group_id: str, message) -> bool:
     )
 
 
-def verify_delete(group_id: str, sender_id: str, message_id: str, pub_b64, sig_b64) -> bool:
-    return _check(
-        group_id, sender_id, pub_b64, sig_b64, delete_parts(group_id, sender_id, message_id)
-    )
-
-
-def verify_edit(
-    group_id: str, sender_id: str, message_id: str, new_content: str, pub_b64, sig_b64
+def verify_message_fields(
+    group_id: str,
+    sender_id: str,
+    message_id: str,
+    timestamp: int,
+    content: str,
+    pub_b64,
+    sig_b64,
 ) -> bool:
+    """verify_message for the signature carried by an edit_message packet: the
+    receiver rebuilds the message transcript from its LOCAL copy's identity
+    fields (id/timestamp/author — immutable) plus the edit's new content.
+    Strict: an unsigned edit is refused here — an edit rewrites stored
+    history and is never tolerated without a signature."""
+    if not pub_b64 or not sig_b64:
+        return False
     return _check(
         group_id,
         sender_id,
         pub_b64,
         sig_b64,
-        edit_parts(group_id, sender_id, message_id, new_content),
+        message_fields_parts(group_id, sender_id, message_id, timestamp, content),
+    )
+
+
+def verify_delete(group_id: str, sender_id: str, message_id: str, pub_b64, sig_b64) -> bool:
+    return _check(
+        group_id, sender_id, pub_b64, sig_b64, delete_parts(group_id, sender_id, message_id)
     )
 
 

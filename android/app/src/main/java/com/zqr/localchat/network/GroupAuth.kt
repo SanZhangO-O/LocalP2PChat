@@ -12,7 +12,7 @@ import com.zqr.localchat.data.ChatMessage
  * previously only required holding the group password, so a leaked password
  * meant any member could forge ANY author. Group messages, delete tombstones,
  * edit rewrites and owner management packets (group_update / kick_member)
- * optionally carry the author's device identity signature:
+ * carry the author's device identity signature:
  *
  *   senderPubId  Base64 long-term identity public key (same key + encoding
  *                as the direct-mode handshake "ident" field)
@@ -30,8 +30,11 @@ import com.zqr.localchat.data.ChatMessage
  *   message:    ["msg", groupId, senderId, messageId, timestamp.toString(),
  *                hex(sha256(utf8(content)))]
  *   delete:     ["del", groupId, senderId, messageId]
- *   edit:       ["edit", groupId, senderId, messageId,
- *                hex(sha256(utf8(newContent)))]
+ *   edit rewrite: the edit_message senderSig covers the EDITED body's
+ *             message transcript (the fields variant [messageParts], built
+ *             from the receiver's copy identity + new content), so the
+ *             verified signature can be stored on the mesh history copy and
+ *             later history pushes pass [verifyMessage]
  *   groupUpdate:["gupd", groupId, senderId, groupName-or-"", announcement-or-""]
  *   kick:       ["kick", groupId, senderId, targetId]
  *
@@ -43,6 +46,10 @@ import com.zqr.localchat.data.ChatMessage
  *   - invalid signature -> reject (never relax)
  *   - valid signature -> TOFU-bind on first sight; a LATER DIFFERENT key for
  *     the same sender is rejected (fingerprint mismatch = possible MITM)
+ *
+ * EDIT exception: edits rewrite stored history and are verified strictly via
+ * [verifyMessageFields] — an unsigned edit is refused on every path (the
+ * project is unreleased, no legacy tolerance).
  *
  * Callers must verify BEFORE merging state or firing listener/persistence
  * callbacks (LESSONS 2026-09-19 #3).
@@ -85,25 +92,31 @@ object GroupAuth {
     fun contentDigest(content: String): String =
         Crypto.hex(Crypto.sha256(content.toByteArray(Charsets.UTF_8)))
 
-    fun messageParts(groupId: String, msg: ChatMessage): List<String> = listOf(
+    fun messageParts(groupId: String, msg: ChatMessage): List<String> = messageParts(
+        groupId, msg.senderId, msg.id, msg.timestamp, msg.content
+    )
+
+    /** Transcript parts for a message known only by its fields: an
+     *  edit_message packet carries the author's signature over the EDITED
+     *  body's message transcript (no ChatMessage object exists on the wire).
+     *  Byte-parity with [messageParts]. */
+    fun messageParts(
+        groupId: String,
+        senderId: String,
+        messageId: String,
+        timestamp: Long,
+        content: String
+    ): List<String> = listOf(
         "msg",
         groupId,
-        msg.senderId,
-        msg.id,
-        msg.timestamp.toString(),
-        contentDigest(msg.content)
+        senderId,
+        messageId,
+        timestamp.toString(),
+        contentDigest(content)
     )
 
     fun deleteParts(groupId: String, senderId: String, messageId: String): List<String> =
         listOf("del", groupId, senderId, messageId)
-
-    fun editParts(
-        groupId: String,
-        senderId: String,
-        messageId: String,
-        newContent: String
-    ): List<String> =
-        listOf("edit", groupId, senderId, messageId, contentDigest(newContent))
 
     fun groupUpdateParts(
         groupId: String,
@@ -199,15 +212,26 @@ object GroupAuth {
         sigB64: String?
     ): Boolean = check(groupId, senderId, pubB64, sigB64, deleteParts(groupId, senderId, messageId))
 
-    fun verifyEdit(
+    /** [verifyMessage] for the signature carried by an edit_message packet:
+     *  the receiver rebuilds the message transcript from its LOCAL copy's
+     *  identity fields (id/timestamp/author — immutable) plus the edit's new
+     *  content. Strict: an unsigned edit is refused here — an edit rewrites
+     *  stored history and is never tolerated without a signature. */
+    fun verifyMessageFields(
         groupId: String,
         senderId: String,
         messageId: String,
-        newContent: String,
+        timestamp: Long,
+        content: String,
         pubB64: String?,
         sigB64: String?
-    ): Boolean =
-        check(groupId, senderId, pubB64, sigB64, editParts(groupId, senderId, messageId, newContent))
+    ): Boolean {
+        if (pubB64.isNullOrBlank() || sigB64.isNullOrBlank()) return false
+        return check(
+            groupId, senderId, pubB64, sigB64,
+            messageParts(groupId, senderId, messageId, timestamp, content)
+        )
+    }
 
     fun verifyGroupUpdate(
         groupId: String,

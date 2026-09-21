@@ -538,8 +538,11 @@ class P2PManager(
     var typingListener: ((senderId: String, active: Boolean) -> Unit)? = null
 
     /** Message-experience callbacks (edit / reaction / pin / group read
-     *  receipt) relayed or mesh-delivered; set by the ViewModel. */
-    var editListener: ((messageId: String, newContent: String, senderId: String) -> Unit)? = null
+     *  receipt) relayed or mesh-delivered; set by the ViewModel. The edit's
+     *  [messageSig] parameter is the packet's senderSig — the author's
+     *  signature over the edited body's message transcript — used to mirror
+     *  the edit into the mesh history copy. */
+    var editListener: ((messageId: String, newContent: String, senderId: String, messageSig: String?) -> Unit)? = null
     var reactionListener: ((messageId: String, emoji: String, senderId: String, active: Boolean) -> Unit)? = null
     var pinListener: ((messageId: String, senderId: String, active: Boolean) -> Unit)? = null
     var groupReceiptListener: ((readerId: String, upToId: String) -> Unit)? = null
@@ -1343,12 +1346,19 @@ class P2PManager(
                     Log.w(TAG, "reject edit_message $id from $senderId: author=${target?.senderId}")
                     return
                 }
-                if (!GroupAuth.verifyEdit(groupId, senderId, id, content, packet.senderPubId, packet.senderSig)) return
+                if (!GroupAuth.verifyMessageFields(
+                        groupId, senderId, id, target.timestamp, content,
+                        packet.senderPubId, packet.senderSig
+                    )
+                ) {
+                    Log.w(TAG, "reject edit_message $id: unsigned or invalid edit signature")
+                    return
+                }
                 applyEditLocal(id, content, senderId)
                 // the ViewModel persists the edit (Windows listener
                 // .message_edited parity) — without this the host's stored row
                 // keeps the pre-edit text until some mesh link re-delivers it
-                editListener?.invoke(id, content, senderId)
+                editListener?.invoke(id, content, senderId, packet.senderSig)
                 broadcastToClients(packet, exclude = senderId)
             }
             "reaction" -> {
@@ -1581,34 +1591,46 @@ class P2PManager(
 
     /** Author-only text edit: applies locally (content + edited flag) and
      *  broadcasts edit_message so every member's copy follows. The group mesh
-     *  is mirrored by the ViewModel (like a chat send). */
+     *  is mirrored by the ViewModel (like a chat send). The packet signature
+     *  covers the EDITED body's message transcript (GroupAuth.
+     *  messageParts): receivers verify it against their local copy and store
+     *  it, so later mesh history pushes pass verifyMessage and the edit
+     *  converges to members that were offline. Unsigned (identity not
+     *  initialized) edits are refused — an edit rewrites stored history and
+     *  is never sent without a signature. */
     fun editMessage(messageId: String, newContent: String): Boolean {
         if (!isValidContent(newContent)) return false
         val target = _messages.value.firstOrNull { it.id == messageId }
         if (target == null || target.senderId != myId) return false
-        val signedEdit = GroupAuth.signParts(
-            GroupAuth.editParts(currentGroupId, myId, messageId, newContent)
+        val signed = GroupAuth.signParts(
+            GroupAuth.messageParts(
+                currentGroupId, myId, messageId, target.timestamp, newContent
+            )
         )
+        if (signed == null) return false
+        val (pub, sig) = signed
         _messages.update { list ->
             list.map {
                 if (it.id == messageId) {
-                    // re-sign the local copy so mesh history pushes stay
-                    // content-signature consistent after the edit
-                    GroupAuth.signMessage(currentGroupId, it.copy(content = newContent, edited = true))
+                    // the packet signature verifies as the new content's
+                    // message signature: store it so mesh history pushes stay
+                    // verifyMessage-valid after the edit
+                    it.copy(content = newContent, edited = true,
+                            senderPubId = pub, senderSig = sig)
                 } else it
             }
         }
-        var packet = NetworkPacket(
-            type = "edit_message",
-            groupId = currentGroupId,
-            messageId = messageId,
-            senderId = myId,
-            newContent = newContent
+        enqueueSend(
+            NetworkPacket(
+                type = "edit_message",
+                groupId = currentGroupId,
+                messageId = messageId,
+                senderId = myId,
+                newContent = newContent,
+                senderPubId = pub,
+                senderSig = sig
+            )
         )
-        if (signedEdit != null) {
-            packet = packet.copy(senderPubId = signedEdit.first, senderSig = signedEdit.second)
-        }
-        enqueueSend(packet)
         return true
     }
 
@@ -1715,9 +1737,16 @@ class P2PManager(
             )
             return
         }
-        if (!GroupAuth.verifyEdit(groupId, sender, id, content, packet.senderPubId, packet.senderSig)) return
+        if (!GroupAuth.verifyMessageFields(
+                groupId, sender, id, target.timestamp, content,
+                packet.senderPubId, packet.senderSig
+            )
+        ) {
+            Log.w(TAG, "reject edit_message $id: unsigned or invalid edit signature")
+            return
+        }
         applyEditLocal(id, content, sender, packet.senderPubId, packet.senderSig)
-        editListener?.invoke(id, content, sender)
+        editListener?.invoke(id, content, sender, packet.senderSig)
     }
 
     private fun applyRelayedReaction(packet: NetworkPacket) {

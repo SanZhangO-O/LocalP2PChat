@@ -92,6 +92,27 @@ interface ChatDao {
         senderId: String
     ): Int
 
+    // ------------------------------------------------------- pending op log
+
+    /** Stage one offline message-experience op. Idempotent: an op with the
+     *  same (groupId, kind, msgId, emoji) is replaced in place (latest
+     *  payload, Android parity with the Windows store). */
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun stagePendingOp(op: PendingOp)
+
+    /** Staged ops of one group in staging order (replayed when the group is
+     *  reachable again). */
+    @Query("SELECT * FROM pending_ops WHERE groupId = :groupId ORDER BY createdAt ASC")
+    suspend fun getPendingOps(groupId: String): List<PendingOp>
+
+    /** Drop one op after its replay attempt (applied+handed off, or
+     *  permanently dead — it must never loop forever, Windows parity). */
+    @Query(
+        "DELETE FROM pending_ops WHERE groupId = :groupId AND kind = :kind " +
+            "AND msgId = :msgId AND emoji = :emoji"
+    )
+    suspend fun deletePendingOp(groupId: String, kind: String, msgId: String, emoji: String)
+
     // ------------------------------------------------- reactions / pins / reads
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)

@@ -283,26 +283,44 @@ object GroupMeshManager {
     }
 
     /** Tell every linked member that [messageId]'s author replaced its
-     *  content (host-offline path). The edit is applied to this device's own
-     *  mesh history FIRST: a later history_reply must push the new text, or
-     *  every link re-establish would push the stale text and (because the
-     *  author-link merge rule accepts it) revert the edit on the receivers. */
+     *  content (host-offline path). The packet signature covers the edited
+     *  body's message transcript: receivers verify it against their copies
+     *  and store it, so this member's later history pushes carry the new
+     *  text AND a signature that passes verifyMessage (LESSONS 2026-09-21).
+     *  Unsigned (identity missing) edits are not broadcast. */
     fun broadcastEdit(groupId: String, messageId: String, newContent: String) {
         val state = groups[groupId] ?: return
         val myId = state.myPeer?.id ?: return
-        val packet = GroupAuth.signPacket(
-            NetworkPacket(
-                type = "edit_message",
-                groupId = groupId,
-                messageId = messageId,
-                senderId = myId,
-                newContent = newContent
-            ),
-            GroupAuth.editParts(groupId, myId, messageId, newContent)
-        )
-        updateMeshMessage(
-            groupId, messageId, newContent, myId,
-            packet.senderPubId, packet.senderSig
+        var pub: String? = null
+        var sig: String? = null
+        synchronized(state) {
+            val messages = state.messages.value
+            val target = messages.firstOrNull { it.id == messageId }
+            if (target != null && target.senderId == myId) {
+                val signed = GroupAuth.signParts(
+                    GroupAuth.messageParts(groupId, myId, messageId, target.timestamp, newContent)
+                )
+                if (signed != null) {
+                    pub = signed.first
+                    sig = signed.second
+                    val edited = target
+                        .copy(content = newContent, edited = true,
+                              senderPubId = pub, senderSig = sig)
+                    state.messages.value = messages.map {
+                        if (it.id == messageId) edited else it
+                    }
+                }
+            }
+        }
+        if (pub == null || sig == null) return
+        val packet = NetworkPacket(
+            type = "edit_message",
+            groupId = groupId,
+            messageId = messageId,
+            senderId = myId,
+            newContent = newContent,
+            senderPubId = pub,
+            senderSig = sig
         )
         val links = state.links.values.toList()
         sendExecutor.execute {
@@ -371,9 +389,16 @@ object GroupMeshManager {
         }
     }
 
-    /** Apply an edit to this member's mesh history copy (author-validated by
-     *  the caller), so a later history push carries the new text. When the
-     *  verified packet carried author identity fields, the copy adopts them. */
+    /** Apply a verified edit to this member's mesh history copy so a later
+     *  history push carries the new text. [senderPubId]/[senderSig] are the
+     *  edit packet's author fields: the signature must verify as the EDITED
+     *  body's message transcript against this copy's identity fields (the
+     *  packet key, or the key already stored on the copy when the caller did
+     *  not carry it) — on success it is stored as the copy's signature, so
+     *  pushed history passes verifyMessage and the edit converges to members
+     *  that were offline (LESSONS 2026-09-21). Strict: a missing or invalid
+     *  signature rejects the edit (an unsigned rewrite must never enter
+     *  history). */
     fun updateMeshMessage(
         groupId: String,
         messageId: String,
@@ -387,17 +412,20 @@ object GroupMeshManager {
             val messages = state.messages.value
             val target = messages.firstOrNull { it.id == messageId } ?: return false
             if (target.senderId != senderId) return false
-            var replacement = target
-            if (target.content != newContent || !target.edited) {
-                replacement = replacement.copy(content = newContent, edited = true)
+            val pub = senderPubId ?: target.senderPubId
+            if (pub == null || !GroupAuth.verifyMessageFields(
+                    groupId, senderId, messageId, target.timestamp, newContent,
+                    pub, senderSig
+                )
+            ) {
+                return false
             }
-            if (!senderPubId.isNullOrBlank() && !senderSig.isNullOrBlank()) {
-                replacement = replacement.copy(senderPubId = senderPubId, senderSig = senderSig)
-            }
-            if (replacement != target) {
-                state.messages.value = messages.map {
-                    if (it.id == messageId) replacement else it
-                }
+            val replacement = target.copy(
+                content = newContent, edited = true,
+                senderPubId = pub, senderSig = senderSig
+            )
+            state.messages.value = messages.map {
+                if (it.id == messageId) replacement else it
             }
         }
         return true
@@ -704,7 +732,9 @@ object GroupMeshManager {
                         // 历史里合法包含多个发送者的消息，但每条仍须形状
                         // 合法：senderId 非空白且内容不超限（与 Windows 端
                         // 过滤一致），防止伪造 senderId 注入或超长内容入库；
-                        // 每条还须通过作者设备签名校验（TOFU）才可入历史
+                        // 每条还须通过作者设备签名校验（TOFU）才可入历史。
+                        // 严格模式：验签不过的条目一律丢弃，即使是作者本人
+                        // 链路推来的（项目未发布，无 legacy 容忍）。
                         val incoming = packet.messages.orEmpty()
                             .filter {
                                 it.senderId.isNotBlank() && P2PManager.isValidContent(it.content) &&
@@ -785,7 +815,9 @@ object GroupMeshManager {
      *  an id-colliding entry rewrites the local copy ONLY when the author
      *  pushes its OWN message over its OWN link (edit convergence — the
      *  strict rule mirrors the Windows client: everyone else's collision is
-     *  a forged overwrite and is dropped). */
+     *  a forged overwrite and is dropped). Entries already passed
+     *  verifyMessage, so the collision rewrite adopts the entry's signature
+     *  and this member's own pushes stay verifyMessage-valid. */
     private fun applyHistoryBatch(state: GroupState, link: Link, incoming: List<ChatMessage>) {
         if (incoming.isEmpty()) return
         val stillNew = ArrayList<ChatMessage>(incoming.size)
@@ -800,8 +832,12 @@ object GroupMeshManager {
                         existing.senderId == msg.senderId &&
                         existing.content != msg.content -> {
                         // edit convergence: replace in the mesh state and
-                        // report the edit so the ViewModel updates the row
-                        updateMeshMessage(state.groupId, msg.id, msg.content, msg.senderId)
+                        // report the edit so the ViewModel updates the row;
+                        // the entry's (verified) signature is adopted
+                        updateMeshMessage(
+                            state.groupId, msg.id, msg.content, msg.senderId,
+                            msg.senderPubId, msg.senderSig
+                        )
                         edits.add(msg)
                     }
                     // identical copy: dedup by id; anything else: forged drop
@@ -834,11 +870,12 @@ object GroupMeshManager {
             Log.w(TAG, "reject mesh edit $id: senderId=$sender on link ${link.peerId}")
             return
         }
-        if (!GroupAuth.verifyEdit(state.groupId, sender, id, content, packet.senderPubId, packet.senderSig)) {
-            return
-        }
-        if (!updateMeshMessage(state.groupId, id, content, sender, packet.senderPubId, packet.senderSig)) {
-            Log.w(TAG, "reject mesh edit $id: message not found or not authored by $sender")
+        if (!updateMeshMessage(
+                state.groupId, id, content, sender,
+                packet.senderPubId, packet.senderSig
+            )
+        ) {
+            Log.w(TAG, "reject mesh edit $id: unsigned, not verifiable, message not found or not authored by $sender")
             return
         }
         onGroupEdit?.invoke(state.groupId, id, content, sender)

@@ -33,22 +33,28 @@ class MessageExtrasProtocolTest {
 
     @Test
     fun `edit message wire format matches the Windows peer`() {
+        // the edit signature (senderSig) covers the EDITED body's message
+        // transcript — the wire shape is unchanged from the pre-edit era
         val packet = NetworkPacket(
             type = "edit_message",
             groupId = "g1",
             messageId = "m-1",
             senderId = "dev-A",
-            newContent = "new body"
+            newContent = "new body",
+            senderPubId = "PUB",
+            senderSig = "MSGSIG"
         )
         val wire = json.encodeToString(packet)
         assertEquals(
             "{\"type\":\"edit_message\",\"groupId\":\"g1\",\"messageId\":\"m-1\"," +
-                "\"senderId\":\"dev-A\",\"newContent\":\"new body\"}",
+                "\"senderId\":\"dev-A\",\"newContent\":\"new body\"," +
+                "\"senderPubId\":\"PUB\",\"senderSig\":\"MSGSIG\"}",
             wire
         )
         val decoded = json.decodeFromString<NetworkPacket>(wire)
         assertEquals("m-1", decoded.messageId)
         assertEquals("new body", decoded.newContent)
+        assertEquals("MSGSIG", decoded.senderSig)
     }
 
     @Test

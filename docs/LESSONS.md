@@ -382,3 +382,61 @@
   dtype 与形状，再决定 frombuffer + reshape 路径；
   「裸字节直接赋二维切片」一律是形状错误。
 
+## 2026-09-21 编辑消息四面修复：mesh 历史签名不一致 / 直聊离线半套用 / 副本别名 / Android 缺暂存
+
+- 现象(审查发现，静态确认):
+  1. mesh 编辑收敛失效：`update_mesh_message`/`updateMeshMessage` 把 mesh 副本
+     的 `senderSig` 换成 edit 包签名（edit transcript），而 `history_reply`
+     接收端先按 message transcript 过滤——已编辑条目验签必败、整条被静默
+     丢弃；且经 host relay 收到编辑的成员不更新 mesh 副本，推历史时把
+     *旧文本*（旧签名有效）推给重连成员，编辑被静默回退。离线成员收不到
+     新文本，甚至整条消息丢失。注释宣称的语义与实际相反。
+  2. Windows 直聊离线编辑半套用：`DirectChatManager.edit_message` 对端离线
+     仍先改内存副本并刷新 UI，`edit_direct_message` 只在发送成功时落库——
+     UI 显示新文本、重启回退、对端永远不知道；docstring 还谎称有 staged
+     replay（从未实现）。Android 一直是干净的 online-only。
+  3. Windows `mesh.broadcast` 把 relay 视图同一 ChatMessage 对象塞进 mesh
+     状态：`broadcast_edit` 的原地改签会覆盖 `p2p.edit_message` 刚做的
+     messageParts 重签。
+  4. Android 群编辑无任何离线暂存（Windows 有 pending_ops），双路径断时
+     编辑永不重放；Windows storage docstring 引用的「ChatDao.stagePendingOp
+     Android parity」并不存在。
+- 修复(两端同步；项目未发布，按「无历史包袱」直接改协议语义，不留旧版容忍):
+  - edit_message 的 `senderSig` 改为覆盖「编辑后完整消息」的 message
+    transcript（`message_fields_parts`/`messageParts`：gid+作者+消息 id+
+    副本时间戳+新内容摘要；旧的 edit transcript 与 `verify_edit`/
+    `editParts` 已删除）。接收端按本地副本时间戳+新内容严格验签，通过后
+    把该签名存为 mesh 历史副本的签名 → 历史推送天然通过 verify_message；
+    relay 收到的编辑也镜像进 mesh 副本；作者本机未初始化身份（无法签名）
+    时直接拒绝编辑，绝不发无签名编辑。
+  - 历史合并恢复单一过滤（verify_message），无任何 fallback；验签不过的
+    条目即使来自作者本人链路也丢弃。
+  - 直聊编辑改 online-only（先 send 成功再改本地，本地与持久层永不分歧）。
+  - `mesh.broadcast` 存 deepcopy，relay 视图与 mesh 状态彻底分家。
+  - Android 新增 `pending_ops` 表（DB v7，FK 级联）+ `replayPendingOps`
+    （connectionLost 恢复 / mesh 链路建立时触发），edit 暂存重放对齐 Windows。
+- 验证: `windows/tests/test_message_extras.py::EditConvergenceTest`
+  （签名编辑经真实 mesh 历史回填收敛到空历史新成员、update_mesh_message
+  对无签名/错签名/异作者严格拒绝、历史批次逐条过滤：签名改写收敛 +
+  enforced 作者的裸条目丢弃 + 合法新条目照收）、
+  `DirectExtrasTest::test_offline_direct_edit_changes_nothing`、
+  `test_group_auth.py::test_delete_edit_update_and_kick_roundtrip`
+  （verify_message_fields：内容/时间戳绑定 + 无签名拒绝）、
+  Android `GroupAuthTranscriptTest`（fields 版 messageParts 与对象版
+  字节一致）、`MessageExtrasProtocolTest`（edit 包 wire 形态不变）。
+- 防再犯:
+  - 「副本签名一致性」断言必须写死在测试里：凡是改写消息内容的路径，
+    改完立刻 `verify_message`/`verifyMessage` 自检（EditConvergenceTest
+    的写法），不要只测「内容变没变」。
+  - 签名 transcript 与消费场景必须同名同源：一个签名只能被按同一
+    transcript 的校验消费；edit 专用 transcript 与 message transcript
+    并存时，跨通道使用必炸（历史推送/存储副本按 message transcript 验）。
+    未发布项目直接删掉多余 transcript，保持「一种操作一种签名」。
+  - 在验证函数里复用通用 `_check`/`check` 时警惕 legacy 放行分支：
+    「pub 缺失 → legacy accept」对改写历史的操作是验证旁路，入口必须
+    显式要求签名存在（verify_message_fields 的严格前置判断）。
+  - 同一可变对象不能同时挂在两个互不同步的状态视图里（relay 视图 vs
+    mesh 状态），入第二视图时 deepcopy。
+  - 文档/docstring 里引用「对端已有实现」（如 Android parity）前先 grep
+    确认存在；不存在的「parity」注释会误导后续审查放行缺口。
+

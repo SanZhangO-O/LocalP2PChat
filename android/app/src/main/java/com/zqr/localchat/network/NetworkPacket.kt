@@ -95,9 +95,13 @@ data class NetworkPacket(
     val emoji: String? = null,
     /** Group sender identity binding (TOFU, see [GroupAuth]) for packets that
      *  claim authorship WITHOUT a ChatMessage object (delete_message /
-     *  edit_message / group_update / kick_member): the author's long-term
-     *  identity public key (Base64 SPKI) plus the ECDSA signature over the
-     *  packet's signing transcript. Null is omitted on the wire so plain
+     *  group_update / kick_member): the author's long-term identity public
+     *  key (Base64 SPKI) plus the ECDSA signature over the packet's signing
+     *  transcript. edit_message uses the same pair with the MESSAGE
+     *  transcript of the edited body ([GroupAuth.messageParts] over the
+     *  receiver's copy identity + new content) so the verified signature can
+     *  be stored on the mesh history copy and later history pushes pass
+     *  [GroupAuth.verifyMessage]. Null is omitted on the wire so plain
      *  packets stay byte-identical with older peers; chat/file messages
      *  carry the same pair inside [ChatMessage] instead. */
     val senderPubId: String? = null,

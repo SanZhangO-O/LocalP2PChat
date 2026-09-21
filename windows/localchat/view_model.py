@@ -1575,12 +1575,13 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # threads persist through the (thread-safe) store and hop to the main
     # thread via signals.
 
-    def message_edited(self, p2p: P2PManager, message_id: str, new_content: str, sender_id: str) -> None:
+    def message_edited(self, p2p: P2PManager, message_id: str, new_content: str, sender_id: str, message_sig: Optional[str] = None) -> None:
         """A relayed edit_message arrived (host relay path). The manager's
-        in-memory copy is already updated; persist and refresh."""
+        in-memory copy is already updated; persist and refresh. [message_sig]
+        mirrors the edit into the mesh history copy (LESSONS 2026-09-21 #1)."""
         gid = p2p.current_group_id
         if gid:
-            self._apply_group_edit(gid, message_id, new_content, sender_id)
+            self._apply_group_edit(gid, message_id, new_content, sender_id, message_sig=message_sig)
 
     def reaction_changed(self, p2p: P2PManager, message_id: str, emoji: str, sender_id: str, active: bool) -> None:
         gid = p2p.current_group_id
@@ -1597,8 +1598,8 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         if gid:
             self._apply_group_read_receipt(gid, reader_id, up_to_id)
 
-    def group_mesh_edit(self, group_id: str, message_id: str, new_content: str, sender_id: str) -> None:
-        self._apply_group_edit(group_id, message_id, new_content, sender_id)
+    def group_mesh_edit(self, group_id: str, message_id: str, new_content: str, sender_id: str, message_sig: Optional[str] = None) -> None:
+        self._apply_group_edit(group_id, message_id, new_content, sender_id, message_sig=message_sig)
 
     def group_mesh_reaction(self, group_id: str, message_id: str, emoji: str, sender_id: str, active: bool) -> None:
         self._apply_reaction(group_id, message_id, emoji, sender_id, active)
@@ -1728,17 +1729,27 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
             self.store.set_message_pinned(key, message_id, active, pinned_by=peer_id)
         self.extras_changed.emit(key)
 
-    def _apply_group_edit(self, group_id: str, message_id: str, new_content: str, sender_id: str) -> None:
+    def _apply_group_edit(self, group_id: str, message_id: str, new_content: str, sender_id: str, message_sig: Optional[str] = None) -> None:
         """Persist a received edit and mirror it into the owning group's
         in-memory list (the mesh path has updated its own state already; the
         relay paths updated the P2PManager copy — apply_edit_local is
-        idempotent either way). The store write is author-gated in SQL, so a
-        forged edit can never rewrite stored history even if an upstream
-        caller skipped the authorization, and the UI only refreshes when a
-        row actually changed."""
+        idempotent either way). [message_sig] is the verified edit packet
+        signature (the edited body's message transcript): mirroring it into
+        the mesh history copy keeps this member's own later history pushes
+        carrying the edited text instead of reverting it for rejoining
+        members (LESSONS 2026-09-21 #1); the history-merge path passes None
+        because it already rewrote its mesh copy. The store write is
+        author-gated in SQL, so a forged edit can never rewrite stored
+        history even if an upstream caller skipped the authorization, and
+        the UI only refreshes when a row actually changed."""
         p2p = self.group_p2p_map.get(group_id)
         if p2p is not None:
             p2p.apply_edit_local(message_id, new_content, sender_id)
+        if message_sig:
+            self.mesh.update_mesh_message(
+                group_id, message_id, new_content, sender_id,
+                sender_sig=message_sig,
+            )
         with self._lock:
             changed = self.store.update_message_content(
                 group_id, message_id, new_content, sender_id=sender_id
@@ -3130,9 +3141,10 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         return sent or not self.direct.is_chat_alive(peer_id)
 
     def edit_direct_message(self, peer_id: str, message_id: str, new_content: str) -> bool:
-        """Edit one of OUR direct-chat messages (live session only; the local
-        copy follows even when the peer is offline but the send fails — an
-        offline edit cannot reach the peer)."""
+        """Edit one of OUR direct-chat messages (live session only, Android
+        parity: when the peer is offline NOTHING changes — no local rewrite,
+        no staged replay — so the local copy and the peer's copy can never
+        disagree). The local store follows only an accepted edit."""
         sent = self.direct.edit_message(peer_id, message_id, new_content)
         if sent:
             with self._lock:

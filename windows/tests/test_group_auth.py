@@ -200,14 +200,30 @@ class PolicyTest(unittest.TestCase):
             groupauth.verify_delete(OTHER_GRP, "aaa-member", "d-1", pub, sig)
         )
 
+        # the edit signature covers the EDITED body's message transcript
+        # (message_fields_parts): verified against the receiver's copy
+        # identity (fixed timestamp) plus the new content — and it is
+        # strict: without a signature the edit is refused
         pub, sig = groupauth.sign_parts(
-            groupauth.edit_parts(GRP, "aaa-member", "e-1", "after")
+            groupauth.message_fields_parts(GRP, "aaa-member", "e-1", 123, "after")
         )
         self.assertTrue(
-            groupauth.verify_edit(GRP, "aaa-member", "e-1", "after", pub, sig)
+            groupauth.verify_message_fields(
+                GRP, "aaa-member", "e-1", 123, "after", pub, sig
+            )
         )
         self.assertFalse(
-            groupauth.verify_edit(GRP, "aaa-member", "e-1", "other", pub, sig)
+            groupauth.verify_message_fields(
+                GRP, "aaa-member", "e-1", 123, "other", pub, sig
+            )
+        )
+        self.assertFalse(
+            groupauth.verify_message_fields(
+                GRP, "aaa-member", "e-1", 456, "after", pub, sig
+            )
+        )
+        self.assertFalse(
+            groupauth.verify_message_fields(GRP, "aaa-member", "e-1", 123, "after", None, None)
         )
 
         pub, sig = groupauth.sign_parts(

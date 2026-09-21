@@ -1,3 +1,4 @@
+import copy
 import ipaddress
 import logging
 import os
@@ -1276,9 +1277,11 @@ class P2PListener:
 
     # ------------------------------------------- message-experience callbacks
 
-    def message_edited(self, p2p: "P2PManager", message_id: str, new_content: str, sender_id: str) -> None:
-        """A member edited its own message (edit_message; the relay/mesh path
-        has already validated the author)."""
+    def message_edited(self, p2p: "P2PManager", message_id: str, new_content: str, sender_id: str, message_sig: Optional[str] = None) -> None:
+        """A member edited its own message (edit_message; the relay path has
+        already validated the author and the edit signature). [message_sig]
+        is the packet's senderSig — the author's signature over the edited
+        body's message transcript — for the mesh-copy mirror."""
         pass
 
     def reaction_changed(
@@ -2337,20 +2340,26 @@ class P2PManager:
                 target.sender_id if target is not None else None,
             )
             return
-        if not groupauth.verify_edit(
+        if not groupauth.verify_message_fields(
             self.current_group_id,
             packet.sender_id,
             packet.message_id,
+            target.timestamp,
             packet.new_content,
             packet.sender_pub_id,
             packet.sender_sig,
         ):
+            logger.warning(
+                "reject edit_message %s: unsigned or invalid edit signature",
+                packet.message_id,
+            )
             return
         with self._lock:
             target.content = packet.new_content
             target.edited = True
         self.listener.message_edited(
-            self, packet.message_id, packet.new_content, packet.sender_id
+            self, packet.message_id, packet.new_content, packet.sender_id,
+            message_sig=packet.sender_sig,
         )
 
     def _apply_relayed_reaction(self, packet: NetworkPacket) -> None:
@@ -2503,7 +2512,9 @@ class P2PManager:
                 self._broadcast_to_clients(packet, exclude=sender_id)
         elif packet.type == "edit_message" and packet.message_id and packet.new_content is not None:
             # only the message's original author may edit, and the claimed
-            # sender must be the authenticated connection (host relay rule)
+            # sender must be the authenticated connection (host relay rule);
+            # the packet signature must verify as the edited body's message
+            # transcript against the host's copy (strict — no unsigned edit)
             target = None
             with self._lock:
                 target = next(
@@ -2513,21 +2524,22 @@ class P2PManager:
                 target is not None
                 and packet.sender_id == sender_id
                 and target.sender_id == sender_id
-            ):
-                if not groupauth.verify_edit(
+                and groupauth.verify_message_fields(
                     self.current_group_id,
                     sender_id,
                     packet.message_id,
+                    target.timestamp,
                     packet.new_content,
                     packet.sender_pub_id,
                     packet.sender_sig,
-                ):
-                    return
+                )
+            ):
                 with self._lock:
                     target.content = packet.new_content
                     target.edited = True
                 self.listener.message_edited(
-                    self, packet.message_id, packet.new_content, sender_id
+                    self, packet.message_id, packet.new_content, sender_id,
+                    message_sig=packet.sender_sig,
                 )
                 self._broadcast_to_clients(packet, exclude=sender_id)
             else:
@@ -2786,18 +2798,34 @@ class P2PManager:
     def edit_message(self, message_id: str, new_content: str) -> bool:
         """Author-only text edit: applies locally (content + edited flag) and
         broadcasts edit_message so every member's copy follows. The group mesh
-        is mirrored by the ViewModel (like a chat send)."""
+        is mirrored by the ViewModel (like a chat send). The packet signature
+        covers the EDITED body's message transcript (groupauth.
+        message_fields_parts): receivers verify it against their local copy
+        and store it, so later mesh history pushes pass verify_message and
+        the edit converges to members that were offline. Unsigned (identity
+        not initialized) edits are refused — an edit rewrites stored history
+        and is never sent without a signature."""
         if not is_valid_content(new_content):
             return False
         with self._lock:
             target = next((m for m in self.messages if m.id == message_id), None)
             if target is None or target.sender_id != self.my_id:
                 return False
+            pub, sig = groupauth.sign_parts(
+                groupauth.message_fields_parts(
+                    self.current_group_id, self.my_id,
+                    message_id, target.timestamp, new_content,
+                )
+            )
+            if not pub:
+                return False
             target.content = new_content
             target.edited = True
-            # re-sign the local copy so mesh history pushes (which serialize
-            # this object) stay content-signature consistent after the edit
-            groupauth.sign_message(self.current_group_id, target)
+            # the packet signature verifies as the new content's message
+            # signature: store it on the local copy so mesh history pushes
+            # (which serialize this object) stay verify_message-valid
+            target.sender_pub_id = pub
+            target.sender_sig = sig
         self.listener.messages_changed(self)
         packet = NetworkPacket(
             type="edit_message",
@@ -2805,10 +2833,8 @@ class P2PManager:
             message_id=message_id,
             sender_id=self.my_id,
             new_content=new_content,
-        )
-        groupauth.sign_packet(
-            packet,
-            groupauth.edit_parts(self.current_group_id, self.my_id, message_id, new_content),
+            sender_pub_id=pub,
+            sender_sig=sig,
         )
         self._enqueue_send(packet)
         return True
@@ -4590,31 +4616,24 @@ class DirectChatManager:
             pass
 
     def edit_message(self, peer_id: str, message_id: str, new_content: str) -> bool:
-        """Edit one of OUR direct-chat messages. The edit applies locally in
-        every case the target is a valid own message; the return value says
-        whether it was handed to a live session. False means the peer was
-        offline — the ViewModel then stages the edit in the pending-op log so
-        it replays (in order, idempotently) once the session comes up, giving
-        offline edits the same convergence the direct outbox gives messages
-        (deletes keep their online-only semantics)."""
+        """Edit one of OUR direct-chat messages on a LIVE session (Android
+        parity, deletes semantics). Online-only on purpose: an offline edit
+        can never reach the peer, and applying half of it (local list only)
+        used to diverge from the persisted copy — the edit visibly reverted
+        on restart while the peer kept the original forever. Returns False
+        when there is no live session (nothing changes at all), the message
+        is not ours, or the wire rejected the packet."""
         if not is_valid_content(new_content):
             return False
         with self._lock:
             session = self._sessions.get(peer_id)
             my_id = self._my_id
-        alive = session is not None and session["alive"]
+        if session is None or not session["alive"]:
+            return False
         target = next(
             (m for m in self._messages.get(peer_id, []) if m.id == message_id), None
         )
         if target is None or target.sender_id != my_id:
-            return False
-        self._edit_message(peer_id, message_id, new_content, my_id)
-        # mark edited even when the new text equals the old one (the user
-        # still went through the edit flow)
-        with self._lock:
-            target.edited = True
-        self._notify_messages(peer_id)
-        if not alive:
             return False
         try:
             self._put_send(
@@ -4629,6 +4648,14 @@ class DirectChatManager:
             )
         except Exception:
             return False
+        # applied only after the packet was handed to the live wire: local
+        # list and persisted copy can never disagree about an accepted edit
+        self._edit_message(peer_id, message_id, new_content, my_id)
+        # mark edited even when the new text equals the old one (the user
+        # still went through the edit flow)
+        with self._lock:
+            target.edited = True
+        self._notify_messages(peer_id)
         return True
 
     def send_direct_reaction(self, peer_id: str, message_id: str, emoji: str, active: bool) -> bool:
@@ -5449,9 +5476,13 @@ class GroupMeshListener:
         or the kicked member's teardown)."""
         pass
 
-    def group_mesh_edit(self, group_id: str, message_id: str, new_content: str, sender_id: str) -> None:
+    def group_mesh_edit(self, group_id: str, message_id: str, new_content: str, sender_id: str, message_sig: Optional[str] = None) -> None:
         """A member edited its own message (edit_message over a mesh link;
-        the mesh layer validated sender against the link and the author)."""
+        the mesh layer validated sender against the link and the edit
+        signature). [message_sig] is the packet's senderSig (signature over
+        the edited body's message transcript) for the mesh-copy mirror; None
+        from the history-merge path (which already updated the mesh copy
+        itself)."""
         pass
 
     def group_mesh_reaction(self, group_id: str, message_id: str, emoji: str, sender_id: str, active: bool) -> None:
@@ -5659,7 +5690,12 @@ class GroupMeshManager:
             # + mesh overlap) and must not double-fill the history (Android
             # noteMessage parity)
             if not any(m.id == msg.id for m in state["messages"]):
-                state["messages"].append(msg)
+                # store a COPY: the caller keeps the same object in the relay
+                # view (p2p.messages), and update_mesh_message mutates its
+                # target in place — sharing one object would let a mesh-side
+                # edit signature overwrite the relay copy's fresh message
+                # signature (LESSONS 2026-09-21 #4)
+                state["messages"].append(copy.deepcopy(msg))
             state["messages"].sort(key=lambda m: m.timestamp)
             if len(state["messages"]) > self.HISTORY_CAP:
                 del state["messages"][: len(state["messages"]) - self.HISTORY_CAP]
@@ -5734,33 +5770,42 @@ class GroupMeshManager:
             self._spawn(self._link_write, link, packet)
 
     def broadcast_edit(self, group_id: str, message_id: str, new_content: str) -> None:
-        """Tell every linked member that [message_id]'s author replaced its
-        content (host-offline path). The sender has already applied the edit
-        to its own mesh history (update_mesh_message), so a later history
-        push carries the new text."""
+        """Tell every linked member that [messageId]'s author replaced its
+        content (host-offline path). The packet signature covers the edited
+        body's message transcript: receivers verify it against their copies
+        and store it, so this member's later history pushes carry the new
+        text AND a signature that passes verify_message (LESSONS
+        2026-09-21 #1). Unsigned (identity missing) edits are not broadcast."""
         with self._lock:
             state = self._groups.get(group_id)
             if state is None:
                 return
             my_id = state["my_peer"].id if state["my_peer"] else ""
             links = list(state["links"].values())
+            target = next(
+                (m for m in state["messages"] if m.id == message_id), None
+            )
+            if target is None or target.sender_id != my_id:
+                return
+            pub, sig = groupauth.sign_parts(
+                groupauth.message_fields_parts(
+                    group_id, my_id, message_id, target.timestamp, new_content,
+                )
+            )
+            if not pub:
+                return
+            target.content = new_content
+            target.edited = True
+            target.sender_pub_id = pub
+            target.sender_sig = sig
         packet = NetworkPacket(
             type="edit_message",
             group_id=group_id,
             message_id=message_id,
             sender_id=my_id,
             new_content=new_content,
-        )
-        groupauth.sign_packet(
-            packet, groupauth.edit_parts(group_id, my_id, message_id, new_content)
-        )
-        self.update_mesh_message(
-            group_id,
-            message_id,
-            new_content,
-            my_id,
-            sender_pub_id=packet.sender_pub_id,
-            sender_sig=packet.sender_sig,
+            sender_pub_id=pub,
+            sender_sig=sig,
         )
         for link in links:
             self._spawn(self._link_write, link, packet)
@@ -5832,11 +5877,16 @@ class GroupMeshManager:
         sender_pub_id: Optional[str] = None,
         sender_sig: Optional[str] = None,
     ) -> bool:
-        """Apply an edit to this member's mesh history copy (author-validated
-        by the caller), so a later history push carries the new text. When
-        [sender_pub_id]/[sender_sig] are provided (the verified edit packet's
-        author fields) they replace the copy's signature so the pushed history
-        entry stays content-signature consistent."""
+        """Apply a verified edit to this member's mesh history copy so a later
+        history push carries the new text. [sender_pub_id]/[sender_sig] are
+        the edit packet's author fields: the signature must verify as the
+        EDITED body's message transcript against this copy's identity fields
+        (the packet key, or the key already stored on the copy when the
+        caller did not carry it) — on success it is stored as the copy's
+        signature, so pushed history passes verify_message and the edit
+        converges to members that were offline (LESSONS 2026-09-21 #1).
+        Strict: a missing or invalid signature rejects the edit (an unsigned
+        rewrite must never enter history)."""
         with self._lock:
             state = self._groups.get(group_id)
             if state is None:
@@ -5846,11 +5896,21 @@ class GroupMeshManager:
             )
             if target is None or target.sender_id != sender_id:
                 return False
+            pub = sender_pub_id or target.sender_pub_id
+            if not pub or not groupauth.verify_message_fields(
+                group_id,
+                sender_id,
+                message_id,
+                target.timestamp,
+                new_content,
+                pub,
+                sender_sig,
+            ):
+                return False
             target.content = new_content
             target.edited = True
-            if sender_pub_id and sender_sig:
-                target.sender_pub_id = sender_pub_id
-                target.sender_sig = sender_sig
+            target.sender_pub_id = pub
+            target.sender_sig = sender_sig
         return True
 
     def apply_deleted_ids(self, group_id: str, deleted_ids) -> None:
@@ -6328,7 +6388,10 @@ class GroupMeshManager:
                     # History legitimately contains messages from many senders,
                     # but each message must still be well-formed and bounded —
                     # and each author's device signature must verify (TOFU)
-                    # before it may enter history or fire a listener.
+                    # before it may enter history or fire a listener. Strict:
+                    # an entry whose signature does not verify as a message
+                    # transcript is dropped, even from the author's own link
+                    # (the project is unreleased — no legacy tolerance).
                     valid_history = [
                         m for m in (packet.messages or [])
                         if m.sender_id
@@ -6372,6 +6435,12 @@ class GroupMeshManager:
                                 ):
                                     local.content = m.content
                                     local.edited = True
+                                    # the entry just passed verify_message:
+                                    # adopt its signature so this member's
+                                    # own history pushes stay verify-valid
+                                    if m.sender_pub_id and m.sender_sig:
+                                        local.sender_pub_id = m.sender_pub_id
+                                        local.sender_sig = m.sender_sig
                                     edits.append(m)
                             valid_history = still_new
                     if valid_history:
@@ -6552,15 +6621,6 @@ class GroupMeshManager:
                 packet.message_id, packet.sender_id, link["peer_id"],
             )
             return
-        if not groupauth.verify_edit(
-            group_id,
-            packet.sender_id,
-            packet.message_id,
-            packet.new_content,
-            packet.sender_pub_id,
-            packet.sender_sig,
-        ):
-            return
         if not self.update_mesh_message(
             group_id,
             packet.message_id,
@@ -6570,7 +6630,8 @@ class GroupMeshManager:
             sender_sig=packet.sender_sig,
         ):
             logger.warning(
-                "reject mesh edit %s: message not found or not authored by %r",
+                "reject mesh edit %s: unsigned, not verifiable, message not "
+                "found or not authored by %r",
                 packet.message_id, packet.sender_id,
             )
             return
@@ -6578,7 +6639,8 @@ class GroupMeshManager:
         if listener is not None:
             try:
                 listener.group_mesh_edit(
-                    group_id, packet.message_id, packet.new_content, packet.sender_id
+                    group_id, packet.message_id, packet.new_content, packet.sender_id,
+                    message_sig=packet.sender_sig,
                 )
             except Exception:
                 pass

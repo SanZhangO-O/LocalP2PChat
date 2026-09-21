@@ -46,19 +46,33 @@ class GroupAuthTranscriptTest {
     }
 
     @Test
-    fun `edit transcript digest matches the Windows codec`() {
-        val parts = GroupAuth.editParts("12345678", "alice", "m-1", "new text")
-        assertEquals(
-            listOf(
-                "edit", "12345678", "alice", "m-1",
-                "cb0208b0b1fa06bc59f85c8b2be1e45ff2ef6ddbf0cef02e9f276b8208ea48ab"
-            ),
-            parts
+    fun `edit signature transcript is the edited body message transcript`() {
+        // the edit packet's signature covers the EDITED body's message
+        // transcript: the fields-based variant (no ChatMessage on the wire)
+        // must be byte-identical to the object-based parts, including the
+        // receiver's copy timestamp
+        val edited = ChatMessage(
+            id = "m-1",
+            content = "new text",
+            timestamp = 1600000000000L,
+            senderId = "alice",
+            senderName = "Alice"
         )
-        assertEquals(
-            "4bc9de1f64ca8db95090d6b24f067438d60b885ec635a878e6c34fd2255dbe33",
-            com.zqr.localchat.crypto.Crypto.hex(GroupAuth.transcriptHash(parts))
+        val fromFields = GroupAuth.messageParts(
+            "12345678", "alice", "m-1", 1600000000000L, "new text"
         )
+        assertEquals(GroupAuth.messageParts("12345678", edited), fromFields)
+        // a different new content or timestamp can never reuse the signature
+        val otherContent = GroupAuth.messageParts(
+            "12345678", "alice", "m-1", 1600000000000L, "other"
+        )
+        assertEquals(false, GroupAuth.transcriptHash(fromFields)
+            .contentEquals(GroupAuth.transcriptHash(otherContent)))
+        val otherTime = GroupAuth.messageParts(
+            "12345678", "alice", "m-1", 1600000000001L, "new text"
+        )
+        assertEquals(false, GroupAuth.transcriptHash(fromFields)
+            .contentEquals(GroupAuth.transcriptHash(otherTime)))
     }
 
     @Test
