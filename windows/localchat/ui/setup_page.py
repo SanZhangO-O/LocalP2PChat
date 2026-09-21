@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -143,7 +144,11 @@ class SetupPage(QWidget):
         self.stack.addWidget(self._build_mode_select())
         self.stack.addWidget(self._build_create_form())
         self.stack.addWidget(self._build_join_form())
-        layout.addWidget(self.stack, 1)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setWidget(self.stack)
+        layout.addWidget(self.scroll, 1)
 
         self.vm.query_state_changed.connect(self._on_query_state_changed)
         self.vm.join_ui_state_changed.connect(self._on_join_state_changed)
@@ -394,6 +399,7 @@ class SetupPage(QWidget):
 
     def show_mode(self, mode: int):
         self.stack.setCurrentIndex(mode)
+        self.scroll.verticalScrollBar().setValue(0)
         if mode == MODE_CREATE:
             if self.vm.nickname:
                 self.create_name_edit.setText(self.vm.nickname)

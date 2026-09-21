@@ -11,7 +11,7 @@ from PyQt6 import QtSvg  # noqa: F401  (registers the SVG image-format plugin; n
 
 from localchat.storage import ChatStore
 from localchat.ui.main_window import MainWindow
-from localchat.ui.theme import APP_QSS
+from localchat.ui.theme import APP_QSS, light_palette
 from localchat.view_model import ChatViewModel
 
 
@@ -213,6 +213,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("LocalChat")
     app.setStyle("Fusion")
+    app.setPalette(light_palette())
     app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setStyleSheet(APP_QSS)
 

@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -47,7 +48,11 @@ class SettingsPage(QWidget):
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(24, 12, 24, 24)
         body_layout.setSpacing(14)
-        layout.addWidget(body, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(body)
+        layout.addWidget(scroll, 1)
 
         # ---- 昵称 ----
         nick_card = QFrame()

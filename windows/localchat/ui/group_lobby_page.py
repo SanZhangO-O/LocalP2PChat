@@ -147,6 +147,7 @@ class PeerRow(QFrame):
         if not is_self and on_call is not None:
             call_btn = QPushButton("通话")
             call_btn.setObjectName("ghost")
+            call_btn.setProperty("compact", True)
             call_btn.setToolTip("视频通话")
             call_btn.setFixedSize(64, 40)
             call_btn.clicked.connect(lambda checked=False, pid=peer.id: on_call(pid))
@@ -155,6 +156,7 @@ class PeerRow(QFrame):
         if not is_self and on_voice_call is not None:
             voice_btn = QPushButton("语音")
             voice_btn.setObjectName("ghost")
+            voice_btn.setProperty("compact", True)
             voice_btn.setToolTip("语音通话")
             voice_btn.setFixedSize(64, 40)
             voice_btn.clicked.connect(lambda checked=False, pid=peer.id: on_voice_call(pid))
@@ -163,6 +165,7 @@ class PeerRow(QFrame):
         if not is_self and on_fingerprint is not None:
             fp_btn = QPushButton("安全码")
             fp_btn.setObjectName("ghost")
+            fp_btn.setProperty("compact", True)
             fp_btn.setToolTip("查看该成员的设备身份安全码")
             fp_btn.setFixedSize(64, 40)
             fp_btn.clicked.connect(lambda checked=False, pid=peer.id: on_fingerprint(pid))
@@ -171,6 +174,7 @@ class PeerRow(QFrame):
         if not is_self and on_kick is not None:
             kick_btn = QPushButton("移出")
             kick_btn.setObjectName("danger")
+            kick_btn.setProperty("compact", True)
             kick_btn.setToolTip("将该成员移出群组")
             kick_btn.setFixedSize(64, 40)
             kick_btn.clicked.connect(lambda checked=False, pid=peer.id: on_kick(pid))

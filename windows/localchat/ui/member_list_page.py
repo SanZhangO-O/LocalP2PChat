@@ -6,6 +6,7 @@ confirmation needed. Groups are a secondary entry in the header.
 """
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFontMetrics
 from PyQt6.QtWidgets import (
     QDialog,
     QFrame,
@@ -89,6 +90,8 @@ class RequestCard(QFrame):
 
 
 class ContactRow(QFrame):
+    PREVIEW_MAX_WIDTH = 300
+
     def __init__(self, contact: Peer, last_message=None, on_click=None, on_remove=None, parent=None):
         super().__init__(parent)
         self.setObjectName("card")
@@ -109,7 +112,14 @@ class ContactRow(QFrame):
         if last_message is not None:
             preview = QLabel(last_message.content)
             preview.setObjectName("faint")
-            preview.setMaximumWidth(300)
+            preview.setMaximumWidth(ContactRow.PREVIEW_MAX_WIDTH)
+            preview.setText(
+                QFontMetrics(preview.font()).elidedText(
+                    last_message.content,
+                    Qt.TextElideMode.ElideRight,
+                    ContactRow.PREVIEW_MAX_WIDTH,
+                )
+            )
             info.addWidget(preview)
         else:
             ip_label = QLabel(f"{contact.ip_address}:{contact.port}")
@@ -120,7 +130,10 @@ class ContactRow(QFrame):
         if last_message is not None:
             time_label = QLabel(format_message_time(last_message.timestamp))
             time_label.setStyleSheet("font-size: 11px; color: #A7A2AF;")
-            layout.addWidget(time_label, alignment=Qt.AlignmentFlag.AlignTop)
+            layout.addWidget(
+                time_label,
+                alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+            )
 
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_menu)

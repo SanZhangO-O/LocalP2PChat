@@ -1,5 +1,5 @@
 from PyQt6.QtCore import QRect
-from PyQt6.QtGui import QColor, QFont, QPainterPath
+from PyQt6.QtGui import QColor, QFont, QPainterPath, QPalette
 
 PRIMARY = "#6750A4"
 PRIMARY_HOVER = "#7965AF"
@@ -181,6 +181,9 @@ QPushButton#danger {{
 QPushButton#danger:hover {{
     background: rgba(179, 38, 30, 0.08);
 }}
+QPushButton[compact="true"] {{
+    padding: 10px 6px;
+}}
 QPushButton#fab {{
     background: {PRIMARY};
     border-radius: 28px;
@@ -307,7 +310,48 @@ QMessageBox {{
 QDialog#confirmDialog {{
     background: {SURFACE};
 }}
+QScrollArea {{
+    background: {BACKGROUND};
+    border: none;
+}}
 """
+
+
+def light_palette() -> QPalette:
+    """Light QPalette matching APP_QSS, for use with the Fusion style.
+
+    On Windows dark mode the default Fusion palette turns dark, and APP_QSS
+    only styles the widgets it names explicitly — everything else (combos,
+    plain-text edits, tool buttons, scroll viewports) would render with dark
+    backgrounds on a light-themed UI."""
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, QColor(BACKGROUND))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor(TEXT))
+    pal.setColor(QPalette.ColorRole.Base, QColor(SURFACE))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor(SURFACE_VARIANT))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#323232"))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#FFFFFF"))
+    pal.setColor(QPalette.ColorRole.Text, QColor(TEXT))
+    pal.setColor(QPalette.ColorRole.Button, QColor(SURFACE))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor(TEXT))
+    pal.setColor(QPalette.ColorRole.BrightText, QColor("#FFFFFF"))
+    pal.setColor(QPalette.ColorRole.Link, QColor(PRIMARY))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor(PRIMARY))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor(ON_PRIMARY))
+    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(TEXT_FAINT))
+    for role in (
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.ButtonText,
+        QPalette.ColorRole.PlaceholderText,
+    ):
+        pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(TEXT_FAINT))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Window, QColor(BACKGROUND))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Base, QColor("#F0EFF4"))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Button, QColor("#F0EFF4"))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Highlight, QColor("#C8C4D2"))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.HighlightedText, QColor("#FEF7FF"))
+    return pal
 
 
 def bubble_path(rect: QRect, radius: int, mine: bool) -> QPainterPath:

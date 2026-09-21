@@ -1,4 +1,5 @@
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QFontMetrics
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -20,6 +21,7 @@ from .widgets import AvatarLabel, Toast, format_group_time
 class GroupCard(QFrame):
     clicked = pyqtSignal()
     remove_requested = pyqtSignal()
+    PREVIEW_MAX_WIDTH = 280
 
     def __init__(self, group: GroupMeta, parent=None):
         super().__init__(parent)
@@ -59,7 +61,14 @@ class GroupCard(QFrame):
         if group.last_message:
             last = QLabel(group.last_message)
             last.setStyleSheet(f"font-size: 12px; color: {TEXT_SUBTLE};")
-            last.setMaximumWidth(280)
+            last.setMaximumWidth(GroupCard.PREVIEW_MAX_WIDTH)
+            last.setText(
+                QFontMetrics(last.font()).elidedText(
+                    group.last_message,
+                    Qt.TextElideMode.ElideRight,
+                    GroupCard.PREVIEW_MAX_WIDTH,
+                )
+            )
             sub_row.addWidget(last)
         sub_row.addStretch()
         info.addLayout(sub_row)

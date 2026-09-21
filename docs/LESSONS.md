@@ -281,3 +281,62 @@
 - 防再犯: 输入框不要和按钮同排放 `AlignBottom` 对齐；底部动作统一走 composer
   的独立 action row，输入框高度由 `enable_auto_grow` 管理。
 
+## 2026-09-21 离屏渲染走查：深色系统下 Fusion 调色板未固定，未样式化控件全变黑
+
+- 现象: 程序只 `app.setStyle("Fusion")` 没有固定 palette。Windows 深色模式下
+  `app.palette().window()` 实测 `#1e1e1e`，APP_QSS 没显式命名的控件
+  （搜索页 QComboBox、表情面板 QToolButton、群公告 QPlainTextEdit、
+  QScrollArea 视口）全部黑底白字，和浅色主题撕裂。
+- 根因: QSS 是「按名字覆盖」，没有命中的控件回落到 application palette；
+  Fusion 风格不重置 palette，直接继承操作系统的深色调色板。
+- 修复: `theme.py` 新增 `light_palette()`（与主题常量同源的完整浅色
+  QPalette，含 Disabled 组），`main.py` 在 `setStyle("Fusion")` 之后
+  `app.setPalette(light_palette())`。
+- 验证: `windows/tests/test_functional.py::RenderWalkthroughFixTest::
+  test_app_pins_light_fusion_palette` 断言调色板颜色、Disabled 组与
+  main() 接线。
+- 防再犯: 改 QApplication 级样式（style/QSS/palette/font）时必须成套给全：
+  Fusion 一定要配显式 palette；新增依赖系统调色板的控件类型时，
+  优先在 QSS 里命名或在 palette 里核对。
+
+## 2026-09-21 离屏渲染走查：固定尺寸按钮吃全局 QSS 内边距，中文字被裁
+
+- 现象: 群大厅成员行的「安全码」按钮 `setFixedSize(64, 40)`，全局
+  `QPushButton { padding: 10px 20px; }` 让可用内容宽只剩 24px，三个汉字
+  约 45px，只显示中间一个字；两字按钮同样被裁掉两侧。
+- 根因: QSS 内边距按规则参与内容区计算，固定尺寸不会让文字缩排或换行，
+  超宽即静默裁剪（无告警）。
+- 修复: `theme.py` 增加 `QPushButton[compact="true"] { padding: 10px 6px; }`，
+  `group_lobby_page.py` 的 PeerRow 四个按钮统一 `setProperty("compact", True)`
+  （宽度保持 64 不动，避免移动布局）。
+- 验证: `RenderWalkthroughFixTest::test_lobby_peer_row_buttons_fit_fixed_width`
+  断言每个按钮 `fontMetrics().horizontalAdvance(文本) <= width - 12`。
+- 防再犯: `setFixedSize` 按钮必须核对「文字宽 + 左右内边距 <= 固定宽」；
+  要改内边距用属性选择器（objectName 已被 ghost/danger 占用）。
+
+## 2026-09-21 离屏渲染走查：高页面缺 QScrollArea 被压缩 + 列表行对齐/省略三则
+
+- 现象: ① SettingsPage minimumSizeHint 高 913px、SetupPage 700px，主窗口
+  920x680 可用仅 638px，布局被强压（按钮 12px 细条、卡片重叠、说明文字截断），
+  1280 宽也不够；② 成员行时间戳 `addWidget(label, alignment=AlignTop)` 只有
+  垂直对齐，水平方向被拉满，宽窗口下时间停在行中间；③ 列表预览用
+  `setMaximumWidth(300/280)` 硬裁，无省略号，断句突兀。
+- 根因: ① QWidget 页面把所有卡片的 minimumSizeHint 逐级上交，窗口一旦小于
+  页面最小值 Qt 只能压缩布局而不滚动；② 布局 alignment 缺省水平分量时
+  stretch 拉满整行；③ QLabel 不会自己截断加 …，只会按 maximumWidth 裁剪。
+- 修复: ① SettingsPage 正文、SetupPage 的 QStackedWidget 分别包进
+  `QScrollArea(widgetResizable, NoFrame)`（`settings_page.py`/`setup_page.py`，
+  `theme.py` 补 QScrollArea 规则）；注意 `QStackedWidget` 的 minimumSizeHint 取
+  各页最大值，Qt 也不会在 `setCurrentIndex` 时重置滚动条，所以 `show_mode()`
+  里要 `scroll.verticalScrollBar().setValue(0)`，否则高页滚到底再切回矮页会停在
+  偏移位置；② 时间戳改 `AlignRight | AlignTop`；
+  ③ 预览统一 `QFontMetrics.elidedText`（`member_list_page.py` ContactRow
+  300px、`group_list_page.py` GroupCard 280px）。
+- 验证: `RenderWalkthroughFixTest` 五个用例（settings/setup 可滚动、切页滚动
+  归零、按钮宽度、ContactRow 右对齐 + 省略、GroupCard 省略）；视觉复验可重跑
+  `%LOCALAPPDATA%\Temp\kilo\lc_shot\shoot.py` 对照 out\ 截图。
+- 防再犯: 页面高度可能超过窗口（设置/表单/多卡片页）一律包 QScrollArea，
+  新增卡片字段前先看页面 minimumSizeHint；`QScrollArea` 包 `QStackedWidget`
+  时切页要重置滚动条；行内「贴边」元素必须同时给
+  水平 + 垂直 alignment；列表预览文本用 elidedText，不要裸 maximumWidth。
+

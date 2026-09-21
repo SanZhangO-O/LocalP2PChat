@@ -81,6 +81,16 @@ README「版本兼容说明」承诺：**聊天、文件、群组在版本不一
   action row」，样式见 `theme.py` 的 `composer`/`composerAction`/`composerText`；
   改按钮结构同步更新 `windows/tests/_real_gui_win.py`、`_real_exe_gui.py` 的坐标点击。
   详见 `docs/LESSONS.md` 2026-09-19 续报 6。
+- **QApplication 级样式要成套给全**：`Fusion` 必须配显式浅色 palette
+  （`theme.py::light_palette`，`main.py` 启动时设置）——QSS 只覆盖它点名的控件，
+  其余回落系统调色板，深色系统下会整片变黑。`setFixedSize` 按钮要核对
+  「文字宽 + 左右内边距 <= 固定宽」（PeerRow 行按钮用 `compact` 属性规则降内边距）；
+  内容可能高过窗口的页面（设置/表单/多卡片）必须包 `QScrollArea`
+  （包 `QStackedWidget` 时切页要重置滚动条——minimumSizeHint 取各页最大值）；
+  行内贴边元素 alignment 要同时给水平 + 垂直分量；列表预览用
+  `QFontMetrics.elidedText`，不要裸 `setMaximumWidth` 硬裁。
+  回归测试：`windows/tests/test_functional.py::RenderWalkthroughFixTest`，
+  详见 `docs/LESSONS.md` 2026-09-21 三则。
 
 ## 5. 安全校验不要为兼容放宽
 

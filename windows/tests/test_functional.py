@@ -2686,5 +2686,158 @@ class ViewModelFlowTest(unittest.TestCase):
             reopened.close()
 
 
+class RenderWalkthroughFixTest(unittest.TestCase):
+    """Regressions for the 2026-09-21 offscreen render walkthrough:
+    settings/setup pages must scroll instead of being compressed, the app
+    pins a light Fusion palette for widgets APP_QSS does not name, fixed-size
+    lobby buttons must fit their label, member rows right-align the time and
+    elide long previews."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def tearDown(self):
+        for vm in getattr(self, "_vms", []):
+            vm.shutdown()
+
+    def test_settings_and_setup_pages_scroll_instead_of_overflow(self):
+        """SettingsPage's minimumSizeHint was 913px tall and SetupPage 700px,
+        so at the default 920x680 window the layouts were force-compressed
+        (buttons squashed to 12px, cards overlapping). Both bodies now live
+        in a QScrollArea, keeping the page's own minimum small."""
+        from PyQt6.QtWidgets import QScrollArea
+
+        from localchat.ui.settings_page import SettingsPage
+        from localchat.ui.setup_page import SetupPage
+
+        network_module.TCP_PORT = 10048
+        vm = make_vm(_fresh_db("lc_render_scroll.db"))
+        self._vms = [vm]
+        settings = SettingsPage(vm, lambda: None)
+        self.assertIsNotNone(settings.findChild(QScrollArea))
+        self.assertLess(settings.minimumSizeHint().height(), 600)
+        settings.deleteLater()
+        setup = SetupPage(vm, lambda: None, lambda: None)
+        self.assertIsNotNone(setup.findChild(QScrollArea))
+        self.assertLess(setup.minimumSizeHint().height(), 600)
+        setup.deleteLater()
+
+    def test_setup_page_resets_scroll_on_mode_switch(self):
+        """The QScrollArea wraps the whole QStackedWidget whose minimum size
+        is the tallest page; Qt keeps the scrollbar value across
+        setCurrentIndex, so scrolling the join form and returning to mode
+        select must not leave the viewport mid-page."""
+        from localchat.ui.setup_page import MODE_JOIN, MODE_SELECT, SetupPage
+
+        network_module.TCP_PORT = 10049
+        vm = make_vm(_fresh_db("lc_render_scroll_reset.db"))
+        self._vms = [vm]
+        page = SetupPage(vm, lambda: None, lambda: None)
+        page.resize(720, 520)
+        page.show_mode(MODE_JOIN)
+        page.show()
+        self.app.processEvents()
+        bar = page.scroll.verticalScrollBar()
+        if bar.maximum() > 0:
+            bar.setValue(bar.maximum())
+            page.show_mode(MODE_SELECT)
+            self.assertEqual(bar.value(), 0)
+        else:
+            page.show_mode(MODE_SELECT)
+            self.assertEqual(bar.value(), 0)
+        page.deleteLater()
+
+    def test_app_pins_light_fusion_palette(self):
+        """Fusion + Windows dark mode left every control not named by APP_QSS
+        (combos, plain-text edits, tool buttons, scroll viewports) dark. The
+        app must set an explicit light palette and ship the matching rules."""
+        import inspect
+
+        import main as app_main
+        from PyQt6.QtGui import QColor, QPalette
+
+        from localchat.ui.theme import APP_QSS, BACKGROUND, TEXT_FAINT, light_palette
+
+        pal = light_palette()
+        self.assertEqual(
+            pal.color(QPalette.ColorGroup.Active, QPalette.ColorRole.Window),
+            QColor(BACKGROUND),
+        )
+        self.assertEqual(
+            pal.color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text),
+            QColor(TEXT_FAINT),
+        )
+        self.assertIn("QScrollArea {", APP_QSS)
+        self.assertIn('QPushButton[compact="true"]', APP_QSS)
+        self.assertIn("setPalette(light_palette())", inspect.getsource(app_main.main))
+
+    def test_lobby_peer_row_buttons_fit_fixed_width(self):
+        """The 64px fixed-size buttons kept the global 10px 20px padding,
+        leaving 24px for ~45px of text: only the middle glyph of a 3-char
+        label was visible. Compact padding (10px 6px) must fit every label."""
+        from PyQt6.QtGui import QFontMetrics
+
+        from localchat.ui.group_lobby_page import PeerRow
+
+        peer = Peer("dev-2", "\u5f20\u4e09", "192.168.0.9", 9999)
+        row = PeerRow(
+            peer,
+            on_call=lambda pid: None,
+            on_kick=lambda pid: None,
+            on_voice_call=lambda pid: None,
+            on_fingerprint=lambda pid: None,
+        )
+        self.assertGreater(len(row.findChildren(QPushButton)), 0)
+        for btn in row.findChildren(QPushButton):
+            self.assertTrue(btn.property("compact"), btn.text())
+            advance = QFontMetrics(btn.font()).horizontalAdvance(btn.text())
+            self.assertLessEqual(advance, btn.width() - 12, btn.text())
+
+    def test_contact_row_elides_preview_and_right_aligns_time(self):
+        """The member row preview was hard-clipped at maximumWidth with no
+        ellipsis, and the time label only set AlignTop so it stretched
+        across the row and drew left of center on wide windows."""
+        from types import SimpleNamespace
+
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QLabel
+
+        from localchat.ui.member_list_page import ContactRow
+
+        contact = Peer("dev-1", "\u7528\u6237", "192.168.0.5", 9999)
+        long_text = "x" * 400
+        row = ContactRow(
+            contact, last_message=SimpleNamespace(content=long_text, timestamp=0)
+        )
+        layout = row.layout()
+        time_item = layout.itemAt(layout.count() - 1)
+        self.assertTrue(time_item.alignment() & Qt.AlignmentFlag.AlignRight)
+        self.assertTrue(time_item.alignment() & Qt.AlignmentFlag.AlignTop)
+        previews = [l for l in row.findChildren(QLabel) if l.maximumWidth() == 300]
+        self.assertEqual(len(previews), 1)
+        self.assertTrue(previews[0].text().endswith("\u2026"))
+        self.assertLess(len(previews[0].text()), len(long_text))
+        short = ContactRow(
+            contact, last_message=SimpleNamespace(content="hi", timestamp=0)
+        )
+        short_previews = [l for l in short.findChildren(QLabel) if l.maximumWidth() == 300]
+        self.assertEqual(short_previews[0].text(), "hi")
+
+    def test_group_card_elides_last_message_preview(self):
+        from PyQt6.QtWidgets import QLabel
+
+        from localchat.ui.group_list_page import GroupCard
+        from localchat.view_model import GroupMeta
+
+        meta = GroupMeta(
+            group_id="g1", group_name="G", is_host=True, last_message="y" * 400
+        )
+        card = GroupCard(meta)
+        previews = [l for l in card.findChildren(QLabel) if l.maximumWidth() == 280]
+        self.assertEqual(len(previews), 1)
+        self.assertTrue(previews[0].text().endswith("\u2026"))
+
+
 if __name__ == "__main__":
     unittest.main()
