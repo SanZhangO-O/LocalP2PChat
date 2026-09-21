@@ -249,13 +249,14 @@ class VoicePlayer:
             if done <= 0:
                 outdata.fill(0)
                 raise _sd.CallbackStop
-            # outdata is a numpy int16 buffer: raw bytes must be decoded
-            # via frombuffer (same as call.py), not assigned directly.
-            outdata[: done * CHANNELS] = _np.frombuffer(
+            # outdata is a numpy int16 buffer shaped (frames, CHANNELS): raw
+            # bytes must be decoded via frombuffer and reshaped (same as
+            # call.py), not assigned directly.
+            outdata[:done] = _np.frombuffer(
                 data, dtype=_np.int16, count=done * CHANNELS
-            )
+            ).reshape(-1, CHANNELS)
             if done < frames:
-                outdata[done * CHANNELS :] = 0
+                outdata[done:] = 0
                 raise _sd.CallbackStop
 
         stream = None
