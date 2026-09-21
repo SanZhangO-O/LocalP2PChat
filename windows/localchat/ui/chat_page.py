@@ -2624,10 +2624,11 @@ class ChatPage(QWidget):
                 if actor == self.vm.my_device_id:
                     mine.add(emoji)
         for emoji in REACTION_CHOICES:
-            label = f"{emoji} 取消回应" if emoji in mine else emoji
+            on = emoji not in mine
+            label = f"{emoji} 取消回应" if not on else emoji
             action = menu.addAction(label)
             action.triggered.connect(
-                lambda checked=False, e=emoji, on=e not in mine: self._react(msg, e, on)
+                lambda checked=False, e=emoji, on=on: self._react(msg, e, on)
             )
 
     def _react(self, msg, emoji: str, active: bool):

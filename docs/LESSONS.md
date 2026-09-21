@@ -340,3 +340,45 @@
   时切页要重置滚动条；行内「贴边」元素必须同时给
   水平 + 垂直 alignment；列表预览文本用 elidedText，不要裸 maximumWidth。
 
+## 2026-09-21 回应菜单一打开就 NameError：lambda 默认参表里引用了前面的默认参
+
+- 现象: 右键消息 → 「回应」子菜单弹出时崩
+  `NameError: name 'e' is not defined`，指向
+  `direct_chat_page.py` 的
+  `lambda checked=False, m=msg, e=emoji, on=e not in mine: ...`；
+  群聊页 `chat_page.py` 同款代码潜伏同一雷。
+- 根因: lambda 默认参表达式在**创建时**于外层作用域从左到右求值，
+  求值 `on=e not in mine` 时形参 `e` 还没绑定（形参只对函数体可见，
+  对同级默认参不可见）——构建菜单即抛 NameError，菜单永远打不开。
+- 修复: 把开关状态提前为普通变量
+  `on = emoji not in mine` 再进默认参表
+  （`direct_chat_page.py::_fill_reactions`、`chat_page.py` 回应子菜单）。
+- 验证: 回归测试
+  `windows/tests/test_functional.py::ViewModelFlowTest::
+  test_direct_reaction_menu_builds_and_dispatches_toggle`
+  （构建菜单不炸 + 已回应项 dispatch active=False、未回应项 active=True，
+  走真实 triggered() 信号路径）；另用 AST 全库扫描
+  「lambda 默认参引用同级更早默认参」确认无同类残留。
+- 防再犯: lambda 默认参表只能放**外部已求值**的名字；
+  需要派生值就在循环体里先算成局部变量再绑定。
+  与 AGENTS.md §4 的「clicked bool 注入」是同一批陷阱家族：
+  默认参表只用于吸收信号实参与捕获循环变量，不放表达式。
+
+## 2026-09-21 回溯补录：语音播放回调裸赋值 int16 字节，广播形状不符每块崩一次
+
+- 现象: 播放语音时 sounddevice 回调持续抛
+  `ValueError: could not broadcast input array from shape (1600,) into
+  shape (1600,1)`，无声且刷屏。
+- 根因: `outdata` 是形状 `(frames, channels)` 的 numpy int16 缓冲，
+  `f.readframes()` 返回的是裸 PCM 字节；直接（或按样本数切片）把
+  一维 frombuffer 结果赋给二维切片会形状不符。wave/字节缓冲的坑与
+  LESSONS 2026-09-19 的 `FileInputStream.getChannel()` 只读同族：
+  原始字节 ↔ numpy/结构化视图之间必须显式解码。
+- 修复: `audio_note.py::VoicePlayer` 回调里
+  `frombuffer(data, int16, count=done*CHANNELS).reshape(-1, CHANNELS)`
+  后赋 `outdata[:done]`（与 `call.py` 同法）；commits `8a72cb0` + `a345e41`。
+- 验证: 真机播放语音正常（用户控制台旧堆栈来自修复前进程）。
+- 防再犯: 给 sounddevice/Qt 多媒体喂数据时，先核对目标缓冲的
+  dtype 与形状，再决定 frombuffer + reshape 路径；
+  「裸字节直接赋二维切片」一律是形状错误。
+

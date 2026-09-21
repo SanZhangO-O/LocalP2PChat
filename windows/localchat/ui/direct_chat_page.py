@@ -1058,10 +1058,11 @@ class DirectChatPage(QWidget):
             if actor == self.vm.my_device_id:
                 mine.add(emoji)
         for emoji in REACTION_CHOICES:
-            label = f"{emoji} 取消回应" if emoji in mine else emoji
+            on = emoji not in mine
+            label = f"{emoji} 取消回应" if not on else emoji
             action = menu.addAction(label)
             action.triggered.connect(
-                lambda checked=False, m=msg, e=emoji, on=e not in mine: self._react(m, e, on)
+                lambda checked=False, m=msg, e=emoji, on=on: self._react(m, e, on)
             )
 
     def _react(self, msg, emoji: str, active: bool):

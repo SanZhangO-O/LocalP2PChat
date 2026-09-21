@@ -2296,6 +2296,57 @@ class ViewModelFlowTest(unittest.TestCase):
         self.assertEqual(page.input_edit.toPlainText(), "")
         page.deleteLater()
 
+    def test_direct_reaction_menu_builds_and_dispatches_toggle(self):
+        """Regression: `on=e not in mine` sat inside the lambda's default list,
+        so `e` was evaluated before being bound — building the reactions
+        submenu raised NameError and right-click reactions never opened.
+        The fixed menu labels mine with the toggle hint and dispatches the
+        per-emoji active flag via the real triggered() path (bool-injected)."""
+        from PyQt6.QtWidgets import QMenu
+
+        from localchat.models import ChatMessage
+        from localchat.ui.direct_chat_page import REACTION_CHOICES, DirectChatPage
+
+        network_module.TCP_PORT = 10057
+        vm = make_vm(_fresh_db("lc_ui_reactions.db"))
+        self._vms = [vm]
+        page = DirectChatPage(vm, lambda: None)
+        page._peer_id = "dev-2"
+        msg = ChatMessage(
+            id="m1",
+            content="hi",
+            timestamp=1700000000000,
+            sender_id="dev-2",
+            sender_name="peer",
+        )
+
+        mine_actor = vm.my_device_id
+        vm.reactions_for = lambda key: {"m1": [(REACTION_CHOICES[0], mine_actor)]}
+
+        calls = []
+
+        def fake_toggle(peer_id, message_id, emoji, active):
+            calls.append((peer_id, message_id, emoji, active))
+            return True
+
+        vm.toggle_direct_reaction = fake_toggle
+
+        menu = QMenu(page)
+        page._fill_reactions(menu, msg)  # must not raise
+        self.assertEqual(len(menu.actions()), len(REACTION_CHOICES))
+        by_label = {a.text(): a for a in menu.actions()}
+        first, second = REACTION_CHOICES[0], REACTION_CHOICES[1]
+        self.assertIn(f"{first} \u53d6\u6d88\u56de\u5e94", by_label)  # 取消回应
+        self.assertIn(second, by_label)
+        by_label[f"{first} \u53d6\u6d88\u56de\u5e94"].trigger()
+        by_label[second].trigger()
+        self.assertEqual(
+            calls,
+            [("dev-2", "m1", first, False), ("dev-2", "m1", second, True)],
+        )
+        menu.deleteLater()
+        page.deleteLater()
+
     def test_reply_payload_falls_back_to_file_name(self):
         """Replying to a file message (empty text body) must quote the file
         name, matching what the reply bar shows — an empty replyPreview on the

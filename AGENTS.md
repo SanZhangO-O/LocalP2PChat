@@ -61,6 +61,10 @@ README「版本兼容说明」承诺：**聊天、文件、群组在版本不一
   ```
 
   回归测试：`windows/tests/test_functional.py::ViewModelFlowTest::test_contact_request_buttons_dispatch_request_id`。
+- **lambda 默认参表里不要放引用同级默认参的表达式**（`on=e not in mine` 在
+  `e=emoji` 绑定前求值，构建菜单即 `NameError`）；派生值先在循环体里算成局部变量。
+  回归测试：`windows/tests/test_functional.py::ViewModelFlowTest::test_direct_reaction_menu_builds_and_dispatches_toggle`，
+  详见 `docs/LESSONS.md` 2026-09-21。
 - 列表页用 `setItemWidget`：刷新要重建条目并 `item.setSizeHint(widget.sizeHint())`；
   数据变化一律通过 ViewModel 的 `pyqtSignal` 触发 `refresh()`。
 - 后台线程不碰 UI，全部经信号回到主线程。
