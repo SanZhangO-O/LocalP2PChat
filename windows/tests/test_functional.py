@@ -2732,9 +2732,172 @@ class ViewModelFlowTest(unittest.TestCase):
         store.close()
         reopened = ChatStore(db)
         try:
-            self.assertEqual(load_recent(reopened), ["\U0001f602", "\U0001f642"])
+            self.assertEqual(load_recent(reopened), ["\U0001f642", "\U0001f602"])
         finally:
             reopened.close()
+
+
+class SignalingServersTest(unittest.TestCase):
+    """Multi-server relay configuration: several signaling/relay servers can
+    be configured (each with its own access secret); hosted groups register
+    on ALL of them, joins resolve the secret per server, and the join form
+    offers the configured servers instead of one retyped address."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def tearDown(self):
+        for vm in getattr(self, "_vms", []):
+            vm.shutdown()
+
+    def test_add_remove_and_persistence(self):
+        network_module.TCP_PORT = 10060
+        db = _fresh_db("lc_sig_multi.db")
+        vm = make_vm(db)
+        self._vms = [vm]
+        self.assertEqual(vm.signaling_servers, [])
+        self.assertEqual(vm.signaling_server, "")
+        self.assertTrue(vm.add_signaling_server("relay1.example.com:25000", secret="k1"))
+        self.assertTrue(vm.add_signaling_server("relay2.example.com", secret="k2"))
+        # endpoint identity is normalized: the same server with the default
+        # port omitted (or re-typed in another case) is a duplicate, and a
+        # non-numeric port is rejected
+        self.assertFalse(vm.add_signaling_server("relay2.example.com:25000"))
+        self.assertFalse(vm.add_signaling_server("RELAY2.EXAMPLE.COM"))
+        self.assertFalse(vm.add_signaling_server("relay.example.com:abc"))
+        self.assertFalse(vm.add_signaling_server(""))
+        entries = vm.signaling_servers
+        self.assertEqual(
+            [e["server"] for e in entries],
+            ["relay1.example.com:25000", "relay2.example.com"],
+        )
+        self.assertEqual([e["secret"] for e in entries], ["k1", "k2"])
+        self.assertEqual(vm.signaling_server, "relay1.example.com:25000")
+        self.assertEqual(vm.signaling_secret, "k1")
+
+        # restart: the list and per-server secrets survive
+        vm.shutdown()
+        self._vms = []
+        vm = make_vm(db)
+        self._vms = [vm]
+        self.assertEqual(vm.signaling_servers, entries)
+
+        vm.remove_signaling_server("relay1.example.com:25000")
+        self.assertEqual(
+            [e["server"] for e in vm.signaling_servers], ["relay2.example.com"]
+        )
+        # the remaining entry is now the primary one, with its own secret
+        self.assertEqual(vm.signaling_server, "relay2.example.com")
+        self.assertEqual(vm.signaling_secret, "k2")
+
+    def test_legacy_single_server_setting_migrates(self):
+        network_module.TCP_PORT = 10061
+        db = _fresh_db("lc_sig_legacy.db")
+        store = ChatStore(db)
+        store.set_setting("signaling_server", "old.example.com:25000")
+        store.set_secret("signaling_secret", "oldkey")
+        store.close()
+        vm = make_vm(db)
+        self._vms = [vm]
+        self.assertEqual(
+            vm.signaling_servers,
+            [{"server": "old.example.com:25000", "secret": "oldkey"}],
+        )
+
+    def test_join_secret_resolves_per_server(self):
+        network_module.TCP_PORT = 10062
+        db = _fresh_db("lc_sig_secret.db")
+        vm = make_vm(db)
+        self._vms = [vm]
+        vm.add_signaling_server("a.example.com:25000", secret="ka")
+        vm.add_signaling_server("b.example.com:25500", secret="kb")
+        self.assertEqual(vm._secret_for_server("a.example.com"), "ka")
+        self.assertEqual(vm._secret_for_server("a.example.com:25000"), "ka")
+        self.assertEqual(vm._secret_for_server("b.example.com:25500"), "kb")
+        self.assertEqual(vm._secret_for_server("unknown.example.com"), "")
+
+    def test_host_registers_bridge_per_server(self):
+        network_module.TCP_PORT = 10063
+        db = _fresh_db("lc_sig_bridges.db")
+        vm = make_vm(db)
+        self._vms = [vm]
+        self.assertEqual(vm.host_server._signaling_bridges, [])
+        vm.add_signaling_server("127.0.0.1:25001", secret="s1")
+        vm.add_signaling_server("127.0.0.1:25002")
+        bridges = vm.host_server._signaling_bridges
+        self.assertEqual(len(bridges), 2)
+        self.assertEqual(bridges[0]._server_host, "127.0.0.1")
+        self.assertEqual(bridges[0]._server_port, 25001)
+        self.assertEqual(bridges[0]._secret, "s1")
+        self.assertEqual(bridges[1]._server_port, 25002)
+        vm.remove_signaling_server("127.0.0.1:25001")
+        bridges = vm.host_server._signaling_bridges
+        self.assertEqual([b._server_port for b in bridges], [25002])
+
+    def test_settings_page_lists_and_removes_servers(self):
+        from localchat.ui.settings_page import SettingsPage
+
+        network_module.TCP_PORT = 10050
+        db = _fresh_db("lc_sig_ui.db")
+        vm = make_vm(db)
+        self._vms = [vm]
+        vm.add_signaling_server("relay1.example.com:25000", secret="k1")
+        vm.add_signaling_server("relay2.example.com:25001", secret="k2")
+        page = SettingsPage(vm, lambda: None)
+        self.assertEqual(page.sig_list.count(), 2)
+        remove_buttons = [
+            b
+            for b in page.sig_list.findChildren(QPushButton)
+            if b.text() == "\u79fb\u9664"
+        ]
+        self.assertEqual(len(remove_buttons), 2)
+        remove_buttons[0].click()
+        self.assertEqual(
+            [e["server"] for e in vm.signaling_servers], ["relay2.example.com:25001"]
+        )
+        self.assertEqual(page.sig_list.count(), 1)
+
+        page.sig_edit.setText("relay3.example.com:25002")
+        page.sig_secret_edit.setText("k3")
+        add_btn = next(
+            b
+            for b in page.findChildren(QPushButton)
+            if b.text() == "\u6dfb\u52a0\u670d\u52a1\u5668"
+        )
+        add_btn.click()
+        self.assertEqual(page.sig_list.count(), 2)
+        self.assertEqual(page.sig_edit.text(), "")
+        self.assertEqual(page.sig_secret_edit.text(), "")
+        page.deleteLater()
+
+    def test_join_page_combo_offers_configured_servers(self):
+        from localchat.ui.setup_page import MODE_JOIN, SetupPage
+
+        network_module.TCP_PORT = 10051
+        db = _fresh_db("lc_sig_join_ui.db")
+        vm = make_vm(db)
+        self._vms = [vm]
+        vm.add_signaling_server("relay1.example.com:25000")
+        vm.add_signaling_server("relay2.example.com:25001")
+        page = SetupPage(vm, lambda: None, lambda: None)
+        page.show_mode(MODE_JOIN)
+        combo = page.join_server_edit
+        self.assertEqual(
+            [combo.itemText(i) for i in range(combo.count())],
+            ["relay1.example.com:25000", "relay2.example.com:25001"],
+        )
+        # an untouched combo stays empty (LAN/IP join stays the default) even
+        # though servers are offered in the dropdown
+        self.assertEqual(combo.currentText(), "")
+        self.assertEqual(page.join_submit_btn.text(), "\u67e5\u627e\u7fa4\u7ec4")
+        # a scanned relay-only invite may prefill an endpoint that is not
+        # configured; the choice survives re-entering the join form
+        combo.setEditText("other.example.com:25000")
+        self.assertEqual(page.join_submit_btn.text(), "\u76f4\u63a5\u52a0\u5165")
+        page.show_mode(MODE_JOIN)
+        self.assertEqual(combo.currentText(), "other.example.com:25000")
+        page.deleteLater()
 
 
 class RenderWalkthroughFixTest(unittest.TestCase):

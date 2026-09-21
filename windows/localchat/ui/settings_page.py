@@ -6,11 +6,14 @@
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -133,7 +136,7 @@ class SettingsPage(QWidget):
         port_layout.addWidget(port_save, alignment=Qt.AlignmentFlag.AlignRight)
         body_layout.addWidget(port_card)
 
-        # ---- 中继/打洞服务器 ----
+        # ---- 中继/打洞服务器（可添加多个） ----
         sig_card = QFrame()
         sig_card.setObjectName("card")
         sig_layout = QVBoxLayout(sig_card)
@@ -143,35 +146,41 @@ class SettingsPage(QWidget):
         sig_title.setStyleSheet("font-size: 14px; font-weight: 600;")
         sig_layout.addWidget(sig_title)
         sig_hint = QLabel(
-            "填写后，本机创建的群组会注册到该服务器；其它网段的成员凭群组数字ID即可加入"
-            "（优先打洞直连，失败时经服务器加密中继）。留空则仅限局域网。"
-            "格式：IP或域名:端口"
+            "可添加多个服务器：本机创建的群组会注册到所有服务器，其它网段的成员"
+            "凭群组数字ID即可加入（优先打洞直连，失败时经服务器加密中继）。"
+            "加入时在“加入群组”页选择其中一个。格式：IP或域名:端口"
         )
         sig_hint.setObjectName("faint")
         sig_hint.setWordWrap(True)
         sig_layout.addWidget(sig_hint)
+        self.sig_list = QListWidget()
+        self.sig_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.sig_list.setMaximumHeight(132)
+        self.sig_list.hide()
+        sig_layout.addWidget(self.sig_list)
+        # Add row: each server carries its own optional access secret
+        # (challenge-response HMAC; stored encrypted).
+        sig_add_row = QHBoxLayout()
+        sig_add_row.setSpacing(8)
         self.sig_edit = QLineEdit()
         self.sig_edit.setPlaceholderText("例如: relay.example.com:25000")
-        self.sig_edit.setMaximumWidth(320)
         self.sig_edit.setMinimumHeight(36)
-        sig_layout.addWidget(self.sig_edit)
-        # Server access secret: the deployment's signaling server may require
-        # it (challenge-response HMAC); stored encrypted. Optional when the
-        # server runs without one.
+        sig_add_row.addWidget(self.sig_edit, 1)
         self.sig_secret_edit = QLineEdit()
         self.sig_secret_edit.setPlaceholderText("访问密钥（服务器要求时必填）")
         self.sig_secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.sig_secret_edit.setMaximumWidth(320)
         self.sig_secret_edit.setMinimumHeight(36)
-        sig_layout.addWidget(self.sig_secret_edit)
+        sig_add_row.addWidget(self.sig_secret_edit, 1)
+        sig_add = QPushButton("添加服务器")
+        sig_add.setObjectName("outline")
+        sig_add.setMinimumHeight(36)
+        sig_add.clicked.connect(self._add_signaling_server)
+        sig_add_row.addWidget(sig_add)
+        sig_layout.addLayout(sig_add_row)
         self.sig_error = QLabel("")
         self.sig_error.setStyleSheet("font-size: 12px; color: #B3261E;")
         self.sig_error.hide()
         sig_layout.addWidget(self.sig_error)
-        sig_save = QPushButton("保存服务器")
-        sig_save.setObjectName("outline")
-        sig_save.clicked.connect(self._save_signaling_server)
-        sig_layout.addWidget(sig_save, alignment=Qt.AlignmentFlag.AlignRight)
         body_layout.addWidget(sig_card)
 
         # ---- 本机安全码 ----
@@ -209,11 +218,36 @@ class SettingsPage(QWidget):
         ip = self.vm.local_ip
         self.ip_label.setText(ip if ip else "未连接到网络")
         self.port_edit.setText(str(self.vm.local_port))
-        self.sig_edit.setText(self.vm.signaling_server or "")
-        self.sig_secret_edit.setText(self.vm.signaling_secret)
+        self._rebuild_server_list()
         code = self.vm.security_code
         self.security_label.setText(code if code else "未生成")
         self.copy_security_btn.setEnabled(bool(code))
+
+    def _rebuild_server_list(self):
+        """Rebuild the configured-server rows (setItemWidget pages must
+        recreate entries and reset the size hint on every refresh)."""
+        self.sig_list.clear()
+        entries = self.vm.signaling_servers
+        self.sig_list.setVisible(bool(entries))
+        for entry in entries:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(2, 0, 2, 0)
+            row_layout.setSpacing(8)
+            address = entry["server"]
+            label = QLabel(address)
+            label.setStyleSheet("font-size: 14px;")
+            row_layout.addWidget(label, 1)
+            remove_btn = QPushButton("移除")
+            remove_btn.setObjectName("ghost")
+            remove_btn.setToolTip(f"移除 {address}")
+            remove_btn.clicked.connect(
+                lambda checked=False, addr=address: self._remove_signaling_server(addr)
+            )
+            row_layout.addWidget(remove_btn)
+            item = QListWidgetItem(self.sig_list)
+            item.setSizeHint(row.sizeHint())
+            self.sig_list.setItemWidget(item, row)
 
     def _copy_security_code(self):
         code = self.vm.security_code
@@ -248,12 +282,19 @@ class SettingsPage(QWidget):
         self.port_error.hide()
         self.vm.set_port(int(text))
 
-    def _save_signaling_server(self):
-        if self.vm.set_signaling_server(
+    def _add_signaling_server(self):
+        if self.vm.add_signaling_server(
             self.sig_edit.text(), secret=self.sig_secret_edit.text()
         ):
             self.sig_error.hide()
-            Toast(self.window()).show_message("中继服务器设置已保存")
+            self.sig_edit.clear()
+            self.sig_secret_edit.clear()
+            self._rebuild_server_list()
+            Toast(self.window()).show_message("中继服务器已添加")
         else:
-            self.sig_error.setText("地址无效，应为 IP或域名:端口")
+            self.sig_error.setText("地址无效或该服务器已存在，应为 IP或域名:端口")
             self.sig_error.show()
+
+    def _remove_signaling_server(self, address: str):
+        self.vm.remove_signaling_server(address)
+        self._rebuild_server_list()

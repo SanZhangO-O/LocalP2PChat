@@ -1,5 +1,6 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QComboBox,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -305,13 +306,15 @@ class SetupPage(QWidget):
         return page
 
     def _build_join_form(self) -> QWidget:
+        # The relay server field is NOT built by _form_page: it is an
+        # editable combo fed from the configured multi-server list, so a
+        # configured server is picked instead of retyped every time.
         page, inputs, btn = self._form_page(
             "加入群组",
             [
                 ("你的昵称", ""),
                 ("群组数字ID", "例如: 4829 1357"),
                 ("创建者的IP地址（可含端口）", "例如: 192.168.1.100:9999"),
-                ("中继服务器（跨网段加入，可选）", "例如: relay.example.com:25000"),
                 ("群组密码（可选）", "创建者分享的8位密码"),
             ],
             "查找群组",
@@ -322,11 +325,22 @@ class SetupPage(QWidget):
             self.join_name_edit,
             self.join_group_edit,
             self.join_ip_edit,
-            self.join_server_edit,
             self.join_password_edit,
         ) = inputs
         self.join_submit_btn = btn
         self.join_name_edit.setMaxLength(MAX_NAME_LENGTH)
+        form_layout = page.layout()
+        # insert (label, combo) before the password field's label
+        insert_at = form_layout.indexOf(self.join_password_edit) - 1
+        server_lbl = QLabel("中继服务器（跨网段加入，可选）")
+        server_lbl.setObjectName("hint")
+        self.join_server_edit = QComboBox()
+        self.join_server_edit.setEditable(True)
+        self.join_server_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.join_server_edit.setPlaceholderText("例如: relay.example.com:25000")
+        self.join_server_edit.setMinimumHeight(40)
+        form_layout.insertWidget(insert_at, self.join_server_edit)
+        form_layout.insertWidget(insert_at, server_lbl)
         ip_hint = QLabel(
             "ID 由创建者设备指纹生成，与群名无关；地址可在创建者的“本机地址”卡片中点击复制。"
             "不同网段时无需 IP：双方填写同一个中继服务器，凭 ID 即可加入"
@@ -348,11 +362,11 @@ class SetupPage(QWidget):
             page.layout().indexOf(self.join_submit_btn), self._wrap_row(qr_row)
         )
         qr_scan_btn.clicked.connect(self._on_scan_group_qr)
+        self.join_server_edit.editTextChanged.connect(self._on_join_input_changed)
         for edit in (
             self.join_name_edit,
             self.join_group_edit,
             self.join_ip_edit,
-            self.join_server_edit,
             self.join_password_edit,
         ):
             edit.textChanged.connect(self._on_join_input_changed)
@@ -383,7 +397,7 @@ class SetupPage(QWidget):
         self.join_ip_edit.setText(
             f"{invite.ip}:{invite.port}" if invite.ip else ""
         )
-        self.join_server_edit.setText(invite.relay)
+        self.join_server_edit.setEditText(invite.relay)
         self._clear_error()
         if not invite.ip and not invite.relay:
             self._set_error(
@@ -407,6 +421,7 @@ class SetupPage(QWidget):
         elif mode == MODE_JOIN:
             if self.vm.nickname:
                 self.join_name_edit.setText(self.vm.nickname)
+            self._refresh_server_choices()
             self._clear_error()
 
     def _go_back(self):
@@ -487,7 +502,7 @@ class SetupPage(QWidget):
 
     def _on_query(self):
         self._set_error(None)
-        server_text = self.join_server_edit.text().strip()
+        server_text = self.join_server_edit.currentText().strip()
         if server_text:
             # cross-NAT path: punch/relay through the signaling server —
             # no host IP needed, no query/confirm step (join starts now)
@@ -508,7 +523,8 @@ class SetupPage(QWidget):
     def _join_inputs_ready(self) -> bool:
         join_id = "".join(ch for ch in self.join_group_edit.text() if ch.isdigit())
         has_endpoint = bool(
-            self.join_ip_edit.text().strip() or self.join_server_edit.text().strip()
+            self.join_ip_edit.text().strip()
+            or self.join_server_edit.currentText().strip()
         )
         return bool(
             self.join_name_edit.text().strip()
@@ -517,10 +533,21 @@ class SetupPage(QWidget):
         )
 
     def _on_join_input_changed(self):
-        via_server = bool(self.join_server_edit.text().strip())
+        via_server = bool(self.join_server_edit.currentText().strip())
         self.join_submit_btn.setText("直接加入" if via_server else "查找群组")
         self.join_submit_btn.setEnabled(self._join_inputs_ready())
         self._clear_error()
+
+    def _refresh_server_choices(self):
+        """Feed the combo from the configured servers. A value typed for a
+        scanned invite that is not configured survives as the edit text, and
+        an empty field stays empty: LAN/IP join remains the default until a
+        server is explicitly picked."""
+        combo = self.join_server_edit
+        current = combo.currentText().strip()
+        combo.clear()
+        combo.addItems([entry["server"] for entry in self.vm.signaling_servers])
+        combo.setEditText(current)
 
     def _on_query_state_changed(self):
         error = self.vm.query_error()

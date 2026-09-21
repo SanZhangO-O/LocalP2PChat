@@ -315,15 +315,16 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         # a group we belong to as a MEMBER are answered here, so newcomers
         # only need the IP of SOME member, not the creator's.
         self.host_server.member_group_handler = self._handle_member_group_request
-        # Cross-NAT joins (optional): when a signaling/relay server is
-        # configured, hosted groups are announced there and members on other
-        # NAT segments can join by the numeric id alone (punch or relay).
-        self._signaling_server: str = ""
-        # Server access secret (challenge-response HMAC; stored encrypted).
-        self._signaling_secret: str = self.store.get_secret("signaling_secret", "")
-        self._apply_signaling_setting(
-            self.store.get_setting("signaling_server", "") or "", persist=False
-        )
+        # Cross-NAT joins (optional): every configured signaling/relay server
+        # gets the hosted groups announced, so members on other NAT segments
+        # can join by the numeric id alone (punch or relay). Multiple servers
+        # are supported; each carries its own access secret.
+        self._signaling_servers: List[str] = []
+        # Per-server access secrets (challenge-response HMAC), keyed by the
+        # normalized "host:port" endpoint; stored encrypted at rest.
+        self._signaling_secrets: Dict[str, str] = {}
+        self._load_signaling_servers()
+        self._apply_signaling_servers()
         saved_contacts = self._load_direct_contacts()
         # honor contact removals from previous processes BEFORE announcing:
         # a peer that keeps presenting itself must not resurrect a contact
@@ -2626,51 +2627,129 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
     # ------------------------------------------------------------ signaling
 
     @property
+    def signaling_servers(self) -> List[Dict[str, str]]:
+        """Configured cross-NAT servers, in add order:
+        ``[{'server': addr, 'secret': secret}, ...]``."""
+        return [
+            {
+                "server": addr,
+                "secret": self._signaling_secrets.get(self._endpoint_key(addr), ""),
+            }
+            for addr in self._signaling_servers
+        ]
+
+    @property
     def signaling_server(self) -> str:
-        """The configured signaling/relay server endpoint ('' = off)."""
-        return self._signaling_server
+        """The primary (first) configured signaling/relay server ('' = none).
+        Invites carry this one endpoint; joining may use any configured one."""
+        return self._signaling_servers[0] if self._signaling_servers else ""
 
     @property
     def signaling_secret(self) -> str:
-        """The server access secret paired with [signaling_server]."""
-        return self._signaling_secret
+        """The access secret paired with [signaling_server]."""
+        if not self._signaling_servers:
+            return ""
+        return self._secret_for_server(self._signaling_servers[0])
 
-    def set_signaling_server(self, text: str, secret: str = "") -> bool:
-        """Enable/disable cross-NAT joining. Returns False (with a status
-        toast) when the endpoint is malformed; the previous setting stays
-        active in that case. [secret] is the deployment's server access
-        secret — required when the server was started with one."""
-        text = (text or "").strip()
-        if text:
-            host, port = parse_server_endpoint(text)
-            if host is None:
-                self.status_message.emit("服务器地址无效（格式：IP或域名:端口）")
-                return False
-        self._apply_signaling_setting(text, secret=(secret or "").strip())
-        self.status_message.emit(
-            "已启用中继服务器" if text else "已关闭中继服务器"
-        )
-        return True
-
-    def _apply_signaling_setting(
-        self, text: str, persist: bool = True, secret: Optional[str] = None
-    ) -> None:
-        text = (text or "").strip()
-        if persist:
-            self.store.set_setting("signaling_server", text)
-        if secret is not None:
-            self._signaling_secret = secret
-            # the access secret is a credential: encrypted at rest
-            self.store.set_secret("signaling_secret", secret)
-        self._signaling_server = text
-        if not text:
-            self.host_server.disable_signaling()
-            return
+    @staticmethod
+    def _endpoint_key(text: str) -> str:
+        """Normalized 'host:port' identity of a server address, so entries
+        typed with or without the default port share one secret slot."""
         host, port = parse_server_endpoint(text)
         if host is None:
-            self.host_server.disable_signaling()
+            return (text or "").strip()
+        return f"{host.lower()}:{port}"
+
+    def _load_signaling_servers(self) -> None:
+        raw = self.store.get_setting("signaling_servers", "")
+        legacy = (self.store.get_setting("signaling_server", "") or "").strip()
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    self._signaling_servers = [
+                        str(item).strip() for item in data if str(item).strip()
+                    ]
+            except (TypeError, ValueError):
+                logger.warning("ignoring malformed signaling_servers setting")
+        elif legacy:
+            # one-time carry-over of the pre-multi-server single setting
+            self._signaling_servers = [legacy]
+        secrets_raw = self.store.get_secret("signaling_secrets", "")
+        self._signaling_secrets = {}
+        if secrets_raw:
+            try:
+                data = json.loads(secrets_raw)
+                if isinstance(data, dict):
+                    self._signaling_secrets = {
+                        str(key): str(value)
+                        for key, value in data.items()
+                        if str(value)
+                    }
+            except (TypeError, ValueError):
+                logger.warning("ignoring malformed signaling_secrets setting")
+        elif legacy:
+            legacy_secret = self.store.get_secret("signaling_secret", "")
+            if legacy_secret:
+                self._signaling_secrets[self._endpoint_key(legacy)] = legacy_secret
+
+    def _persist_signaling_servers(self) -> None:
+        self.store.set_setting("signaling_servers", json.dumps(self._signaling_servers))
+        # secrets are credentials: encrypted at rest
+        self.store.set_secret("signaling_secrets", json.dumps(self._signaling_secrets))
+
+    def add_signaling_server(self, text: str, secret: str = "") -> bool:
+        """Register another cross-NAT server: hosted groups are announced on
+        every configured one, and joins may go through any of them. Returns
+        False (with a status toast) when the endpoint is malformed or the
+        server is already configured."""
+        text = (text or "").strip()
+        host, port = parse_server_endpoint(text)
+        if host is None:
+            self.status_message.emit("服务器地址无效（格式：IP或域名:端口）")
+            return False
+        key = self._endpoint_key(text)
+        if any(self._endpoint_key(addr) == key for addr in self._signaling_servers):
+            self.status_message.emit("该服务器已存在")
+            return False
+        self._signaling_servers.append(text)
+        self._signaling_secrets[key] = (secret or "").strip()
+        self._persist_signaling_servers()
+        self._apply_signaling_servers()
+        self.status_message.emit("已添加中继服务器")
+        return True
+
+    def remove_signaling_server(self, text: str) -> None:
+        """Drop a configured server; its registration stops immediately."""
+        text = (text or "").strip()
+        if text not in self._signaling_servers:
             return
-        self.host_server.enable_signaling(host, port, secret=self._signaling_secret)
+        removed_key = self._endpoint_key(text)
+        self._signaling_servers.remove(text)
+        if all(self._endpoint_key(addr) != removed_key for addr in self._signaling_servers):
+            self._signaling_secrets.pop(removed_key, None)
+        self._persist_signaling_servers()
+        self._apply_signaling_servers()
+        self.status_message.emit("已移除中继服务器")
+
+    def _secret_for_server(self, text: str) -> str:
+        """The configured access secret for [text]'s endpoint ('' when the
+        server is unknown or runs without one)."""
+        return self._signaling_secrets.get(self._endpoint_key(text), "")
+
+    def _apply_signaling_servers(self) -> None:
+        """(Re)register hosted groups on every configured server; a malformed
+        stored address is skipped instead of blocking the others."""
+        specs = []
+        for addr in self._signaling_servers:
+            host, port = parse_server_endpoint(addr)
+            if host is None:
+                continue
+            specs.append((host, port, self._secret_for_server(addr)))
+        if specs:
+            self.host_server.enable_signaling_servers(specs)
+        else:
+            self.host_server.disable_signaling()
 
     def join_via_server(
         self,
@@ -2715,7 +2794,7 @@ class ChatViewModel(QObject, P2PListener, DirectChatListener):
         self.pending_group_id = None
         p2p.clear_query_state()
         p2p.clear_join_result()
-        p2p.confirm_join_via_server(host, port, secret=self._signaling_secret)
+        p2p.confirm_join_via_server(host, port, secret=self._secret_for_server(server))
 
     def cancel_join(self) -> None:
         self._stop_pending_p2p()

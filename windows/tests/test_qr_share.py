@@ -411,7 +411,7 @@ class QrDialogEntryTest(unittest.TestCase):
         digits = "".join(ch for ch in page.join_group_edit.text() if ch.isdigit())
         self.assertEqual(digits, "48291357")
         self.assertTrue(page.join_ip_edit.text().startswith("192.168.0.55:"))
-        self.assertEqual(page.join_server_edit.text(), "r.example.org:25000")
+        self.assertEqual(page.join_server_edit.currentText(), "r.example.org:25000")
         # the password is NEVER prefilled from a QR: it must be typed
         self.assertEqual(page.join_password_edit.text(), "")
         page.deleteLater()

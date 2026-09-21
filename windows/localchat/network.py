@@ -714,10 +714,10 @@ class HostGroupServer:
         # packet was handled. The wire is already secured (password verified
         # during the handshake).
         self.member_group_handler = None
-        # Cross-NAT join support: the bridge that registers hosted groups on
-        # the public signaling server and feeds punched/relayed member
-        # connections into _handle (set by enable_signaling).
-        self._signaling_bridge = None
+        # Cross-NAT join support: one bridge per configured signaling server;
+        # each registers the hosted groups there and feeds punched/relayed
+        # member connections into _handle (see enable_signaling_servers).
+        self._signaling_bridges: List = []
         # Group file share area (群文件): fileId -> {path, size, key} of files
         # this device shares into its groups' share areas. A file_download
         # request line arriving on the shared listener is served from here
@@ -823,23 +823,27 @@ class HostGroupServer:
     def enable_signaling(
         self, server_host: str, server_port: int, secret: str = ""
     ) -> None:
-        """Start announcing every hosted group on the public signaling server
-        (punch.py.SignalingHostBridge) so members on other NAT segments can
-        join without this device being reachable directly. [secret] is the
-        deployment's server access secret (challenge-response authenticated;
-        see signaling_server.py)."""
+        """Register every hosted group on ONE signaling server (convenience
+        form of enable_signaling_servers)."""
+        self.enable_signaling_servers([(server_host, server_port, secret)])
+
+    def enable_signaling_servers(self, specs: List) -> None:
+        """Start one signaling bridge per server in [specs] — (host, port,
+        secret) tuples of punch.py.SignalingHostBridge — so members on other
+        NAT segments can join without this device being reachable directly.
+        [secret] is that deployment's server access secret
+        (challenge-response authenticated; see signaling_server.py)."""
         from .punch import SignalingHostBridge
 
         self.disable_signaling()
-        self._signaling_bridge = SignalingHostBridge(
-            server_host, server_port, self, secret=secret
-        )
-        self._signaling_bridge.start()
+        for server_host, server_port, secret in specs:
+            bridge = SignalingHostBridge(server_host, server_port, self, secret=secret)
+            bridge.start()
+            self._signaling_bridges.append(bridge)
 
     def disable_signaling(self) -> None:
-        bridge = self._signaling_bridge
-        self._signaling_bridge = None
-        if bridge is not None:
+        bridges, self._signaling_bridges = self._signaling_bridges, []
+        for bridge in bridges:
             bridge.stop()
 
     def signaling_groups(self) -> list:
@@ -853,8 +857,7 @@ class HostGroupServer:
             ]
 
     def _notify_signaling(self) -> None:
-        bridge = self._signaling_bridge
-        if bridge is not None:
+        for bridge in self._signaling_bridges:
             bridge.notify_groups_changed()
 
     def stop(self) -> None:
