@@ -130,12 +130,18 @@ class Wire(val lineIn: LineIn, val writer: PrintWriter) {
     @Volatile
     private var key: ByteArray? = null
 
+    /** Serializes whole [sendPacket] invocations (stamp + encrypt + write).
+     *  [PrintWriter] only synchronizes individual write calls, so without
+     *  this lock two senders could interleave inside one line AND stamp seq
+     *  out of wire order — the receiver's strict seq check then kills the
+     *  connection (Windows parity: Wire._lock covers the whole send). */
+    private val sendLock = Any()
+
     /** Per-direction packet sequence numbers (see class doc): send stamps
-     *  1,2,3,... under the write lock; recv requires exactly last+1, so any
+     *  1,2,3,... under [sendLock]; recv requires exactly last+1, so any
      *  replayed, reordered or injected encrypted line fails even after the
      *  nonce LRU evicted its nonce. Guarded by [seenNonces]' monitor on
-     *  recv (single read loop) and by the PrintWriter's serialization on
-     *  send.
+     *  recv (single read loop) and by [sendLock] on send.
      *
      *  Compatibility: peers built BEFORE the seq field exists never stamp it
      *  (README: chat/file/group must keep working across versions). An
@@ -172,17 +178,19 @@ class Wire(val lineIn: LineIn, val writer: PrintWriter) {
 
     fun sendPacket(packet: NetworkPacket) {
         val k = key ?: throw WireException("wire not secured yet")
-        // stamp under the write lock: seq order == wire order (relay hops
-        // forwarding the same packet object get a fresh seq per wire)
-        val stamped = synchronized(seenNonces) {
+        // The WHOLE send runs under one lock: seq order == wire order even
+        // with several concurrent writers (send queue, ping/pong, heartbeat,
+        // relay broadcast all target the same wire). Atomic per line: two
+        // senders can never interleave inside one println.
+        synchronized(sendLock) {
             sendSeq += 1
-            packet.copy(seq = sendSeq)
+            val stamped = packet.copy(seq = sendSeq)
+            val json = wireJson.encodeToString(stamped)
+            val line = Crypto.toB64(Crypto.aesGcmEncrypt(k, json.toByteArray(Charsets.UTF_8)))
+            if (line.length > P2PManager.MAX_LINE_LENGTH) throw WireException("encrypted line exceeds cap")
+            writer.println(line)
+            writer.flush()
         }
-        val json = wireJson.encodeToString(stamped)
-        val line = Crypto.toB64(Crypto.aesGcmEncrypt(k, json.toByteArray(Charsets.UTF_8)))
-        if (line.length > P2PManager.MAX_LINE_LENGTH) throw WireException("encrypted line exceeds cap")
-        writer.println(line)
-        writer.flush()
     }
 
     /** Decrypted packet, or null at stream end. Throws [WireException] on

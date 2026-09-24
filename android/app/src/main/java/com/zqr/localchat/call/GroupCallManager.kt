@@ -685,6 +685,12 @@ object GroupCallManager {
             val cur = _state.value as? GroupCallState.Incoming ?: return
             if (cur.meetingId != meeting) return
             _state.value = GroupCallState.Active(meeting, cur.hostName)
+            // The member path owns the running flag too (1:1 parity:
+            // CallManager sets it on BOTH caller and callee handoff). The
+            // member read loop (:live check), the uplink sender and
+            // startEngines all gate on it — without this, a joined member's
+            // media path tears itself down on its first loop iteration.
+            running = true
         }
         publishParticipants()
         startEngines()
@@ -790,18 +796,25 @@ object GroupCallManager {
 
     // ------------------------------------------------------------- engines
 
-    /** Start audio + mixer exactly once per meeting. */
+    /** Start audio + mixer exactly once per meeting. Atomic with [leaveLocal]:
+     *  two members joining at the same moment run concurrent hostLinkThreads,
+     *  and the old unlocked null-check raced into two ConferenceAudio
+     *  instances — the overwritten one never stops and its AudioRecord keeps
+     *  the microphone in use (1:1 parity: CallManager.startEngines holds the
+     *  same lock against the same incident). */
     private fun startEngines() {
-        if (audioEngine != null) return
-        val isHost = synchronized(lock) { role == "host" }
-        audioEngine = ConferenceAudio(::onMicPcm)
-        audioEngine?.start()
-        if (isHost && mixerThread?.isAlive != true) {
-            val meeting = meetingId
-            mixerThread = Thread { mixerLoop(meeting) }.apply {
-                name = "group-call-mixer"
-                isDaemon = true
-                start()
+        synchronized(lock) {
+            if (!running || audioEngine != null) return
+            val isHost = role == "host"
+            audioEngine = ConferenceAudio(::onMicPcm)
+            audioEngine?.start()
+            if (isHost && mixerThread?.isAlive != true) {
+                val meeting = meetingId
+                mixerThread = Thread { mixerLoop(meeting) }.apply {
+                    name = "group-call-mixer"
+                    isDaemon = true
+                    start()
+                }
             }
         }
     }
@@ -944,6 +957,15 @@ object GroupCallManager {
             memberKey = null
             dialing = false
             running = false
+            // Engine teardown INSIDE the lock (startEngines holds the same
+            // lock): a leave immediately followed by a new join must not let
+            // the new meeting's engines be created between the flag flip and
+            // the old stop — the overwritten engine would never stop and
+            // keep the microphone.
+            audioEngine?.stop()
+            audioEngine = null
+            senderThread = null
+            mixerThread = null
         }
         stopRingTimer()
         runCatching { server?.close() }
@@ -953,10 +975,6 @@ object GroupCallManager {
         }
         micBuf.clear()
         audioTxQueue.clear()
-        audioEngine?.stop()
-        audioEngine = null
-        senderThread = null
-        mixerThread = null
         _participants.value = emptyList()
         _events.tryEmit("语音会议结束：$reason")
     }

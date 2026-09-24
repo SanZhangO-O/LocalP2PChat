@@ -440,3 +440,101 @@
   - 文档/docstring 里引用「对端已有实现」（如 Android parity）前先 grep
     确认存在；不存在的「parity」注释会误导后续审查放行缺口。
 
+## 2026-09-22 多对端审查修复：Wire 并发发送、mesh 乱序与成员路径 running 不变量
+
+- 现象: 「一个客户端连多个服务器」专项审查发现三类跨端问题：
+  1) Android 端同一 Wire 上多写者（直聊 ping/pong 直写、mesh 每包一线程、
+     心跳在 IO 池）并发发送时，接收端偶发「packet sequence violation」断连
+     且在途消息静默丢失；Windows 端无此问题。
+  2) 两端 mesh 链路上「发消息后立刻删除/编辑」，对端（host 离线路径）
+     可能先收 delete（目标不存在被丢弃）后收 chat，已删消息复活且无法
+     被历史推送纠正（发送方本地已移除）。
+  3) Android 群语音成员侧媒体路径瞬时自毁（读循环首轮退出 → leaveLocal）。
+- 根因:
+  1) Android `Wire.sendPacket` 的 seq 打戳在锁内、JSON/加密/`println` 在
+     锁外，seq 顺序 ≠ 上线顺序；类文档声称「PrintWriter 序列化整行写入」
+     是错的——PrintWriter 只同步单次 write，多次 write 之间可交错（行帧
+     与 seq 双重损坏）。Windows `Wire.send_packet` 整体持锁，两端不一致。
+  2) mesh 广播对每条链路的每包各起一个线程（Windows `_spawn(_link_write)`
+     / Android 曾有 `thread{}` 与绕过 `sendExecutor` 的路径），包间无顺序
+     保证；接收端对未知 id 的 delete 静默丢弃，与「发送方立刻删历史」
+     组合成永久分歧。relay 路径早有单发送者（Windows send worker /
+     Android sendScope）且注释写明了该乱序危害，但 mesh 路径漏修。
+  3) `GroupCallManager.running` 只在 host 的 `startMeeting` 置位，成员侧
+     `goActive` 从不置位，而成员读循环 live 检查、上行发送循环、引擎守卫
+     全部 gate 在 running 上——成员媒体路径整体依赖一个永假的标志。
+- 修复:
+  1) Android sendPacket 整体纳入 `sendLock`（Windows parity）；mesh 改为
+     每链路一条 FIFO 写线程（`Link.sendQueue` + `linkSender` / Windows
+     `_link_sender` + `send_queue`），广播一律入队；直聊/心跳/relay 的
+     并发写者由 Wire 锁保证行原子与 seq 顺序。
+  2) 同上——每链路 FIFO 使 chat→delete/edit 的提交序 = 上线序；满员拒绝
+     移到 mesh_ack/join_ack 之前，避免拨号方重试预算被重置后永久重拨。
+  3) `goActive` 在锁内置 `running = true`（1:1 CallManager 两条路径都置位
+     的 parity 是真实的）；`startEngines` 全程持锁 + `!running` 守卫，
+     `leaveLocal` 引擎拆除移入锁内，闭合 leave→join 双建引擎泄漏麦克风。
+- 验证: 两端 `py_compile` / `compileDebugKotlin` 通过；全量单测与互通 E2E
+  按需执行（见 AGENTS.md §7）。
+- 防再犯:
+  - 跨端同名组件（Wire）的并发契约必须逐字节对照：一端「整体持锁」另一端
+    「打戳在锁内、写在锁外」就是协议级分叉；类文档宣称的线程安全要用
+    锁的覆盖范围验证，PrintWriter/BufferedWriter 的内部同步不等于调用序列原子。
+  - 「每包一线程」的发送路径天然无序：只要存在 delete/edit/管理包这类
+    依赖前序包的报文，发送侧必须有每链路（或每会话）FIFO 串行点；
+    修 relay 时要顺手检查 mesh/直聊路径是否同病。
+  - 状态标志（如 running）的置位点必须覆盖所有会消费它的角色路径；
+    「读循环/引擎/发送线程都检查 X」时先 grep X 的所有赋值点。
+  - 名册/连接表上限是防伪造膨胀的最后防线：check-then-act 要么与插入同锁，
+    要么用原子声明（putIfAbsent / CAS update）；拒绝要发生在对端「认为
+    建立成功」的信令（ack）之前，否则对方的有界重试预算会被重置成永久重拨。
+
+## 2026-09-22 续报：复审发现同一轮修复遗留的四则缺口
+
+- 现象: 对上面修复轮的复审发现其自身仍有四处缺口：
+  1) Windows mesh 九个广播函数仍 `self._spawn(self._link_write, ...)`——
+     `_link_write` 已改成入队后线程只剩一次 put，但线程「启动顺序」无保证，
+     紧随 chat 的 delete 线程可能先入队，FIFO 保证根本不成立（Android 是
+     调用线程内联 `enqueue`，两端再次分叉）。
+  2) Android `handleJoin` 用 `_peers.update`（CAS 可重跑 lambda）设外部
+     `admitted` 标志，但 else 分支不重置：失败迭代的 `admitted=true` 泄漏到
+     最终拒绝路径，join_ack 发出而成员根本不在名册里。
+  3) 两端 mesh 的 `mesh_ack` 都在「预检之后、原子 claim 之前」发送：满员边界
+     上并发 join 仍能造成 ack-then-refuse，拨号方重试预算照样被重置——预检
+     只是收窄了窗口，没有消除 TOCTOU。
+  4) Windows 已把首触自动接受收紧为「仅已知设备 id」，Android DirectChat
+     仍按 endpoint（ip:port）匹配自动接受，DHCP 地址复用窗口两端不一致；
+     另外两端 mesh 发送队列无界，半死对端（停读但持续 ping）可撑爆内存。
+- 根因:
+  1) 「改成非阻塞入队」不等于修好顺序——凡是还经 `_spawn`/`thread{}`
+     搬运的调用点，入队动作本身就不在同一调用线程上，顺序仍靠调度运气。
+  2) CAS 循环的 lambda 会带着上一次迭代的副作用重跑；外部标志只在成功
+     分支赋值就是泄漏点。
+  3) 「拒绝在 ack 之前」必须是「原子 admission（claim+插入同锁/同 CAS）
+     之后才 ack」，任何先预检、后发 ack、再安装的三段式都留 TOCTOU。
+  4) 安全策略的跨端收紧必须 grep 对端同语义代码同步修改；有界队列是
+     「不信任对端配合」的内存防线。
+- 修复:
+  1) Windows 九处改为内联 `self._link_write(link, packet)`（入队非阻塞，
+     调用循环即串行点）；两端发送队列加界（`MESH_SEND_QUEUE_CAP = 4096`），
+     溢出按死链处理（alive=false + 关 socket，读循环收尸）。
+  2) else 分支补 `admitted = false`。
+  3) `mesh_ack` 移入 `_register_link` / `registerLink`，在原子 claim+install
+     持有之后发送；ack 发送失败有对应的安装回退（读循环尚未启动，就地清理）。
+     满员拒绝与「已有活链」拒绝现在都发生在任何 ack 之前。
+  4) Android `DirectChat.handleDirectHello` 改为仅 `containsKey(peer.id)`
+     自动接受（Windows `_maybe_incoming_request` parity）。
+- 验证: 两端 `py_compile` / `compileDebugKotlin` 通过；全量单测与互通 E2E
+  按需执行（见 AGENTS.md §7）。
+- 防再犯:
+  - 修「每包一线程」时 grep 所有 `_spawn`/`thread` 残留：入队点必须留在
+    调用线程上，否则 FIFO 是假的；两端同名机制要逐行对照调用形态。
+  - `Atomic*`/`update{}` 的 lambda 里写外部标志，每个分支都要完整赋值，
+    把「本次迭代的完整结论」写全，而不是只写成功路径。
+  - 协议信令（ack）的发送点要紧贴原子状态变更之后：审查时画「预检 → ack →
+    安装」的三段图，凡是 ack 不在原子段之后的都是 TOCTOU。
+  - 跨端行为收紧（安全策略、校验、上限）同步另一端时，按语义 grep 对端
+    （「首触」「auto-accept」「endpoint」），不要只对照同名函数。
+  - 面向对端流量积累的队列一律有界，满队=对端不配合=按断链处理，
+    而不是无界缓存或阻塞广播调用方。
+
+

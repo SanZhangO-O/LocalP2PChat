@@ -1316,6 +1316,12 @@ class P2PManager:
     HANDSHAKE_RATE_LIMIT = 60
     HANDSHAKE_RATE_WINDOW = 60.0
 
+    # Member roster cap (same value as GroupMeshManager's): same-id rejoins
+    # never consume a new slot, but a NEW id past the cap is rejected so a
+    # password holder cannot grow the member/connection tables without
+    # bound with forged joins.
+    MAX_PEERS_PER_GROUP = 64
+
     def __init__(
         self,
         listener: P2PListener,
@@ -1842,6 +1848,8 @@ class P2PManager:
 
         def run() -> None:
             sock: Optional[socket.socket] = None
+            relay_sock: Optional[socket.socket] = None
+            registered = False
             try:
                 sock = socket.create_connection((host.ip_address, host.port), timeout=5)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -1874,8 +1882,12 @@ class P2PManager:
                             self.peers[peer.id] = peer
                     self._host_socket = sock
                     self._host_wire = wire
+                    registered = True
                 if response.announcement is not None:
                     self.group_announcement = response.announcement
+                # hand ownership to the read loop via a dedicated local: the
+                # error-path closer must no longer touch this socket
+                relay_sock = sock
                 sock = None
                 if response.deleted_ids:
                     # tombstone convergence from the host (no rebroadcast);
@@ -1886,13 +1898,22 @@ class P2PManager:
                         self.listener.deleted_ids_received(self, ids)
                 self._apply_join_group_files(response)
                 self._start_heartbeat()
-                self._read_loop_from_host(self._host_socket, wire)
+                # pass the owned local, not a racy re-read of _host_socket
+                self._read_loop_from_host(relay_sock, wire)
             except Exception:
+                # relay_sock: owned by (or about to be owned by) the read loop
+                # once set — closing a still-connected socket here is always
+                # safe, the read loop tolerates closure.
+                self._safe_close(relay_sock)
                 if sock is not None:
                     self._safe_close(sock)
                 with self._lock:
-                    self._host_socket = None
-                    self._host_wire = None
+                    # Only unwind OUR registration: a failure before the join
+                    # ack never owned host_socket, and a stale clear would tear
+                    # down a connection a newer attempt already registered.
+                    if registered and self._host_wire is wire:
+                        self._host_socket = None
+                        self._host_wire = None
 
         self._spawn(run)
 
@@ -2046,6 +2067,15 @@ class P2PManager:
             self._safe_close(sock)
             return
         with self._lock:
+            # Roster cap: same-id rejoins never consume a new slot (see
+            # MAX_PEERS_PER_GROUP).
+            if peer.id not in self.peers and len(self.peers) >= self.MAX_PEERS_PER_GROUP:
+                try:
+                    wire.send_packet(NetworkPacket(type="join_rejected"))
+                except Exception:
+                    pass
+                self._safe_close(sock)
+                return
             self.peers[peer.id] = peer
             # A rejoin with the same stable peer id replaces the old
             # connection: the stale connection would otherwise keep a live
@@ -2140,19 +2170,27 @@ class P2PManager:
             pass
         finally:
             self._safe_close(sock)
-            # Order matters: the ViewModel's peers_changed keys its "keep
-            # last-known members" guard off connection_lost, so the flag must
-            # be set BEFORE the peer map is cleared — otherwise a listener that
-            # runs between the two updates would see an empty map with
-            # lost=false and tear down the mesh + persisted peers (Android
-            # parity).
-            self.connection_lost = True
+            # Only unwind when this connection is still the registered one:
+            # a newer join on the same manager replaces the registration, and
+            # this old loop's cleanup must not tear down the fresh connection
+            # (Android parity).
+            lost = False
             with self._lock:
-                self._host_socket = None
-                self._host_wire = None
-                self.peers.clear()
-            self.listener.peers_changed(self)
-            self.listener.connection_lost(self)
+                if self._host_socket is sock:
+                    # Order matters: the ViewModel's peers_changed keys its "keep
+                    # last-known members" guard off connection_lost, so the flag must
+                    # be set BEFORE the peer map is cleared — otherwise a listener that
+                    # runs between the two updates would see an empty map with
+                    # lost=false and tear down the mesh + persisted peers (Android
+                    # parity).
+                    self.connection_lost = True
+                    self._host_socket = None
+                    self._host_wire = None
+                    self.peers.clear()
+                    lost = True
+            if lost:
+                self.listener.peers_changed(self)
+                self.listener.connection_lost(self)
 
     def _read_loop_from_client(
         self, sock: socket.socket, wire: Wire, conn: dict, peer_id: str
@@ -4406,15 +4444,15 @@ class DirectChatManager:
         # First contact / removed member -> the request box. Nothing here is
         # dropped silently: the box entry is visible (deduped, one row per
         # peer, one event per NEW entry) and the dialer gets a definitive
-        # "pending" answer instead of a hung-up connection. A KNOWN member
-        # (id or endpoint) is auto-accepted below — the handshake already
-        # authenticated the dialer's identity key.
+        # "pending" answer instead of a hung-up connection. A member with a
+        # KNOWN ID is auto-accepted below — the handshake already
+        # authenticated the dialer's identity key. An endpoint (ip:port)
+        # match alone must NOT auto-accept: DHCP may hand a known contact's
+        # old address to a stranger device, and only the request box keeps
+        # "first contact needs confirmation" true for it.
         removed = self._is_removed(peer)
         with self._lock:
-            known = peer.id in self._contacts or any(
-                c.ip_address == peer.ip_address and c.port == peer.port
-                for c in self._contacts.values()
-            )
+            known = peer.id in self._contacts
         if removed or not known:
             fingerprint = (
                 DeviceIdentity.peer_fingerprint(peer_ident) if peer_ident else ""
@@ -5558,6 +5596,12 @@ class GroupMeshManager:
     # 500-message packet would exceed the read cap and drop the link
     # (Android parity: HISTORY_CHUNK_BYTES = 36KB there).
     HISTORY_CHUNK_BYTES = 36 * 1024
+    # Per-link send queue bound (Android parity: MESH_SEND_QUEUE_CAP): a
+    # peer that reads nothing backs the queue up instead of blocking the
+    # broadcast caller (queue put never blocks); past this cap the link is
+    # treated as dead (alive flipped + socket closed), so its ping-fed read
+    # loop cannot keep a memory balloon alive indefinitely.
+    MESH_SEND_QUEUE_CAP = 4096
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -5706,7 +5750,7 @@ class GroupMeshManager:
             return
         packet = NetworkPacket(type="mesh_chat", group_id=group_id, message=msg)
         for link in links:
-            self._spawn(self._link_write, link, packet)
+            self._link_write(link, packet)
 
     def broadcast_admin(self, group_id: str, packet: NetworkPacket) -> None:
         """Relay an owner management packet over every mesh link. Called by a
@@ -5720,7 +5764,7 @@ class GroupMeshManager:
                 return
             links = list(state["links"].values())
         for link in links:
-            self._spawn(self._link_write, link, packet)
+            self._link_write(link, packet)
 
     def broadcast_delete(self, group_id: str, message_id: str) -> None:
         """Tell every linked member that a message was deleted (host-offline
@@ -5750,7 +5794,7 @@ class GroupMeshManager:
         )
         groupauth.sign_packet(packet, groupauth.delete_parts(group_id, my_id, message_id))
         for link in links:
-            self._spawn(self._link_write, link, packet)
+            self._link_write(link, packet)
 
     def broadcast_typing(self, group_id: str, sender_id: str, active: bool) -> None:
         """Tell every linked member that [sender_id] started/stopped typing
@@ -5770,7 +5814,7 @@ class GroupMeshManager:
             active=bool(active),
         )
         for link in links:
-            self._spawn(self._link_write, link, packet)
+            self._link_write(link, packet)
 
     def broadcast_edit(self, group_id: str, message_id: str, new_content: str) -> None:
         """Tell every linked member that [messageId]'s author replaced its
@@ -5811,7 +5855,7 @@ class GroupMeshManager:
             sender_sig=sig,
         )
         for link in links:
-            self._spawn(self._link_write, link, packet)
+            self._link_write(link, packet)
 
     def broadcast_reaction(
         self, group_id: str, message_id: str, emoji: str, active: bool
@@ -5833,7 +5877,7 @@ class GroupMeshManager:
             active=bool(active),
         )
         for link in links:
-            self._spawn(self._link_write, link, packet)
+            self._link_write(link, packet)
 
     def broadcast_pin(self, group_id: str, message_id: str, active: bool) -> None:
         """Pin/unpin a message over every mesh link (host-offline path)."""
@@ -5851,7 +5895,7 @@ class GroupMeshManager:
             active=bool(active),
         )
         for link in links:
-            self._spawn(self._link_write, link, packet)
+            self._link_write(link, packet)
 
     def broadcast_read_receipt(self, group_id: str, up_to_id: str) -> None:
         """Tell every linked member we have read the group up to [up_to_id]
@@ -5869,7 +5913,7 @@ class GroupMeshManager:
             reader_id=my_id,
         )
         for link in links:
-            self._spawn(self._link_write, link, packet)
+            self._link_write(link, packet)
 
     def update_mesh_message(
         self,
@@ -5963,14 +6007,56 @@ class GroupMeshManager:
             return
         packet = NetworkPacket(type="mesh_announce", group_id=group_id, peer=peer)
         for link in links:
-            self._spawn(self._link_write, link, packet)
+            self._link_write(link, packet)
 
-    @staticmethod
-    def _link_write(link: dict, packet: NetworkPacket) -> None:
+    def _link_write(self, link: dict, packet: NetworkPacket) -> None:
+        """Hand one packet to the link's FIFO sender thread (_link_sender).
+        Called INLINE from every broadcast: the put is non-blocking, so the
+        caller's loop is the serialization point and enqueue order ==
+        broadcast order (a spawned thread would not guarantee that). A dead
+        link simply drops the packet: its read loop removes the link and the
+        sender exits (broadcasts re-snapshot the link table). A full queue
+        means the peer stopped reading long ago: the link is killed instead
+        of growing memory without bound (see MESH_SEND_QUEUE_CAP)."""
+        q = link.get("send_queue")
+        if q is None or not link["alive"]:
+            return
         try:
-            link["wire"].send_packet(packet)
-        except Exception:
-            pass
+            q.put_nowait(packet)
+        except queue.Full:
+            link["alive"] = False
+            self._safe_close(link["sock"])
+            logger.warning(
+                "mesh send queue overflow on link %s: killing link",
+                link.get("peer_id"),
+            )
+
+    def _link_sender(self, link: dict) -> None:
+        """Per-link FIFO writer (DirectChatManager parity): packets leave in
+        the order they were enqueued, so a delete/edit broadcast can never
+        overtake the chat packet it targets on this link — the receiver drops
+        a delete for an id it has not seen yet, and the message would
+        resurrect. One daemon thread per link; exits when the link dies
+        (alive flag flipped by the read loop's finally / leave_group / a
+        failed write). A half-dead peer (stops reading but keeps pinging) can
+        block this thread's write indefinitely — that stalls ONLY this
+        link's queue, never another link or group (a fully dead peer is
+        reaped by the read timeout)."""
+        q = link["send_queue"]
+        while link["alive"]:
+            try:
+                packet = q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if packet is None:  # defensive: poison pill
+                break
+            try:
+                link["wire"].send_packet(packet)
+            except Exception:
+                # unblock the read loop, which owns the registry cleanup
+                link["alive"] = False
+                self._safe_close(link["sock"])
+                break
 
     def _send_history(self, wire: Wire, group_id: str, history) -> None:
         """Push history in size-capped batches (see HISTORY_CHUNK_BYTES): the
@@ -6099,13 +6185,12 @@ class GroupMeshManager:
         if state is None or peer is None:
             self._safe_close(sock)
             return
-        try:
-            wire.send_packet(
-                NetworkPacket(type="mesh_ack", group_id=group_id, peer=state["my_peer"])
-            )
-        except Exception:
-            self._safe_close(sock)
-            return
+        # The mesh_ack is sent INSIDE _register_link AFTER the atomic roster
+        # claim: a dialer that received an ack is guaranteed a claimed slot,
+        # so "ack implies admission" holds and its bounded retry budget
+        # (MAX_DIAL_ATTEMPTS, reset only after a working link) can never be
+        # reset by an ack-then-refuse — including the race where a concurrent
+        # join takes the last free slot between this function and the install.
         self._register_link(state, peer, sock, wire)
 
     # ------------------------------------------------------------- internals
@@ -6218,6 +6303,9 @@ class GroupMeshManager:
             # sides push; receivers dedup by id)
             if history:
                 self._send_history(link["wire"], group_id, history)
+            # FIFO sender first (see _register_link): queued broadcasts drain
+            # after the history push above.
+            self._spawn(self._link_sender, link)
             self._read_loop(group_id, link)
             with self._lock:
                 state = self._groups.get(group_id)
@@ -6262,6 +6350,10 @@ class GroupMeshManager:
                 "sock": sock,
                 "wire": wire,
                 "alive": True,
+                # Per-link FIFO hand-off (see _link_sender): broadcasts enqueue
+                # here instead of each spawning its own write thread, so a
+                # delete/edit can never overtake the chat it targets.
+                "send_queue": queue.Queue(maxsize=self.MESH_SEND_QUEUE_CAP),
             }
         except Exception:
             if sock is not None:
@@ -6275,11 +6367,31 @@ class GroupMeshManager:
             "sock": sock,
             "wire": wire,
             "alive": True,
+            # Per-link FIFO hand-off (see _link_writer/_link_sender), bounded
+            # by MESH_SEND_QUEUE_CAP (a non-reading peer must not balloon
+            # memory; overflow kills the link).
+            "send_queue": queue.Queue(maxsize=self.MESH_SEND_QUEUE_CAP),
         }
         with self._lock:
+            # Same roster cap as add_peer, atomic with the insert below (one
+            # lock): a fresh id must not grow the roster past the cap even
+            # over a valid-password handshake (same-id relink or endpoint
+            # refresh still passes). The mesh_ack below goes out only after
+            # this claim held, so ack implies admission.
+            if (
+                peer.id not in state["peers"]
+                and len(state["peers"]) >= self.MAX_PEERS_PER_GROUP
+            ):
+                # refusal BEFORE any ack: the dialer counts this as a failed
+                # attempt and keeps its bounded retry budget
+                self._safe_close(sock)
+                return
             state["peers"][peer.id] = peer
             existing = state["links"].get(peer.id)
             if existing is not None and existing["alive"]:
+                # a live link already serves this peer: the fresh connection
+                # is redundant, so it is closed before any ack (the dialer
+                # treats it as a failed attempt; its other link stays up)
                 link["alive"] = False
                 self._safe_close(sock)
                 return
@@ -6289,8 +6401,32 @@ class GroupMeshManager:
             state["links"][peer.id] = link
             self._set_has_links(state["group_id"], True)
             history = list(state["messages"])[-self.HISTORY_CAP:]
+        # Ack AFTER the atomic claim/install (see handle_mesh_hello): before
+        # the sender thread exists, so no queued broadcast can precede it.
+        try:
+            wire.send_packet(
+                NetworkPacket(
+                    type="mesh_ack", group_id=state["group_id"], peer=state["my_peer"]
+                )
+            )
+        except Exception:
+            # the dialer never saw an ack, but OUR install happened: unwind
+            # it here — the read loop was not started yet, so nothing else
+            # owns this cleanup
+            with self._lock:
+                cur = self._groups.get(state["group_id"])
+                if cur is not None and cur["links"].get(peer.id) is link:
+                    cur["links"].pop(peer.id, None)
+                    self._set_has_links(state["group_id"], bool(cur["links"]))
+            link["alive"] = False
+            self._safe_close(sock)
+            return
         if history:
             self._send_history(wire, state["group_id"], history)
+        # The sender starts AFTER the direct history push: broadcasts that
+        # enqueued between install (under the lock) and now drain FIFO once
+        # this thread begins, so history backfill precedes live traffic.
+        self._spawn(self._link_sender, link)
         self._spawn(self._read_loop, state["group_id"], link)
         self._spawn(self._ping_loop, link)
 

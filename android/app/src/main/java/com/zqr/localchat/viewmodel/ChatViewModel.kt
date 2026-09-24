@@ -114,7 +114,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val announcement: String = ""
     )
 
-    private val groupP2pMap = mutableMapOf<String, P2PManager>()
+    // Concurrent containers: the network threads (relay handlers, session
+    // callbacks) read/iterate these while the main thread adds/removes —
+    // a plain mutableMapOf would be a real data race (CME / torn reads).
+    private val groupP2pMap = ConcurrentHashMap<String, P2PManager>()
     private val monitoringJobs = mutableMapOf<String, List<Job>>()
     private val _groupP2pVersion = MutableStateFlow(0)
     private var pendingP2pManager: P2PManager? = null
@@ -125,19 +128,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // from both the main thread (removeGroup) and IO coroutines (upsertGroup),
     // so it must be a concurrent set.
     private val removedGroupIds: MutableSet<String> = ConcurrentHashMap.newKeySet()
-    private val persistedMessageIds = mutableMapOf<String, MutableSet<String>>()
+    private val persistedMessageIds = ConcurrentHashMap<String, MutableSet<String>>()
     private val persistedPeerCounts = mutableMapOf<String, Int>()
-    private val persistedMyNames = mutableMapOf<String, String>()
+    // IO coroutines write (loadPersistedGroups collector), main and IO
+    // threads read (persist flow, notifications) — concurrent container.
+    private val persistedMyNames = ConcurrentHashMap<String, String>()
     /** Holds the P2PManager instance that completed history replay for a
      *  group — NOT a bare set of group ids. The reverse-delete guard keys off
      *  this: an OLD connection's replay finishing after a reconnect must not
      *  mark history restored for the NEW connection (which would let the new
      *  (still-loading) message list wipe rows that only the old instance had
      *  seen). */
-    private val replayDone = mutableMapOf<String, P2PManager>()
+    // Written from a replay coroutine on Dispatchers.IO (finally), read from
+    // the main-thread messages collector — concurrent container.
+    private val replayDone = ConcurrentHashMap<String, P2PManager>()
     /** History-replay jobs per group; cancelled on reconnect/remove so a stale
      *  load can never finish late and touch state it no longer owns. */
-    private val replayJobs = mutableMapOf<String, Job>()
+    // Written from main/IO launch sites and cancelled from teardown paths on
+    // other threads — concurrent container, matching the maps above.
+    private val replayJobs = ConcurrentHashMap<String, Job>()
 
     /** Serializes Room writes per conversation (messages + groups + deletes):
      *  Dispatchers.IO is multi-threaded, so an insert launched after a delete
@@ -254,15 +263,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // Members are first-class: a known member can be pulled into a 1:1 chat
     // immediately (auto-accepted on the other side, no confirmation).
 
-    private val directJobs = mutableMapOf<String, Job>()
-    private val persistedDirectIds = mutableMapOf<String, MutableSet<String>>()
+    // Concurrent containers: session/IO threads write these (observeDirectChat,
+    // replay) while the main thread cancels jobs and drops entries.
+    private val directJobs = ConcurrentHashMap<String, Job>()
+    private val persistedDirectIds = ConcurrentHashMap<String, MutableSet<String>>()
     /** Last persisted pending flag per message id, so a pending->sent flip
      *  (outbox flush) is written back to the database. */
-    private val persistedDirectPending = mutableMapOf<String, MutableMap<String, Boolean>>()
+    private val persistedDirectPending = ConcurrentHashMap<String, MutableMap<String, Boolean>>()
 
     /** Own direct messages' persisted read state (peer read_receipts):
      *  message id -> read. Mirrors [persistedDirectPending]. */
-    private val persistedDirectRead = mutableMapOf<String, MutableMap<String, Boolean>>()
+    private val persistedDirectRead = ConcurrentHashMap<String, MutableMap<String, Boolean>>()
 
     /** Fires when a direct chat's key moves from a manually added "ip:..."
      *  placeholder id to the member's real device id (revealed by a
@@ -1050,8 +1061,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun observeDirectChat(peerId: String) {
-        if (directJobs.containsKey(peerId)) return
-        directJobs[peerId] = viewModelScope.launch(Dispatchers.IO) {
+        // Reached from BOTH the main thread (chat screen opened, contact
+        // migrated) and network callbacks (onSessionEstablished) — the old
+        // containsKey-then-put could race into two jobs, orphaning the loser
+        // (duplicate persistence collectors). putIfAbsent is the atomic
+        // claim; the duplicate job is cancelled (it only did setup work).
+        val job = viewModelScope.launch(Dispatchers.IO) {
             // Direct chats live under a synthetic "direct:<peerId>" key in the
             // messages table, which has a foreign key to saved_groups — insert
             // a placeholder group row so message persistence never violates it
@@ -1073,10 +1088,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             val saved = chatDao.getMessagesForGroup("direct:$peerId").first()
-            persistedDirectIds[peerId] = saved.map { it.id }.toMutableSet()
-            persistedDirectPending[peerId] = saved.associate { it.id to it.pending }.toMutableMap()
+            persistedDirectIds[peerId] = ConcurrentHashMap.newKeySet<String>().apply { addAll(saved.map { it.id }) }
+            persistedDirectPending[peerId] = ConcurrentHashMap(saved.associate { it.id to it.pending })
             // read flips from the peer's read_receipts: persisted like pending
-            persistedDirectRead[peerId] = saved.associate { it.id to it.read }.toMutableMap()
+            persistedDirectRead[peerId] = ConcurrentHashMap(saved.associate { it.id to it.read })
             DirectChatManager.seedMessages(
                 peerId,
                 saved.map { sm ->
@@ -1100,9 +1115,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             )
             DirectChatManager.messagesFor(peerId).collect { msgs ->
-                val persisted = persistedDirectIds.getOrPut(peerId) { mutableSetOf() }
-                val pendingMap = persistedDirectPending.getOrPut(peerId) { mutableMapOf() }
-                val readMap = persistedDirectRead.getOrPut(peerId) { mutableMapOf() }
+                val persisted = persistedDirectIds.getOrPut(peerId) { ConcurrentHashMap.newKeySet() }
+                val pendingMap = persistedDirectPending.getOrPut(peerId) { ConcurrentHashMap() }
+                val readMap = persistedDirectRead.getOrPut(peerId) { ConcurrentHashMap() }
                 val currentIds = msgs.map { it.id }.toSet()
                 val removed = persisted.filter { it !in currentIds }
                 val newOnes = msgs.filter { it.id !in persisted }
@@ -1213,6 +1228,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+        val existing = directJobs.putIfAbsent(peerId, job)
+        if (existing != null) job.cancel()
     }
 
     private fun loadDirectContacts(): List<DirectChatManager.Contact> {
@@ -3175,7 +3192,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 val fresh = saved.filter { it.id !in tombstonedIds }
-                persistedMessageIds[groupId] = fresh.map { it.id }.toMutableSet()
+                persistedMessageIds[groupId] = ConcurrentHashMap.newKeySet<String>().apply { addAll(fresh.map { it.id }) }
                 if (fresh.isNotEmpty()) {
                     val msgs = fresh.map { sm ->
                         val plain = sm.withPlainContent()
@@ -4154,7 +4171,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         ) else g
                     }
                 }
-                val persistedIds = persistedMessageIds.getOrPut(groupId) { mutableSetOf() }
+                val persistedIds = persistedMessageIds.getOrPut(groupId) { ConcurrentHashMap.newKeySet() }
                 val newMessages = msgs.filter { it.id !in persistedIds }
                 // reverse-delete ONLY when the CURRENT p2p finished its replay:
                 // a stale connection's replayDone entry must not let a fresh

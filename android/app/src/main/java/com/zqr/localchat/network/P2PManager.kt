@@ -902,10 +902,11 @@ class P2PManager(
      *  the host is unreachable the member stays mesh-only. */
     private fun connectToHost(host: Peer) {
         scope.launch {
-            var socket: Socket? = null
+            // Unconnected Socket() construction cannot throw; hoisting it lets
+            // the catch compare against the exact socket this attempt owned.
+            val s = Socket()
+            var socket: Socket? = s
             try {
-                val s = Socket()
-                socket = s
                 s.tcpNoDelay = true
                 s.connect(InetSocketAddress(host.ipAddress, host.port), 5000)
                 s.soTimeout = 15000
@@ -944,8 +945,13 @@ class P2PManager(
             } catch (e: Exception) {
                 Log.w(TAG, "host connect after sponsor join failed", e)
                 closeSocket(socket)
-                hostConnection = null
-                hostWire = null
+                // Only unwind OUR registration: a failure before the join_ack
+                // never owned hostConnection, and a stale clear would tear
+                // down a connection a newer attempt already registered.
+                if (hostConnection === s) {
+                    hostConnection = null
+                    hostWire = null
+                }
             }
         }
     }
@@ -1014,7 +1020,28 @@ class P2PManager(
             closeSocket(socket)
             return
         }
-        _peers.update { it + (newPeer.id to newPeer) }
+        // 成员名册上限（同 id 重连不占新名额）：用 update 的 CAS 语义原子
+        // 声明名额，并发 join 也不可能越过上限；被拒方未收到 join_ack，
+        // 其有界重连预算不会被重置（与 mesh 侧满员预检同理）。
+        var admitted = false
+        _peers.update { cur ->
+            if (cur.containsKey(newPeer.id) || cur.size < MAX_PEERS_PER_GROUP) {
+                admitted = true
+                cur + (newPeer.id to newPeer)
+            } else {
+                // update may re-run this lambda after a failed CAS: a prior
+                // iteration's admitted=true must not survive into a refusal
+                // (the flag is only trusted from the CAS-winning run)
+                admitted = false
+                cur
+            }
+        }
+        if (!admitted) {
+            Log.w(TAG, "peer cap ($MAX_PEERS_PER_GROUP) reached for $groupId, rejecting ${newPeer.id}")
+            wire.sendPacket(NetworkPacket(type = "join_rejected"))
+            closeSocket(socket)
+            return
+        }
         // A rejoin with the same stable peer id replaces the old connection: the
         // stale connection would otherwise keep a live input channel for that
         // identity (duplicate messages, forged packets, or its read-loop
@@ -1062,15 +1089,22 @@ class P2PManager(
             Log.w(TAG, "host read loop ended", e)
         } finally {
             closeSocket(socket)
-            hostConnection = null
-            hostWire = null
-            // Order matters: the ViewModel's peers collector keys its
-            // "keep last-known members" guard off connectionLost, so the flag
-            // must be set BEFORE the peer map is cleared — otherwise a
-            // collector that runs between the two updates would see an empty
-            // map with lost=false and tear down the mesh + persisted peers.
-            _connectionLost.value = true
-            _peers.update { emptyMap() }
+            // Only unwind when this connection is still the registered one:
+            // a newer join on the same manager replaces the registration, and
+            // this old loop's cleanup must not tear down the fresh connection
+            // (parity with the Windows client read loop).
+            if (hostConnection === socket) {
+                hostConnection = null
+                hostWire = null
+                // Order matters: the ViewModel's peers collector keys its
+                // "keep last-known members" guard off connectionLost, so the
+                // flag must be set BEFORE the peer map is cleared — otherwise
+                // a collector that runs between the two updates would see an
+                // empty map with lost=false and tear down the mesh +
+                // persisted peers.
+                _connectionLost.value = true
+                _peers.update { emptyMap() }
+            }
         }
     }
 
@@ -2012,6 +2046,10 @@ class P2PManager(
         private const val TAG = "P2PManager"
         const val MAX_CONTENT_LENGTH = 5000
         const val MAX_LINE_LENGTH = 64 * 1024
+
+        /** host 成员名册上限（与 mesh 侧 MAX_PEERS_PER_GROUP 一致）：同 id
+         *  重连不占名额，新 id 到上限即拒绝，防伪造 join 膨胀名册。 */
+        const val MAX_PEERS_PER_GROUP = 64
 
         /**
          * Tombstone intake bounds for ONE packet. The deleted_messages table

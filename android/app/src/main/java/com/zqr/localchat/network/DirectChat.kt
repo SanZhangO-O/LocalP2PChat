@@ -830,13 +830,16 @@ object DirectChatManager {
     }
 
     /** Listener side: a secured direct_hello arrived on the shared port.
-     *  A KNOWN member (device id or endpoint) is auto-accepted — the
-     *  handshake already authenticated the dialer's identity key. A FIRST
-     *  CONTACT (unknown id AND endpoint) or a member the local user REMOVED
-     *  is never silently dropped: the request is parked in the message box
-     *  ([contactRequests]) for the user to accept or ignore, and the dialer
-     *  is told via "direct_pending" so its side shows "waiting for
-     *  confirmation" instead of a failure. */
+     *  A member with a KNOWN device id is auto-accepted — the handshake
+     *  already authenticated the dialer's identity key. An endpoint
+     *  (ip:port) match alone must NOT auto-accept: DHCP may hand a known
+     *  contact's old address to a stranger device, and only the request box
+     *  keeps "first contact needs confirmation" true for it (Windows
+     *  `_maybe_incoming_request` parity). A FIRST CONTACT (unknown id) or a
+     *  member the local user REMOVED is never silently dropped: the request
+     *  is parked in the message box ([contactRequests]) for the user to
+     *  accept or ignore, and the dialer is told via "direct_pending" so its
+     *  side shows "waiting for confirmation" instead of a failure. */
     fun handleDirectHello(socket: Socket, wire: Wire, hello: NetworkPacket, peerIdent: String?) {
         val peer = hello.peer
         if (peer == null || peer.id == myId) {
@@ -847,10 +850,12 @@ object DirectChatManager {
         // First contact / removed member -> the request box. Nothing here is
         // dropped silently: the box entry is visible (deduped, one row per
         // peer, one event per NEW entry) and the dialer gets a definitive
-        // "pending" answer instead of a hung-up connection.
+        // "pending" answer instead of a hung-up connection. A member with a
+        // KNOWN ID is auto-accepted below; an endpoint (ip:port) match alone
+        // is deliberately NOT enough (DHCP address reuse — see the class
+        // doc above).
         val removed = isRemoved(peer)
-        val known = _contacts.value.containsKey(peer.id) ||
-            _contacts.value.any { (_, c) -> c.ip == peer.ipAddress && c.port == peer.port }
+        val known = _contacts.value.containsKey(peer.id)
         if (removed || !known) {
             recordContactRequest(
                 peer,

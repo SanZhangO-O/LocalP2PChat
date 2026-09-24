@@ -1,4 +1,4 @@
-﻿package com.zqr.localchat.network
+package com.zqr.localchat.network
 
 import android.util.Log
 import com.zqr.localchat.data.ChatMessage
@@ -13,7 +13,8 @@ import java.io.PrintWriter
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 /**
@@ -57,6 +58,12 @@ object GroupMeshManager {
      *  expansion of an encrypted line (~1.4x). */
     private const val HISTORY_CHUNK_BYTES = 36 * 1024
 
+    /** Per-link send queue bound (Windows MESH_SEND_QUEUE_CAP parity): a
+     *  peer that reads nothing backs the queue up instead of blocking the
+     *  broadcast caller; past this cap the link is treated as dead, so its
+     *  ping-fed read loop cannot keep a memory balloon alive indefinitely. */
+    private const val MESH_SEND_QUEUE_CAP = 4096
+
     private class Link(
         val peerId: String,
         val socket: Socket,
@@ -64,6 +71,27 @@ object GroupMeshManager {
     ) {
         @Volatile
         var alive = true
+
+        /** Per-link FIFO hand-off (Windows `_link_sender` parity): broadcasts
+         *  enqueue here and one writer thread drains it in order, so a
+         *  delete/edit can never overtake the chat it targets on this link —
+         *  the receiver drops a delete for an id it has not seen yet and the
+         *  message would resurrect. A slow/half-dead link only backs up its
+         *  OWN queue, never another group's traffic (the shared single
+         *  executor this replaced had that failure mode). */
+        val sendQueue = LinkedBlockingQueue<NetworkPacket>(MESH_SEND_QUEUE_CAP)
+
+        /** Non-blocking FIFO hand-off to the link's writer thread. A full
+         *  queue means the peer stopped reading long ago: the link is killed
+         *  (sender's blocked write fails, read loop reaps the registry)
+         *  instead of growing memory without bound (see MESH_SEND_QUEUE_CAP). */
+        fun enqueue(packet: NetworkPacket) {
+            if (!alive) return
+            if (!sendQueue.offer(packet)) {
+                alive = false
+                runCatching { socket.close() }
+            }
+        }
     }
 
     private class GroupState(
@@ -145,13 +173,6 @@ object GroupMeshManager {
     @Volatile
     var onGroupReadReceipt: ((String, String, String) -> Unit)? = null
 
-    /** Shared single writer for the high-frequency advisory broadcasts
-     *  (typing / admin relay): one daemon thread instead of one thread per
-     *  packet. Sends are serialized, which socket writes tolerate. */
-    private val sendExecutor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "mesh-send").apply { isDaemon = true }
-    }
-
     // ------------------------------------------------------------ lifecycle
 
     /** The ViewModel seeds a group's mesh state and connects to every other
@@ -225,18 +246,19 @@ object GroupMeshManager {
     // --------------------------------------------------------------- sending
 
     /** Broadcast a message to every mesh link (the host path is separate).
-     *  The writes run on a background thread — this is called from the UI
-     *  thread when the user sends a message. */
+     *  The writes run on the single send thread — this is called from the UI
+     *  thread when the user sends a message, and FIFO execution guarantees a
+     *  delete broadcast right after this one cannot overtake it on any link
+     *  (a delete arriving before its chat would be dropped as unknown and
+     *  the message would resurrect). */
     fun broadcast(groupId: String, msg: ChatMessage) {
         val state = groups[groupId] ?: return
         noteMessage(groupId, msg)
         val packet = NetworkPacket(type = "mesh_chat", groupId = groupId, message = msg)
         val links = state.links.values.toList()
-        thread(name = "mesh-broadcast") {
-            links.forEach { link ->
-                runCatching { link.wire.sendPacket(packet) }
-            }
-        }
+        // Per-link FIFO writer (see Link.sendQueue): ordered per link, and a
+        // stuck link only backs up its own queue.
+        links.forEach { link -> link.enqueue(packet) }
     }
 
     /** Tell every linked member that a message was deleted (host-offline
@@ -255,11 +277,9 @@ object GroupMeshManager {
             GroupAuth.deleteParts(groupId, myId, messageId)
         )
         val links = state.links.values.toList()
-        thread(name = "mesh-delete") {
-            links.forEach { link ->
-                runCatching { link.wire.sendPacket(packet) }
-            }
-        }
+        // Same per-link FIFO writer as [broadcast]: the delete cannot overtake
+        // the chat packet it targets on any link.
+        links.forEach { link -> link.enqueue(packet) }
     }
 
     /** Tell every linked member that [senderId] started/stopped typing
@@ -275,11 +295,9 @@ object GroupMeshManager {
         )
         val links = state.links.values.toList()
         if (links.isEmpty()) return
-        sendExecutor.execute {
-            links.forEach { link ->
-                runCatching { link.wire.sendPacket(packet) }
-            }
-        }
+        // Per-link FIFO writer (see Link.sendQueue): advisory packets keep
+        // their per-link order; a stuck link only backs up its own queue.
+        links.forEach { link -> link.enqueue(packet) }
     }
 
     /** Tell every linked member that [messageId]'s author replaced its
@@ -323,11 +341,9 @@ object GroupMeshManager {
             senderSig = sig
         )
         val links = state.links.values.toList()
-        sendExecutor.execute {
-            links.forEach { link ->
-                runCatching { link.wire.sendPacket(packet) }
-            }
-        }
+        // Per-link FIFO writer (see Link.sendQueue): advisory packets keep
+        // their per-link order; a stuck link only backs up its own queue.
+        links.forEach { link -> link.enqueue(packet) }
     }
 
     /** Toggle an emoji reaction over every mesh link. Advisory: members with
@@ -344,11 +360,9 @@ object GroupMeshManager {
             active = active
         )
         val links = state.links.values.toList()
-        sendExecutor.execute {
-            links.forEach { link ->
-                runCatching { link.wire.sendPacket(packet) }
-            }
-        }
+        // Per-link FIFO writer (see Link.sendQueue): advisory packets keep
+        // their per-link order; a stuck link only backs up its own queue.
+        links.forEach { link -> link.enqueue(packet) }
     }
 
     /** Pin/unpin a message over every mesh link (host-offline path). */
@@ -363,11 +377,9 @@ object GroupMeshManager {
             active = active
         )
         val links = state.links.values.toList()
-        sendExecutor.execute {
-            links.forEach { link ->
-                runCatching { link.wire.sendPacket(packet) }
-            }
-        }
+        // Per-link FIFO writer (see Link.sendQueue): advisory packets keep
+        // their per-link order; a stuck link only backs up its own queue.
+        links.forEach { link -> link.enqueue(packet) }
     }
 
     /** Tell every linked member we have read the group up to [upToId]
@@ -382,11 +394,9 @@ object GroupMeshManager {
             readerId = myId
         )
         val links = state.links.values.toList()
-        sendExecutor.execute {
-            links.forEach { link ->
-                runCatching { link.wire.sendPacket(packet) }
-            }
-        }
+        // Per-link FIFO writer (see Link.sendQueue): advisory packets keep
+        // their per-link order; a stuck link only backs up its own queue.
+        links.forEach { link -> link.enqueue(packet) }
     }
 
     /** Apply a verified edit to this member's mesh history copy so a later
@@ -438,11 +448,9 @@ object GroupMeshManager {
     fun broadcastAdmin(groupId: String, packet: NetworkPacket) {
         val state = groups[groupId] ?: return
         val links = state.links.values.toList()
-        sendExecutor.execute {
-            links.forEach { link ->
-                runCatching { link.wire.sendPacket(packet) }
-            }
-        }
+        // Per-link FIFO writer (see Link.sendQueue): advisory packets keep
+        // their per-link order; a stuck link only backs up its own queue.
+        links.forEach { link -> link.enqueue(packet) }
     }
 
     /** Tell every linked member that [peer] joined the group, so each one
@@ -452,11 +460,7 @@ object GroupMeshManager {
         addPeer(groupId, peer)
         val packet = NetworkPacket(type = "mesh_announce", groupId = groupId, peer = peer)
         val links = state.links.values.toList()
-        thread(name = "mesh-announce") {
-            links.forEach { link ->
-                runCatching { link.wire.sendPacket(packet) }
-            }
-        }
+        links.forEach { link -> link.enqueue(packet) }
     }
 
     /** Record a locally sent message so it can be shared as history later. */
@@ -524,8 +528,16 @@ object GroupMeshManager {
         val groupId = hello.groupId ?: run { closeSocket(socket); return }
         val peer = hello.peer ?: run { closeSocket(socket); return }
         val state = groups[groupId] ?: run { closeSocket(socket); return }
-        val my = state.myPeer ?: run { closeSocket(socket); return }
-        wire.sendPacket(NetworkPacket(type = "mesh_ack", groupId = groupId, peer = my))
+        if (state.myPeer == null) {
+            closeSocket(socket)
+            return
+        }
+        // The mesh_ack is sent INSIDE registerLink AFTER the atomic roster
+        // claim: a dialer that received an ack is guaranteed a claimed slot,
+        // so "ack implies admission" holds and its bounded retry budget
+        // (MAX_CONNECT_ATTEMPTS, reset only after a working link) can never
+        // be reset by an ack-then-refuse — including the race where a
+        // concurrent join takes the last free slot before the install.
         registerLink(state, peer, socket, wire)
     }
 
@@ -607,6 +619,10 @@ object GroupMeshManager {
             if (history.isNotEmpty()) {
                 sendHistory(link.wire, state.groupId, history)
             }
+            // FIFO writer after the history push: broadcasts enqueued between
+            // install and now drain in order once this thread begins, so
+            // history backfill precedes live traffic (Windows parity).
+            thread(name = "mesh-send-${state.groupId}-${peer.id}") { linkSender(link) }
             runLinkLoop(state, link)
             state.links.remove(peer.id, link)
             updateHasLinks(state.groupId)
@@ -660,8 +676,25 @@ object GroupMeshManager {
     }
 
     /** Register a freshly established link (either direction) and exchange
-     *  history so both sides backfill what they missed. */
+     *  history so both sides backfill what they missed. Sends the mesh_ack
+     *  only after the roster claim + install held, so ack implies admission
+     *  (Windows `_register_link` parity). */
     private fun registerLink(state: GroupState, peer: Peer, socket: Socket, wire: Wire) {
+        val my = state.myPeer ?: run { closeSocket(socket); return }
+        // Same roster cap as [addPeer], atomic via the putIfAbsent claim: a
+        // fresh id must not grow the roster past the cap even over a
+        // valid-password handshake (same-id relink or endpoint refresh still
+        // passes; a claimed-then-released slot leaves the roster unchanged).
+        // Refusal happens BEFORE any ack: the dialer counts this as a failed
+        // attempt and keeps its bounded retry budget.
+        if (state.peers.putIfAbsent(peer.id, peer) == null &&
+            state.peers.size > MAX_PEERS_PER_GROUP
+        ) {
+            state.peers.remove(peer.id, peer)
+            Log.w(TAG, "peer cap ($MAX_PEERS_PER_GROUP) reached for ${state.groupId}, refusing link ${peer.id}")
+            closeSocket(socket)
+            return
+        }
         val link = Link(peer.id, socket, wire)
         state.peers[peer.id] = peer
         // Atomically install: replace a dead/stale link, reject only when a
@@ -690,13 +723,55 @@ object GroupMeshManager {
             }
         }
         updateHasLinks(state.groupId)
+        // Ack AFTER the atomic claim/install (see handleMeshHello): before
+        // the sender thread exists, so no queued broadcast can precede it.
+        try {
+            wire.sendPacket(NetworkPacket(type = "mesh_ack", groupId = state.groupId, peer = my))
+        } catch (e: Exception) {
+            // the dialer never saw an ack, but OUR install happened: unwind
+            // it — the read loop was not started yet, so nothing else owns
+            // this cleanup
+            Log.w(TAG, "mesh_ack send to ${peer.id} failed", e)
+            link.alive = false
+            state.links.remove(peer.id, link)
+            updateHasLinks(state.groupId)
+            closeSocket(socket)
+            return
+        }
         // push our history for the group (the peer pushes theirs back)
         val history = state.messages.value.takeLast(HISTORY_CAP)
         if (history.isNotEmpty()) {
             sendHistory(wire, state.groupId, history)
         }
-        thread(name = "mesh-read-$state.groupId-${peer.id}") { runLinkLoop(state, link) }
-        thread(name = "mesh-ping-$state.groupId-${peer.id}") { pingLoop(link) }
+        // FIFO writer first (see connectWithRetry / Link.sendQueue).
+        thread(name = "mesh-send-${state.groupId}-${peer.id}") { linkSender(link) }
+        thread(name = "mesh-read-${state.groupId}-${peer.id}") { runLinkLoop(state, link) }
+        thread(name = "mesh-ping-${state.groupId}-${peer.id}") { pingLoop(link) }
+    }
+
+    /** Per-link FIFO writer: drains [Link.sendQueue] in order. One daemon
+     *  thread per link; exits when the link dies (alive flag flipped by the
+     *  read loop's finally / leaveGroup / a failed write) or when replaced.
+     *  A half-dead peer (stops reading but keeps pinging) can block this
+     *  thread's write indefinitely — that stalls ONLY this link's queue,
+     *  never another group's traffic (the shared single executor this
+     *  replaced had exactly that failure mode). */
+    private fun linkSender(link: Link) {
+        while (link.alive) {
+            val packet = try {
+                link.sendQueue.poll(1, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+                break
+            } ?: continue
+            try {
+                link.wire.sendPacket(packet)
+            } catch (e: Exception) {
+                // unblock the read loop, which owns the registry cleanup
+                link.alive = false
+                closeSocket(link.socket)
+                break
+            }
+        }
     }
 
     private fun runLinkLoop(state: GroupState, link: Link) {
