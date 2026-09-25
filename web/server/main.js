@@ -14,6 +14,15 @@ const LOGIN_WINDOW_MS = 5 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 10;
 const MAX_JSON_BODY = 64 * 1024;
 
+function portArg(value, fallback, flag) {
+  const parsed = parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    console.warn(`\u5ffd\u7565\u65e0\u6548\u53c2\u6570 ${flag} ${value}\uff0c\u4f7f\u7528\u9ed8\u8ba4\u503c ${fallback}`);
+    return fallback;
+  }
+  return parsed;
+}
+
 function parseArgs(argv) {
   const args = {
     portBase: U.TCP_PORT,
@@ -24,8 +33,8 @@ function parseArgs(argv) {
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--port-base") args.portBase = parseInt(argv[++i], 10);
-    else if (a === "--http") args.httpPort = parseInt(argv[++i], 10);
+    if (a === "--port-base") args.portBase = portArg(argv[++i], args.portBase, a);
+    else if (a === "--http") args.httpPort = portArg(argv[++i], args.httpPort, a);
     else if (a === "--http-host") args.httpHost = argv[++i];
     else if (a === "--data") args.data = path.resolve(argv[++i]);
     else if (a === "--public") args.publicDir = path.resolve(argv[++i]);

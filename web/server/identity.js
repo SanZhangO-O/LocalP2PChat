@@ -49,6 +49,8 @@ class DeviceIdentity {
         );
       }
       pair = C.ECKeyPair.generate();
+      // _save() reads this.pair: publish the new key before persisting
+      this.pair = pair;
       this.deviceId = doc && doc.deviceId ? String(doc.deviceId) : UuidLike();
       this.hardwareId = doc && doc.hardwareId ? String(doc.hardwareId) : UuidLike();
       this.peers = {};

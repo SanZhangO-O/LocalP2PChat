@@ -44,9 +44,11 @@ function randomBytes(n) {
 
 function aesGcmEncrypt(key, plaintext) {
   const nonce = crypto.randomBytes(GCM_NONCE_LEN);
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, nonce);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, nonce, {
+    authTagLength: GCM_TAG_LEN,
+  });
   const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  const tag = cipher.getTag(GCM_TAG_LEN);
+  const tag = cipher.getAuthTag();
   return Buffer.concat([nonce, ct, tag]);
 }
 

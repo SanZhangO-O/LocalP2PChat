@@ -43,15 +43,37 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// virtual adapters (VMware/VirtualBox/Hyper-V/docker/WSL/tunnel) are often
+// enumerated first and are unreachable for LAN peers; the address we advertise
+// in direct_hello / fileInfo must be the real LAN one
+const VIRTUAL_IFACE_RE = /(vethernet|vmware|virtualbox|hyper-v|hyperv|docker|wsl|loopback|bluetooth|radmin|tailscale|zerotier|npcap|tap|tun)/i;
+
+function interfaceRank(name, address) {
+  let rank = VIRTUAL_IFACE_RE.test(name) ? 100 : 0;
+  if (address.startsWith("192.168.")) rank += 0;
+  else if (address.startsWith("10.")) rank += 1;
+  else if (/^172\.(1[6-9]|2\d|3[01])\./.test(address)) rank += 2;
+  else if (address.startsWith("169.254.")) rank += 50;
+  else rank += 10;
+  return rank;
+}
+
 function getLocalIpAddress() {
   const ifaces = os.networkInterfaces();
+  const candidates = [];
   for (const name of Object.keys(ifaces)) {
     for (const iface of ifaces[name] || []) {
       if (iface.family === "IPv4" && !iface.internal) {
-        return iface.address;
+        candidates.push({ name, address: iface.address });
       }
     }
   }
+  candidates.sort(
+    (a, b) =>
+      interfaceRank(a.name, a.address) - interfaceRank(b.name, b.address) ||
+      (a.name < b.name ? -1 : 1)
+  );
+  if (candidates.length) return candidates[0].address;
   try {
     const candidate = os.hostname();
     if (candidate && !candidate.startsWith("127.")) {
@@ -88,7 +110,10 @@ function codePointsOf(text) {
 }
 
 function isValidContent(content) {
-  return Boolean(content && content.trim()) && content.length <= MAX_CONTENT_LENGTH;
+  if (typeof content !== "string" || !content.trim()) return false;
+  // python's len() counts code points; UTF-16 units would reject astral-heavy
+  // messages that the other ends accept (AGENTS.md cross-endian rule)
+  return codePointsOf(content).length <= MAX_CONTENT_LENGTH;
 }
 
 function detectMediaKind(name) {

@@ -537,4 +537,76 @@
   - 面向对端流量积累的队列一律有界，满队=对端不配合=按断链处理，
     而不是无界缓存或阻塞广播调用方。
 
+## 2026-09-25 Web 端（Node 复刻）首轮可运行性审查：加密/身份/群主 id 三处硬伤 + 两处传输截断
+
+- 现象: 对 `web/`（Node ≥ 18 多用户复刻）做挑剔审查并用最小脚本实际跑通时发现：
+  1) 一切都加密不可用——`aes-gcm roundtrip` 单测本应失败，任何 `send_packet` /
+  文件帧 / `enc1:` 落盘都会抛 `TypeError: cipher.getTag is not a function`
+  （Node v24.14.0 实测；`crypto.Cipheriv` 只有 `getAuthTag()`）。
+  2) `new DeviceIdentity(dir)`（首次运行/无身份文件）必崩：
+  `TypeError: Cannot read properties of null (reading 'privateB64')`。
+  3) 成员加入群后 `creatorId` 恒为空：任何 `group_update` / `kick_member`
+  都被 `_handleGroupUpdateAsClient` / `_handleKickAsClient` 判为越权，
+  直接把成员与 host 的 relay 断开（群公告/改名/移出成员全不可用）。
+  4) 文件下载偶发「文件不完整」：发送端可能在最后一个数据帧或 4 字节 EOF
+  落地前就 RST 掉连接；接收端 `.part` 保留、重试才收敛。
+  5) UI/接口级：`createGroup` 不复述 `reqId`（前端 `request()` 20s 后
+  超时、弹窗不关）；服务器重启后 `serveFile` 只查内存 `downloads` 表，
+  已下载文件 404（快照却标 `done`）；上传超限只 `req.destroy()` 不响应，
+  浏览器端一直等到超时。
+  6) 服务器重启后**群主自己的群聊历史全部消失**（成员加入的群由于走
+  `enterMesh` 会恢复；群主群只恢复群名/公告/密码，不读消息文件）。
+- 根因:
+  1) Node 与 WebCrypto 的 API 名字混淆：GCM 取 tag 是 `cipher.getAuthTag()`，
+  `getTag()` 不存在；`createCipheriv` 的 tag 长度用 `authTagLength` 选项。
+  代码从未真正跑过（单测存在但没人执行），所以协议栈三个实现里它一直是坏的。
+  2) `_load()` 在 `this.pair = pair` 之前调 `this._save()`，而 `_save()` 读
+  `this.pair.privateB64`；身份文件存在时走 else 分支不触发，掩盖了首次运行路径。
+  3) Windows 的 creator 是在视图层（`view_model.py:4061-4078`）按
+  「sponsor ack 的 host → query 的 creatorId → 拨号地址上的名册成员」三步
+  落库的；web 复刻只在恢复存档时读 `creatorId`，加入路径完全没写。
+  4) `conn.end()` 只保证「排空后发 FIN」，紧跟的 `conn.destroy()` 会直接关掉
+  fd，内核里未发出的缓冲（尾帧 + EOF）被丢弃；Python 接收端以
+  `received != expected` 判不完整，于是表现为可重试的假失败。
+  6) `_restoreState` 的分支不对称：成员分支做了「读历史 + enterMesh」，
+  群主分支只 `createHost` 后设置元数据；消息虽已加密落盘
+  （`_saveGroupChat`），恢复路径没人读。
+- 修复:
+  - `web/server/crypto.js:45-55`：`getAuthTag()` + `authTagLength: GCM_TAG_LEN`。
+  - `web/server/identity.js:51-57`：生成新密钥后先 `this.pair = pair` 再 `_save()`。
+  - `web/server/group.js:539-620`：`joinGroup` 把 query 的 `creatorId` 传进
+    `_joinExchange`；creator 依次取 `join_ack.host.id` / query creatorId /
+    `members[0].id`，并在已存在 group 上补写。
+  - `web/server/files.js:30-116`：`complete(eof)` 改为 `conn.end()` /
+    `conn.end(EOF)`（排空后 FIN），10s 兜底 `destroy` + `close` 时清定时器；
+    只有错误/中断路径才立即 `destroy`。
+  - `web/server/account.js`：`createGroup` 回填 `reqId`；`serveFile` 改为扫
+    `downloads/`（跳过 `.part`）并补 `Content-Length`；上传超限先回 413、
+    再 `unpipe` + 删分片 + `req.resume()` 把剩余体读完（不 RST）。
+  - `web/server/account.js:241-256`：群主分支同样 `_restoreGroupMessages`
+    回填 `g.messages`（按时间戳排序），与成员分支对称。
+- 验证: 用临时脚本（不入库）实跑：单 Node 直接聊（消息/已读/输入中/编辑/
+  回应/置顶/文件收发/撤回）+ 首触请求卡片/接受/离线暂存重拨补发 + 群 relay
+  （加入、双向消息、编辑签名收敛、公告、群已读、踢人）+ 双 Node mesh
+  （mesh_chat/history_reply）+ 真实 `ChatServer` HTTP/WS（注册/登录 401/
+  会话 cookie/未认证 WS 拒绝/createGroup reqId/上传 413/logout）+ 同数据
+  目录重启（身份、昵称、群与历史消息、文件元数据全部恢复）全部通过；
+  文件服务器 319545 字节全量 + EOF 校验通过。
+  语法 `node --check web/server/*.js web/public/app.js`。
+  注：现有 `web/test/unit.test.js` 的 `aes-gcm roundtrip ...` 与
+  `identity tofu store persists and enforces` 本可拦住 1) 2)，本轮未跑套件
+  （项目约定不自动跑测试），首次全量跑 web 单测时这两条应作为基线。
+- 防再犯:
+  - 复刻实现必须**实际运行**再声明完成：`web/test/*.test.js` 与临时端到端
+    脚本至少各跑一次；`getAuthTag` 这类 API 名字错误不会被静态审查放过，
+    但会被任何一次真实调用暴露。改 `web/` 后先跑 `node --test web\test\*.test.js`。
+  - 「先赋值、后使用」的状态初始化（`this.pair`）在错误分支里最容易漏：
+    新增 `_save()`/序列化调用时检查它依赖的字段是否已就绪。
+  - 对端有「视图层补齐协议字段」的逻辑（如 Windows 的 creatorId 三步回退）
+    时，复刻端必须在同一位置补同等逻辑，而不是只复刻网络层字段解析。
+  - `end()` 与 `destroy()` 不是同一语义：正常结束只 `end()`（必要时带尾数据），
+    立即销毁仅用于错误路径；凡「写响应后马上 destroy」的代码都在丢数据。
+  - 服务端拒绝请求（413/400）必须先写响应再处理剩余请求体（drain），
+    直接 `req.destroy()` 会把响应一起掐掉，客户端只看到网络错误。
+
 

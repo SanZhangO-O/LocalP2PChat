@@ -450,6 +450,13 @@ class GroupApp {
       ) {
         target.content = packet.newContent;
         target.edited = true;
+        if (packet.senderPubId && packet.senderSig) {
+          // this local copy is also the mesh history copy: it must carry the
+          // edit's signature or our own history pushes would fail
+          // verify_message on the edited body
+          target.senderPubId = packet.senderPubId;
+          target.senderSig = packet.senderSig;
+        }
         this.emit("messagesChanged", g);
         this.emit("messageEdited", g, packet.messageId, packet.newContent, senderId);
         this._broadcastToClients(g, packet, senderId);
@@ -532,6 +539,8 @@ class GroupApp {
   async joinGroup(targetIp, targetPort, idOrName, password) {
     const queried = await this.queryGroup(targetIp, targetPort, idOrName, password);
     const displayName = queried.ok ? queried.info.groupName : idOrName;
+    const queriedCreatorId =
+      queried.ok && queried.info ? String(queried.info.creatorId || "") : "";
     let socket = null;
     let consumed = false;
     try {
@@ -541,7 +550,8 @@ class GroupApp {
         idOrName,
         password,
         [targetIp, targetPort],
-        displayName
+        displayName,
+        queriedCreatorId
       );
       consumed = result.consumed;
       return result;
@@ -552,7 +562,7 @@ class GroupApp {
     }
   }
 
-  async _joinExchange(socket, idOrName, password, typedEndpoint, displayName) {
+  async _joinExchange(socket, idOrName, password, typedEndpoint, displayName, queriedCreatorId) {
     const channel = new W.LineChannel(socket);
     const wire = new W.Wire(channel);
     await W.Handshake.initiate(wire, W.MODE_JOIN, idOrName, password || "");
@@ -571,6 +581,15 @@ class GroupApp {
       return { ok: false, message: "\u8fde\u63a5\u88ab\u5173\u95ed" };
     }
     if (response.type === "join_ack" && response.members) {
+      const host = response.host;
+      // the owner's device id gates group_update/kick_member acceptance:
+      // a sponsor ack names the host, the query reply carries creatorId, and
+      // the first join_ack member is the host for a direct host join
+      const creatorId =
+        (host && host.id) ||
+        queriedCreatorId ||
+        (response.members[0] && response.members[0].id) ||
+        "";
       let g = this.groups.get(response.groupId || idOrName);
       if (!g) {
         g = mkState({
@@ -579,11 +598,13 @@ class GroupApp {
           joinId: idOrName,
           password: password || "",
           isHost: false,
+          creatorId,
         });
         this.groups.set(g.groupId, g);
       } else if (displayName && displayName !== g.name) {
         g.name = displayName;
       }
+      if (creatorId && !g.creatorId) g.creatorId = creatorId;
       g.password = password || g.password;
       for (const peer of response.members) {
         if (peer.id !== this.identity.deviceId) g.peers.set(peer.id, peer);
@@ -592,7 +613,6 @@ class GroupApp {
       if (response.deletedIds && response.deletedIds.length) {
         this._applyDeletedIds(g, U.sanitizeDeletedIds(response.deletedIds));
       }
-      const host = response.host;
       if (
         host != null &&
         (typedEndpoint == null ||
@@ -944,6 +964,9 @@ class GroupApp {
     this._enqueueSend(g, new M.NetworkPacket({ type: "file_message", message }), () => {
       fileServer.close();
       g.messages = g.messages.filter((m) => m.id !== fileServer.fileId);
+      // the offer may already have reached mesh links; the tombstone
+      // propagates through history_reply so peers drop the dead card too
+      this.recordTombstone(g, fileServer.fileId);
       this.emit("messagesChanged", g);
     });
     this.meshBroadcastMessage(g, message);

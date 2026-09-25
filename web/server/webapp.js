@@ -6,6 +6,8 @@ const path = require("path");
 const crypto = require("crypto");
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const MAX_WS_MESSAGE = 4 * 1024 * 1024;
+const MAX_WS_FRAME = 64 * 1024 * 1024;
 
 class WebSocketConn {
   constructor(socket) {
@@ -14,6 +16,7 @@ class WebSocketConn {
     this.onclose = null;
     this.buffer = Buffer.alloc(0);
     this.fragments = [];
+    this.fragmentBytes = 0;
     this.fragOpcode = 0;
     this.closed = false;
     socket.on("data", (chunk) => this._onData(chunk));
@@ -29,10 +32,15 @@ class WebSocketConn {
   }
 
   _onData(chunk) {
+    if (this.closed) return;
     this.buffer = Buffer.concat([this.buffer, chunk]);
     for (;;) {
       const frame = this._parseFrame();
       if (frame == null) return;
+      if (frame.protocolError) {
+        this._protocolClose();
+        return;
+      }
       if (frame.opcode === 0x8) {
         this._sendFrame(0x8, frame.payload);
         this._closed();
@@ -48,17 +56,34 @@ class WebSocketConn {
           this._deliver(frame.payload);
         } else {
           this.fragments = [frame.payload];
+          this.fragmentBytes = frame.payload.length;
           this.fragOpcode = frame.opcode;
+          if (this.fragmentBytes > MAX_WS_MESSAGE) return this._protocolClose();
         }
       } else if (frame.opcode === 0x0) {
+        this.fragmentBytes += frame.payload.length;
+        if (this.fragmentBytes > MAX_WS_MESSAGE) return this._protocolClose();
         this.fragments.push(frame.payload);
         if (frame.fin) {
           const full = Buffer.concat(this.fragments);
           this.fragments = [];
+          this.fragmentBytes = 0;
           this._deliver(full);
         }
       }
     }
+  }
+
+  _protocolClose() {
+    const payload = Buffer.alloc(2);
+    payload.writeUInt16BE(1002, 0);
+    this._sendFrame(0x8, payload);
+    try {
+      this.socket.destroy();
+    } catch (e) {
+      /* ignore */
+    }
+    this._closed();
   }
 
   _deliver(payload) {
@@ -77,8 +102,12 @@ class WebSocketConn {
     const first = buf[0];
     const second = buf[1];
     const fin = (first & 0x80) !== 0;
+    const rsv = (first & 0x70) !== 0;
     const opcode = first & 0x0f;
     const masked = (second & 0x80) !== 0;
+    // RFC 6455: no extensions negotiated, every client frame must be masked,
+    // control frames must be final and <= 125 bytes
+    if (rsv || !masked) return { protocolError: true };
     let len = second & 0x7f;
     let offset = 2;
     if (len === 126) {
@@ -88,15 +117,13 @@ class WebSocketConn {
     } else if (len === 127) {
       if (buf.length < 10) return null;
       const big = buf.readBigUInt64BE(2);
-      if (big > BigInt(64 * 1024 * 1024)) {
-        this.socket.destroy();
-        return null;
-      }
+      if (big > BigInt(MAX_WS_FRAME)) return { protocolError: true };
       len = Number(big);
       offset = 10;
     }
+    if ((opcode & 0x8) !== 0 && (!fin || len > 125)) return { protocolError: true };
     let mask = null;
-    if (masked) {
+    {
       if (buf.length < offset + 4) return null;
       mask = buf.subarray(offset, offset + 4);
       offset += 4;
@@ -228,7 +255,11 @@ class WebApp {
         this.connections.add(conn);
       });
       this.server.on("error", reject);
-      this.server.listen(this.port, this.host, () => resolve(this.port));
+      this.server.listen(this.port, this.host, () => {
+        // port 0 means "any free port": report what was actually bound
+        const bound = this.server.address();
+        resolve(bound ? bound.port : this.port);
+      });
     });
   }
 
@@ -278,7 +309,14 @@ class WebApp {
 
   async _handleRequest(req, res) {
     const url = new URL(req.url, "http://localhost");
-    const pathname = decodeURIComponent(url.pathname);
+    let pathname;
+    try {
+      pathname = decodeURIComponent(url.pathname);
+    } catch (e) {
+      res.writeHead(400);
+      res.end("bad request");
+      return;
+    }
     if (pathname.startsWith("/api/") || pathname.startsWith("/files/")) {
       const accountId = this.onAuth(req);
       const publicPaths = ["/api/login", "/api/register", "/api/whoami"];

@@ -10,8 +10,11 @@ const { Store } = require("./store");
 const { DirectChatManager } = require("./direct");
 const { GroupApp } = require("./group");
 const { SharedListener } = require("./tcpserver");
+const { downloadFileOffer } = require("./files");
 
 const BIND_RETRY_MS = 5000;
+const MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
+const UPLOAD_TTL_MS = 24 * 3600 * 1000;
 
 class Account {
   constructor(server, record) {
@@ -50,6 +53,27 @@ class Account {
     this._wireGroups();
     this._startListener();
     this._restoreState();
+    this._pruneUploads();
+  }
+
+  // uploads are a staging area for files already handed to the per-file
+  // servers; anything older than a day is dead weight
+  _pruneUploads() {
+    const cutoff = Date.now() - UPLOAD_TTL_MS;
+    let names = [];
+    try {
+      names = fs.readdirSync(this.uploadsDir);
+    } catch (e) {
+      return;
+    }
+    for (const name of names) {
+      const p = path.join(this.uploadsDir, name);
+      try {
+        if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
+      } catch (e) {
+        /* ignore */
+      }
+    }
   }
 
   _startListener() {
@@ -220,6 +244,12 @@ class Account {
         g.announcement = sg.announcement || "";
         g.creatorId = sg.creatorId || this.identity.deviceId;
         g.tombstones = sg.tombstones || [];
+        // the host's copy is also the mesh history source: reload it or the
+        // whole group chat vanishes from the UI on every restart
+        const history = this._restoreGroupMessages(g.groupId);
+        if (history.length) {
+          g.messages = history.sort((a, b) => a.timestamp - b.timestamp);
+        }
       } else {
         const g = this.groups.registerMemberGroup({
           groupId: sg.groupId,
@@ -300,6 +330,7 @@ class Account {
   }
 
   buildSnapshot() {
+    const downloaded = this._downloadedFileNames();
     const contacts = this.direct.contactsList().map((c) => ({
       id: c.id,
       name: c.name,
@@ -332,10 +363,14 @@ class Account {
     }
     const chats = {};
     for (const c of contacts) {
-      chats["direct:" + c.id] = this._chatView("direct:" + c.id, this.direct.messagesFor(c.id));
+      chats["direct:" + c.id] = this._chatView(
+        "direct:" + c.id,
+        this.direct.messagesFor(c.id),
+        downloaded
+      );
     }
     for (const g of this.groups.groups.values()) {
-      chats[g.groupId] = this._chatView(g.groupId, g.messages);
+      chats[g.groupId] = this._chatView(g.groupId, g.messages, downloaded);
     }
     return {
       profile: {
@@ -354,7 +389,7 @@ class Account {
     };
   }
 
-  _chatView(key, messages) {
+  _chatView(key, messages, downloaded) {
     return {
       key,
       messages: messages.slice(-300).map((m) => ({
@@ -373,7 +408,7 @@ class Account {
               fileName: m.fileInfo.fileName,
               fileSize: m.fileInfo.fileSize,
               kind: m.fileInfo.kind || "file",
-              state: this._fileState(m.fileInfo.fileId, m),
+              state: this._fileState(m.fileInfo.fileId, m, downloaded),
             }
           : null,
         reactions: m.reactions || {},
@@ -383,11 +418,21 @@ class Account {
     };
   }
 
-  _fileState(fileId, msg) {
+  // one directory listing per snapshot instead of an fs stat per message
+  _downloadedFileNames() {
+    try {
+      return new Set(fs.readdirSync(this.downloadsDir));
+    } catch (e) {
+      return new Set();
+    }
+  }
+
+  _fileState(fileId, msg, downloaded) {
     if (msg.senderId === this.identity.deviceId) return "sent";
     const dl = this.downloads.get(fileId);
     if (dl && dl.status === "done") return "done";
-    if (fs.existsSync(this._downloadPath(fileId, msg.fileInfo.fileName))) return "done";
+    const saved = path.basename(this._downloadPath(fileId, msg.fileInfo.fileName));
+    if (downloaded && downloaded.has(saved)) return "done";
     if (dl && dl.status === "downloading") {
       return { downloading: true, received: dl.received, total: dl.total };
     }
@@ -448,11 +493,12 @@ class Account {
         return;
       }
       case "createGroup": {
+        const reqId = msg.reqId;
         const name = String(msg.name || "").trim().slice(0, 64);
         if (!name) return;
         const g = gapp.createHost(name, String(msg.password || ""));
         this._saveGroups();
-        conn.send(JSON.stringify({ createdGroup: { groupId: g.groupId, joinId: g.joinId, name: g.name } }));
+        conn.send(JSON.stringify({ createdGroup: { reqId, groupId: g.groupId, joinId: g.joinId, name: g.name } }));
         this._scheduleSnapshot();
         return;
       }
@@ -524,7 +570,10 @@ class Account {
         if (key.startsWith("direct:")) {
           const peerId = key.slice(7);
           const target = d.messagesFor(peerId).find((m) => m.id === messageId);
-          d.deleteMessage(peerId, messageId, target ? target.senderId : this.identity.deviceId);
+          // direct chat delete only retracts OUR message; a missing target
+          // must never fabricate a senderId and broadcast a delete claim
+          if (!target || target.senderId !== this.identity.deviceId) return;
+          d.deleteMessage(peerId, messageId, this.identity.deviceId);
           this._saveDirectChat(peerId);
         } else {
           const g = gapp.get(key);
@@ -679,7 +728,7 @@ class Account {
     const entry = { status: "downloading", received: offset, total: fileInfo.fileSize };
     this.downloads.set(fileInfo.fileId, entry);
     this._scheduleSnapshot();
-    const result = await this.groups.downloadFile(fileInfo, targetPath, {
+    const result = await downloadFileOffer(fileInfo, targetPath, {
       // resume: start at the bytes already staged in the ".part" file so an
       // interrupted download continues instead of restarting from zero
       offset,
@@ -706,19 +755,46 @@ class Account {
 
   serveFile(res, fileId) {
     const safeId = U.sanitizeFileId(fileId);
-    for (const entry of this.downloads.values()) {
-      if (entry.status === "done" && path.basename(entry.path).startsWith(safeId + "_")) {
-        const displayName = path.basename(entry.path).slice(safeId.length + 1);
-        res.writeHead(200, {
-          "Content-Type": "application/octet-stream",
-          "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(displayName)}`,
-        });
-        fs.createReadStream(entry.path).pipe(res);
-        return;
+    const prefix = safeId + "_";
+    // the in-memory download map is empty after a restart, so look at what is
+    // actually on disk (the snapshot marks such files "done" too); partial
+    // ".part" files must never be served
+    let match = null;
+    try {
+      for (const name of fs.readdirSync(this.downloadsDir)) {
+        if (name.startsWith(prefix) && !name.endsWith(".part")) {
+          match = path.join(this.downloadsDir, name);
+          break;
+        }
       }
+    } catch (e) {
+      match = null;
     }
-    res.writeHead(404);
-    res.end("not downloaded yet");
+    if (!match) {
+      res.writeHead(404);
+      res.end("not downloaded yet");
+      return;
+    }
+    const displayName = path.basename(match).slice(safeId.length + 1);
+    const headers = {
+      "Content-Type": "application/octet-stream",
+      "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(displayName)}`,
+    };
+    try {
+      headers["Content-Length"] = String(fs.statSync(match).size);
+    } catch (e) {
+      /* ignore */
+    }
+    res.writeHead(200, headers);
+    const stream = fs.createReadStream(match);
+    stream.on("error", () => {
+      try {
+        res.destroy();
+      } catch (e) {
+        /* ignore */
+      }
+    });
+    stream.pipe(res);
   }
 
   handleUpload(params, req, res) {
@@ -727,27 +803,46 @@ class Account {
     const target = this._uploadPath(uploadId);
     const out = fs.createWriteStream(target);
     let size = 0;
-    req.on("data", (chunk) => {
-      size += chunk.length;
-      if (size > 512 * 1024 * 1024) {
-        req.destroy();
+    let responded = false;
+    const respond = (code, body) => {
+      if (responded) return;
+      responded = true;
+      try {
+        res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+      } catch (e) {
+        /* ignore */
+      }
+    };
+    const discardPartial = () => {
+      try {
         out.destroy();
-        try {
-          fs.unlinkSync(target);
-        } catch (e) {
-          /* ignore */
-        }
+      } catch (e) {
+        /* ignore */
+      }
+      try {
+        fs.unlinkSync(target);
+      } catch (e) {
+        /* ignore */
+      }
+    };
+    let rejected = false;
+    req.on("data", (chunk) => {
+      if (rejected) return;
+      size += chunk.length;
+      if (size > MAX_UPLOAD_BYTES) {
+        rejected = true;
+        respond(413, { error: "file too large" });
+        req.unpipe(out);
+        discardPartial();
+        // keep consuming and discarding the rest: resetting the socket here
+        // would destroy the 413 before the client can read it
+        req.resume();
       }
     });
     req.pipe(out);
-    out.on("finish", () => {
-      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ uploadId, size }));
-    });
-    out.on("error", () => {
-      res.writeHead(500);
-      res.end();
-    });
+    out.on("finish", () => respond(200, { uploadId, size }));
+    out.on("error", () => respond(500, { error: "upload failed" }));
   }
 }
 

@@ -160,6 +160,11 @@ cd windows; python -m pytest tests -q
 # Android 单测 + 构建 APK
 cd android; .\gradlew.bat testDebugUnitTest
 .\gradlew.bat assembleDebug   # 产物: app/build/outputs/apk/debug/app-debug.apk
+
+# Web（Node ≥ 18；细节见 web/README.md）
+node --test web\test\unit.test.js     # 密码学向量、包序列化、transcript、TOFU 存储
+node --test web\test\auth.test.js     # 账号注册/口令哈希/端口分配/会话
+node --test web\test\interop.test.js  # 与 windows/ 真实引擎的跨语言互通
 ```
 
 互通 E2E（需先启动模拟器并安装 APK）：
@@ -173,6 +178,12 @@ cd android; .\gradlew.bat testDebugUnitTest
 
 **改协议两端必须同步改**（§2：未发布、无旧版本兼容兜底，不再做混合版本
 验证；两端跑各自全量单测 + 互通 E2E 即可）。
+
+**改 `web/` 必须实际运行**：Node 与 WebCrypto 存在同名不同实的 API（GCM 取
+tag 是 `cipher.getAuthTag()`，`getTag()` 不存在），没跑过的复刻代码可能整条
+加密/身份路径都不可用；改完先 `node --check` 改动文件，再跑 web 单测 + 至少
+一次端到端脚本（双 Node 直聊/群/mesh、真实 `ChatServer` HTTP+WS）。
+详见 `docs/LESSONS.md` 2026-09-25。
 
 测试文件约定：Windows 测试保持纯 ASCII（中文写 `\uXXXX` 转义）；辅助脚本写成 UTF-8 文件再
 执行，不要用 PowerShell here-string 传中文（会按 GBK 进管道）。

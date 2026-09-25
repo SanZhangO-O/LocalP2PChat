@@ -28,11 +28,38 @@ function packFrame(blob) {
 }
 
 function serveDownload(conn, req, fileId, filePath, fileSize, fileKey) {
-  const finish = () => {
+  let settled = false;
+  let stream = null;
+  // end() flushes pending writes and sends the FIN; destroying right away can
+  // discard the last frames (and the EOF marker) mid-flight
+  const complete = (eof) => {
+    if (settled) return;
+    settled = true;
     try {
-      conn.end();
+      if (eof) conn.end(Buffer.alloc(4));
+      else conn.end();
     } catch (e) {
       /* ignore */
+    }
+    const timer = setTimeout(() => {
+      try {
+        conn.destroy();
+      } catch (e) {
+        /* ignore */
+      }
+    }, 10000);
+    if (timer.unref) timer.unref();
+    conn.once("close", () => clearTimeout(timer));
+  };
+  const abort = () => {
+    if (settled) return;
+    settled = true;
+    if (stream) {
+      try {
+        stream.destroy();
+      } catch (e) {
+        /* ignore */
+      }
     }
     try {
       conn.destroy();
@@ -41,25 +68,35 @@ function serveDownload(conn, req, fileId, filePath, fileSize, fileKey) {
     }
   };
   try {
-    if (req.type !== "file_download" || req.fileId !== fileId) return finish();
-    if (req.offset == null || req.offset < 0) return finish();
-    if (fileSize >= 0 && req.offset > fileSize) return finish();
-    if (!req.token) return finish();
+    if (req.type !== "file_download" || req.fileId !== fileId) return complete(false);
+    if (req.offset == null || req.offset < 0) return complete(false);
+    if (fileSize >= 0 && req.offset > fileSize) return complete(false);
+    if (!req.token) return complete(false);
     const expected = C.hmacSha256(fileKey, Buffer.from(FILE_DL_TOKEN_PREFIX + fileId, "ascii"));
     let provided;
     try {
       provided = C.fromB64(req.token);
     } catch (e) {
-      return finish();
+      return complete(false);
     }
-    if (!C.constantTimeEquals(provided, expected)) return finish();
+    if (!C.constantTimeEquals(provided, expected)) return complete(false);
     const meta = new M.NetworkPacket({
       type: "file_meta",
       fileInfo: new M.FileInfo(fileId, path.basename(filePath), fileSize, "", 0),
     });
     const metaLine = C.toB64(C.aesGcmEncrypt(fileKey, Buffer.from(meta.toJson(), "utf8")));
     conn.write(Buffer.from(metaLine + "\n", "utf8"));
-    const stream = fs.createReadStream(filePath, { start: req.offset });
+    conn.on("error", abort);
+    conn.on("close", () => {
+      if (stream) {
+        try {
+          stream.destroy();
+        } catch (e) {
+          /* ignore */
+        }
+      }
+    });
+    stream = fs.createReadStream(filePath, { start: req.offset });
     stream.on("data", (chunk) => {
       let pos = 0;
       while (pos < chunk.length) {
@@ -71,22 +108,10 @@ function serveDownload(conn, req, fileId, filePath, fileSize, fileKey) {
         }
       }
     });
-    stream.on("end", () => {
-      const eof = Buffer.alloc(4);
-      conn.write(eof);
-      finish();
-    });
-    stream.on("error", () => finish());
-    conn.on("error", () => {
-      try {
-        stream.destroy();
-      } catch (e) {
-        /* ignore */
-      }
-      finish();
-    });
+    stream.on("end", () => complete(true));
+    stream.on("error", abort);
   } catch (e) {
-    finish();
+    abort();
   }
 }
 
@@ -177,6 +202,7 @@ class SocketFrameReader {
     this.ended = false;
     this.reads = [];
     socket.on("data", (chunk) => {
+      if (this.ended) return;
       this.buffer = Buffer.concat([this.buffer, chunk]);
       this._pump();
     });
@@ -196,6 +222,12 @@ class SocketFrameReader {
   _headFrameLen() {
     if (this.buffer.length < 4) return null;
     const len = this.buffer.readUInt32BE(0);
+    if (len > MAX_CHUNK_WIRE) {
+      // a bogus length must not make us buffer up to 4 GiB before failing
+      this.error = new Error("file frame too large");
+      this.ended = true;
+      return null;
+    }
     if (this.buffer.length < 4 + len) return null;
     return len;
   }

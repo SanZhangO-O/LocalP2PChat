@@ -6,6 +6,7 @@ const state = {
   ws: null,
   snapshot: null,
   openKey: null,
+  pendingOpenKey: null,
   typingTimers: {},
   typingShown: {},
   reqCounter: 1,
@@ -18,9 +19,14 @@ function $(id) {
 }
 
 function esc(text) {
-  const div = document.createElement("div");
-  div.textContent = text == null ? "" : String(text);
-  return div.innerHTML;
+  // peer-controlled strings (names, ids, file names) end up inside HTML
+  // attributes such as value="...", so quotes must be escaped too
+  return String(text == null ? "" : text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function connect() {
@@ -30,7 +36,19 @@ function connect() {
   ws.onopen = () => {
     send({ action: "getSnapshot" });
   };
-  ws.onclose = () => {
+  ws.onclose = async () => {
+    // a dropped session (TTL / logout elsewhere) must not leave a silently
+    // frozen UI: only reload when the server answers and says we are logged out
+    try {
+      const resp = await fetch("/api/whoami");
+      const doc = await resp.json();
+      if (!doc.authenticated) {
+        location.reload();
+        return;
+      }
+    } catch (e) {
+      /* server unreachable: keep retrying below */
+    }
     setTimeout(connect, 1500);
   };
   ws.onmessage = (ev) => {
@@ -120,6 +138,11 @@ function renderAll() {
   renderRequests();
   renderContacts();
   renderGroups();
+  if (state.pendingOpenKey) {
+    const key = state.pendingOpenKey;
+    state.pendingOpenKey = null;
+    if (findChatSummary(key)) openChat(key);
+  }
   if (state.openKey) renderChat();
 }
 
@@ -177,7 +200,7 @@ function renderRequests() {
     card.className = "requestCard";
     card.innerHTML = `
       <div><b>${esc(r.name)}</b> <span class="dim">${esc(r.ip)}:${r.port}</span></div>
-      ${r.peerFingerprint ? `<div class="fp">\u5b89\u5168\u7801 ${r.peerFingerprint}</div>` : ""}
+      ${r.peerFingerprint ? `<div class="fp">\u5b89\u5168\u7801 ${esc(r.peerFingerprint)}</div>` : ""}
       ${r.fromRemoved ? `<div class="dim">\u5df2\u79fb\u9664\u7684\u6210\u5458</div>` : ""}
       <div class="actions">
         <button class="primary" data-act="accept">\u63a5\u53d7</button>
@@ -437,12 +460,13 @@ function buildFileBubble(m, summary) {
   const info = m.fileInfo;
   const bubble = document.createElement("div");
   bubble.className = "bubble";
+  const fileUrl = `/files/${encodeURIComponent(info.fileId)}`;
   if (info.kind === "image" && info.state === "done") {
     bubble.classList.add("imageBubble");
     const img = document.createElement("img");
-    img.src = `/files/${info.fileId}`;
+    img.src = fileUrl;
     img.alt = info.fileName;
-    img.onclick = () => window.open(`/files/${info.fileId}`, "_blank");
+    img.onclick = () => window.open(fileUrl, "_blank");
     bubble.appendChild(img);
   } else {
     const card = document.createElement("div");
@@ -452,7 +476,7 @@ function buildFileBubble(m, summary) {
     if (m.senderId === state.snapshot.profile.deviceId) {
       actionHtml = `<span class="dim">\u5df2\u53d1\u9001</span>`;
     } else if (info.state === "done") {
-      actionHtml = `<a href="/files/${info.fileId}" download="${esc(info.fileName)}">\u4fdd\u5b58</a>`;
+      actionHtml = `<a href="${esc(fileUrl)}" download="${esc(info.fileName)}">\u4fdd\u5b58</a>`;
     } else if (info.state && info.state.downloading) {
       const pct = info.state.total ? Math.min(100, Math.round((info.state.received / info.state.total) * 100)) : 0;
       actionHtml = `
@@ -569,7 +593,8 @@ function setupComposer() {
   const sendNow = () => {
     const content = input.value.replace(/\s+$/, "");
     if (!content || !state.openKey) return;
-    if (content.length > MAX_CONTENT_LENGTH) {
+    // the server caps at 5000 code points (python len()), not UTF-16 units
+    if (Array.from(content).length > MAX_CONTENT_LENGTH) {
       toast("\u6d88\u606f\u8fc7\u957f\uff08\u4e0a\u9650 5000 \u5b57\uff09", true);
       return;
     }
@@ -603,8 +628,9 @@ function setupComposer() {
   };
   $("fileInput").onchange = async () => {
     const file = $("fileInput").files[0];
+    const chatKey = state.openKey;
     $("fileInput").value = "";
-    if (!file || !state.openKey) return;
+    if (!file || !chatKey) return;
     if (file.size > 512 * 1024 * 1024) {
       toast("\u6587\u4ef6\u8fc7\u5927\uff08\u8d85\u8fc7 512 MB\uff09", true);
       return;
@@ -616,7 +642,13 @@ function setupComposer() {
         body: file,
       });
       const doc = await resp.json();
-      send({ action: "sendFile", chatKey: state.openKey, uploadId: doc.uploadId });
+      if (!resp.ok || !doc.uploadId) {
+        toast("\u4e0a\u4f20\u5931\u8d25", true);
+        return;
+      }
+      // send to the chat that was open when the file was picked, not the
+      // (possibly) switched-to chat when the upload finishes
+      send({ action: "sendFile", chatKey, uploadId: doc.uploadId });
     } catch (e) {
       toast("\u4e0a\u4f20\u5931\u8d25", true);
     }
@@ -680,7 +712,9 @@ function createGroupDialog() {
       toast(
         `\u7fa4\u7ec4\u5df2\u521b\u5efa\uff0c\u5165\u7fa4\u53f7\u7801 ${result.joinId.slice(0, 4)} ${result.joinId.slice(4)}\uff08\u52a0\u5165\u65f6\u9700\u586b\u5199\uff09`
       );
-      if (state.snapshot) openChat(result.groupId);
+      // the group only exists in the next snapshot; open it as soon as it lands
+      state.pendingOpenKey = result.groupId;
+      send({ action: "getSnapshot" });
     }
   };
 }
@@ -731,6 +765,10 @@ function joinGroupDialog() {
     if (result && result.ok) {
       closeModal();
       toast("\u5df2\u52a0\u5165\u7fa4\u7ec4");
+      if (result.groupId) {
+        state.pendingOpenKey = result.groupId;
+        send({ action: "getSnapshot" });
+      }
     } else {
       err.textContent = (result && result.message) || "\u52a0\u5165\u5931\u8d25";
     }
