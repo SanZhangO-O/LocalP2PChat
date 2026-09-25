@@ -7,7 +7,7 @@
 ```
 ├── android/   # Android 版（Kotlin + Compose）
 ├── windows/   # Windows 版（PyQt6，已实现）
-└── web/       # Web 版（Node.js 引擎 + 浏览器界面，见 web/README.md）
+└── web/       # Web 版（Node.js 服务器聊天 + 浏览器界面，见 web/README.md）
 ```
 
 ## Android 版
@@ -28,7 +28,8 @@
 
 ## Web 版
 
-- Node.js **多用户聊天服务** + 浏览器界面，位于 `web/`（仅依赖 Node 标准库，无需安装依赖）。一台服务器承载多个账号，每个账号是一个独立的 LocalChat 设备（独立身份/联系人/群组/协议端口），用户从各自浏览器登录使用，与 Windows / Android 端在局域网内互通。运行与功能范围见 `web/README.md`。
+- Node.js **多用户服务器聊天** + 浏览器界面，位于 `web/`（仅依赖 Node 标准库，无需安装依赖）。一台服务器承载多个账号，消息经服务器中转与存储。**Web 版只提供网络服务器聊天，不实现局域网 P2P 协议，不与 Windows / Android 端互通**。
+- 使用方式：服务器机器上双击 `web\start-server.bat` 启动（需 Node.js ≥ 18），会自动打开聊天页面并列出局域网访问地址；其他用户**只需在浏览器打开该地址**，无需安装任何东西。详见 `web/README.md`。
 
 ## 本地功能（消息搜索 / 表情面板 / 通知快捷回复）
 

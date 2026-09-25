@@ -19,6 +19,7 @@
     <input type="password" id="authPass2" class="hidden" autocomplete="new-password">
     <div class="formError" id="authError"></div>
     <button id="authSubmit" class="primary hidden"></button>
+    <button id="authToggle" class="ghost authToggle hidden"></button>
   </div>
 </div>
 
@@ -28,18 +29,14 @@
       <div class="avatar" id="profileAvatar">W</div>
       <div class="profileMeta">
         <div class="profileName" id="profileName">…</div>
-        <div class="profileFp" id="profileFp"></div>
+        <div class="profileSub" id="profileSub"></div>
       </div>
     </div>
     <div class="sideActions">
-      <button id="btnAddContact" class="ghost">＋成员</button>
       <button id="btnCreateGroup" class="ghost">＋建群</button>
-      <button id="btnJoinGroup" class="ghost">＋入群</button>
     </div>
-    <div class="sectionTitle">请求 <span id="requestBadge" class="badge hidden">0</span></div>
-    <div id="requestList"></div>
-    <div class="sectionTitle">成员</div>
-    <div id="contactList"></div>
+    <div class="sectionTitle">用户</div>
+    <div id="userList"></div>
     <div class="sectionTitle">群组</div>
     <div id="groupList"></div>
   </aside>
@@ -47,8 +44,8 @@
     <div id="emptyHint">
       <div>
         <h2>LocalChat Web</h2>
-        <p>局域网 P2P 聊天 · 与 Windows / Android 端互通</p>
-        <p class="dim">左侧添加成员或加入群组开始聊天</p>
+        <p>多用户服务器聊天</p>
+        <p class="dim">左侧点击用户或群组开始聊天</p>
       </div>
     </div>
     <div id="chatView" class="hidden">

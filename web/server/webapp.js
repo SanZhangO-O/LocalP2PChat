@@ -192,6 +192,7 @@ class WebApp {
     this.host = options.host || "127.0.0.1";
     this.onAuth = options.onAuth || (() => null);
     this.onWsMessage = options.onWsMessage || (() => {});
+    this.onWsOpen = options.onWsOpen || (() => {});
     this.onWsClose = options.onWsClose || (() => {});
     this.apiGet = options.apiGet || (async () => null);
     this.apiPost = options.apiPost || (async () => null);
@@ -232,7 +233,7 @@ class WebApp {
           socket.destroy();
           return;
         }
-        const accountId = this.onAuth(req);
+        const accountId = this.onAuth(req, new URL(req.url, "http://localhost"));
         if (!accountId) {
           socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
           socket.destroy();
@@ -253,6 +254,7 @@ class WebApp {
           this.onWsClose(conn);
         };
         this.connections.add(conn);
+        this.onWsOpen(conn);
       });
       this.server.on("error", reject);
       this.server.listen(this.port, this.host, () => {
@@ -318,7 +320,7 @@ class WebApp {
       return;
     }
     if (pathname.startsWith("/api/") || pathname.startsWith("/files/")) {
-      const accountId = this.onAuth(req);
+      const accountId = this.onAuth(req, url);
       const publicPaths = ["/api/login", "/api/register", "/api/whoami"];
       if (!accountId && !publicPaths.includes(pathname)) {
         res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });

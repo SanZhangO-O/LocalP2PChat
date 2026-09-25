@@ -1,19 +1,21 @@
 # 修改代码注意点
 
-本仓库是同一套局域网协议的独立实现（Windows = PyQt6 + Python，Android = Kotlin + Compose，
-另有 Web 版 = Node.js 多用户聊天服务（每账号一个独立协议身份/端口）+ 浏览器 UI，位于 `web/`，范围见 `web/README.md`），
-各端必须能在同一局域网内互通，且要兼容旧版本对端。改动前先读本文，避免重复踩过的坑。
-**协议改动必须同步所有已实现该协议面的端**（含 Web 版，否则 Web 端会在线层被拒）。
+本仓库是同一套局域网协议的独立实现（Windows = PyQt6 + Python，Android = Kotlin + Compose），
+各端必须能在同一局域网内互通，且要兼容旧版本对端。另有 `web/` = Node.js 多用户**服务器**聊天
+（HTTP+WS 中转与存储 + 浏览器 UI，范围见 `web/README.md`）：Web 版只提供网络服务器聊天，
+**不实现局域网协议、不与 Windows / Android 端互通**，不在协议同步范围内。
+改动前先读本文，避免重复踩过的坑。
+**协议改动必须同步所有已实现该协议面的端**（Windows / Android）。
 
 ## 1. 两套实现，一份协议
 
-| 协议面 | Windows | Android | Web (Node) |
-| --- | --- | --- | --- |
-| 加密线层 / 握手 | `windows/localchat/securewire.py` | `android/app/src/main/java/com/zqr/localchat/network/SecureWire.kt` | `web/server/wire.js` + `web/server/crypto.js` |
-| 数据包模型 | `windows/localchat/models.py` (`NetworkPacket`) | `.../network/NetworkPacket.kt` | `web/server/models.js` |
-| 直聊 / 群组 / 网状 | `windows/localchat/network.py` | `.../network/{P2PManager,DirectChat,GroupMesh}.kt` | `web/server/{direct,group}.js` |
-| 通话 / 文件 | `windows/localchat/call.py`、文件收发在 `network.py` | `.../call/CallManager.kt`、`.../network/FileTransfer.kt` | 文件收发在 `web/server/files.js`（通话未实现） |
-| 群消息设备签名 | `windows/localchat/groupauth.py` | `.../groupauth/GroupAuth.kt` | `web/server/identity.js`（transcript/TOFU 同构） |
+| 协议面 | Windows | Android |
+| --- | --- | --- |
+| 加密线层 / 握手 | `windows/localchat/securewire.py` | `android/app/src/main/java/com/zqr/localchat/network/SecureWire.kt` |
+| 数据包模型 | `windows/localchat/models.py` (`NetworkPacket`) | `.../network/NetworkPacket.kt` |
+| 直聊 / 群组 / 网状 | `windows/localchat/network.py` | `.../network/{P2PManager,DirectChat,GroupMesh}.kt` |
+| 通话 / 文件 | `windows/localchat/call.py`、文件收发在 `network.py` | `.../call/CallManager.kt`、`.../network/FileTransfer.kt` |
+| 群消息设备签名 | `windows/localchat/groupauth.py` | `.../groupauth/GroupAuth.kt` |
 
 - 任何协议改动（新增/修改字段、包类型、握手步骤、加密参数）必须**两端同步修改**，
   并用混合版本 E2E 验证（见第 7 节）。
@@ -161,10 +163,12 @@ cd windows; python -m pytest tests -q
 cd android; .\gradlew.bat testDebugUnitTest
 .\gradlew.bat assembleDebug   # 产物: app/build/outputs/apk/debug/app-debug.apk
 
-# Web（Node ≥ 18；细节见 web/README.md）
-node --test web\test\unit.test.js     # 密码学向量、包序列化、transcript、TOFU 存储
-node --test web\test\auth.test.js     # 账号注册/口令哈希/端口分配/会话
-node --test web\test\interop.test.js  # 与 windows/ 真实引擎的跨语言互通
+# Web（Node ≥ 18；服务器聊天，细节见 web/README.md；不在局域网协议互通范围）
+node --test web\test\unit.test.js     # AES-GCM 向量、静态加密存储、净化函数
+node --test web\test\auth.test.js     # 账号注册/口令哈希/会话
+node --test web\test\server.test.js   # 真实 ChatServer HTTP+WS 端到端
+# 运行：双击 web\start-server.bat（等价 node web\server\main.js --http-host 0.0.0.0 --open）；
+# 普通用户只开浏览器访问，不装任何东西、不敲命令。
 ```
 
 互通 E2E（需先启动模拟器并安装 APK）：
@@ -181,8 +185,8 @@ node --test web\test\interop.test.js  # 与 windows/ 真实引擎的跨语言互
 
 **改 `web/` 必须实际运行**：Node 与 WebCrypto 存在同名不同实的 API（GCM 取
 tag 是 `cipher.getAuthTag()`，`getTag()` 不存在），没跑过的复刻代码可能整条
-加密/身份路径都不可用；改完先 `node --check` 改动文件，再跑 web 单测 + 至少
-一次端到端脚本（双 Node 直聊/群/mesh、真实 `ChatServer` HTTP+WS）。
+加密路径都不可用；改完先 `node --check` 改动文件，再跑 web 单测 +
+`web\test\server.test.js`（真实 `ChatServer` HTTP+WS 端到端）。
 详见 `docs/LESSONS.md` 2026-09-25。
 
 测试文件约定：Windows 测试保持纯 ASCII（中文写 `\uXXXX` 转义）；辅助脚本写成 UTF-8 文件再

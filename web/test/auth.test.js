@@ -17,13 +17,14 @@ test("scrypt password hash/verify roundtrip and rejection", () => {
   assert.strictEqual(verifyPassword("\u5bc6\u7801abc123", "00", hash), false);
 });
 
-test("registry: create, unique usernames, port allocation", () => {
+test("registry: create, unique usernames, no protocol ports", () => {
   const dir = makeTmpDir("lc-registry-");
-  const registry = new AccountRegistry(dir, 9999);
+  const registry = new AccountRegistry(dir);
   assert.strictEqual(registry.firstRun, true);
   const first = registry.create("alice", "password1");
   assert.strictEqual(first.ok, true);
-  assert.strictEqual(first.record.tcpPort, 9999);
+  assert.strictEqual(first.record.nickname, "alice");
+  assert.strictEqual(first.record.tcpPort, undefined, "server chat has no per-account protocol port");
   assert.strictEqual(registry.firstRun, false);
   const dup = registry.create("Alice", "password2");
   assert.strictEqual(dup.ok, false, "case-insensitive duplicate must be rejected");
@@ -33,37 +34,39 @@ test("registry: create, unique usernames, port allocation", () => {
   assert.strictEqual(badPass.ok, false);
   const second = registry.create("bob", "password2");
   assert.strictEqual(second.ok, true);
-  assert.strictEqual(second.record.tcpPort, 10000, "ports must be allocated per account");
   assert.strictEqual(registry.verify("alice", "password1").id, first.record.id);
   assert.strictEqual(registry.verify("alice", "nope"), null);
   assert.strictEqual(registry.verify("carol", "password1"), null);
 });
 
-test("registry persists accounts and sessions across instances", () => {
+test("registry persists accounts and nickname edits, sessions stay in memory", () => {
   const dir = makeTmpDir("lc-registry2-");
-  const a = new AccountRegistry(dir, 9999);
+  const a = new AccountRegistry(dir);
   const rec = a.create("carol", "password9").record;
   const token = a.createSession(rec.id);
   assert.strictEqual(a.sessionAccount(token).id, rec.id);
   a.dropSession(token);
   assert.strictEqual(a.sessionAccount(token), null);
 
-  const b = new AccountRegistry(dir, 9999);
+  const b = new AccountRegistry(dir);
   assert.strictEqual(b.accounts.size, 1);
   assert.strictEqual(b.verify("carol", "password9").id, rec.id);
   assert.strictEqual(b.sessionAccount(token), null, "sessions must not survive a restart");
+  b.get(rec.id).nickname = "\u5361\u7f57\u5c14";
+  b.save();
+  const c = new AccountRegistry(dir);
+  assert.strictEqual(c.get(rec.id).nickname, "\u5361\u7f57\u5c14");
 });
 
 test("registry file layout stays inside the data dir", () => {
   const dir = makeTmpDir("lc-registry3-");
-  new AccountRegistry(dir, 9999).create("dave", "password8");
+  new AccountRegistry(dir).create("dave", "password8");
   assert.ok(fs.existsSync(path.join(dir, "accounts.json")));
 });
 
 test("parseArgs reads server flags", () => {
-  const args = parseArgs(["node", "main.js", "--port-base", "20000", "--http", "9000", "--http-host", "0.0.0.0"]);
-  assert.strictEqual(args.portBase, 20000);
+  const args = parseArgs(["node", "main.js", "--http", "9000", "--http-host", "0.0.0.0"]);
   assert.strictEqual(args.httpPort, 9000);
   assert.strictEqual(args.httpHost, "0.0.0.0");
-  assert.strictEqual(args.portBase !== undefined, true);
+  assert.strictEqual(args.portBase, undefined, "protocol port base no longer exists");
 });

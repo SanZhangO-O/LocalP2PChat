@@ -69,7 +69,7 @@ html, body {
 }
 
 .profileName { font-weight: 600; }
-.profileFp { font-size: 11px; color: var(--dim); font-family: monospace; }
+.profileSub { font-size: 11px; color: var(--dim); }
 
 .sideActions {
   display: flex;
@@ -136,15 +136,15 @@ button.ghost { background: transparent; }
 }
 .dot.on { background: var(--ok); }
 
-.requestCard {
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 8px;
-  margin-bottom: 6px;
+.checkRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 2px;
   font-size: 13px;
+  cursor: pointer;
 }
-.requestCard .fp { font-size: 11px; font-family: monospace; color: var(--dim); margin: 3px 0; }
-.requestCard .actions { display: flex; gap: 6px; margin-top: 6px; }
+.checkRow input { width: auto; }
 
 /* ---------------- chat pane ---------------- */
 
@@ -243,8 +243,6 @@ button.ghost { background: transparent; }
 }
 .bubble .editedTag { font-size: 11px; color: var(--dim); margin-left: 6px; }
 
-.bubble.mentioned { border: 1.5px solid #e2b93b; }
-
 .fileCard {
   display: flex;
   gap: 10px;
@@ -255,14 +253,6 @@ button.ghost { background: transparent; }
 .fileMeta { flex: 1; min-width: 0; }
 .fileName { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fileSize { font-size: 12px; color: var(--dim); }
-.progressOuter {
-  height: 5px;
-  background: #e6ebf4;
-  border-radius: 3px;
-  margin-top: 5px;
-  overflow: hidden;
-}
-.progressBar { height: 100%; background: var(--accent); width: 0; }
 
 .imageBubble img {
   max-width: 300px;
@@ -378,13 +368,6 @@ button.ghost { background: transparent; }
 }
 .memberRow .flex { flex: 1; min-width: 0; }
 .memberRow .fp { font-size: 11px; font-family: monospace; color: var(--dim); }
-.vtag {
-  font-size: 11px;
-  color: var(--ok);
-  border: 1px solid var(--ok);
-  border-radius: 8px;
-  padding: 0 6px;
-}
 
 #toasts {
   position: fixed;
@@ -437,6 +420,7 @@ button.ghost { background: transparent; }
 }
 .authCard input:focus { border-color: var(--accent); }
 .authCard button { width: 100%; margin-top: 18px; padding: 10px; }
+.authCard .authToggle { margin-top: 8px; font-size: 12px; color: var(--dim); }
 
 .accountActions { display: flex; gap: 8px; margin-top: 14px; }
 .accountActions button { flex: 1; }
