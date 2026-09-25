@@ -1,16 +1,19 @@
 # 修改代码注意点
 
-本仓库是同一套局域网协议的两个独立实现（Windows = PyQt6 + Python，Android = Kotlin + Compose），
-两端必须能在同一局域网内互通，且要兼容旧版本对端。改动前先读本文，避免重复踩过的坑。
+本仓库是同一套局域网协议的独立实现（Windows = PyQt6 + Python，Android = Kotlin + Compose，
+另有 Web 版 = Node.js 多用户聊天服务（每账号一个独立协议身份/端口）+ 浏览器 UI，位于 `web/`，范围见 `web/README.md`），
+各端必须能在同一局域网内互通，且要兼容旧版本对端。改动前先读本文，避免重复踩过的坑。
+**协议改动必须同步所有已实现该协议面的端**（含 Web 版，否则 Web 端会在线层被拒）。
 
 ## 1. 两套实现，一份协议
 
-| 协议面 | Windows | Android |
-| --- | --- | --- |
-| 加密线层 / 握手 | `windows/localchat/securewire.py` | `android/app/src/main/java/com/zqr/localchat/network/SecureWire.kt` |
-| 数据包模型 | `windows/localchat/models.py` (`NetworkPacket`) | `.../network/NetworkPacket.kt` |
-| 直聊 / 群组 / 网状 | `windows/localchat/network.py` | `.../network/{P2PManager,DirectChat,GroupMesh}.kt` |
-| 通话 / 文件 | `windows/localchat/call.py`、文件收发在 `network.py` | `.../call/CallManager.kt`、`.../network/FileTransfer.kt` |
+| 协议面 | Windows | Android | Web (Node) |
+| --- | --- | --- | --- |
+| 加密线层 / 握手 | `windows/localchat/securewire.py` | `android/app/src/main/java/com/zqr/localchat/network/SecureWire.kt` | `web/server/wire.js` + `web/server/crypto.js` |
+| 数据包模型 | `windows/localchat/models.py` (`NetworkPacket`) | `.../network/NetworkPacket.kt` | `web/server/models.js` |
+| 直聊 / 群组 / 网状 | `windows/localchat/network.py` | `.../network/{P2PManager,DirectChat,GroupMesh}.kt` | `web/server/{direct,group}.js` |
+| 通话 / 文件 | `windows/localchat/call.py`、文件收发在 `network.py` | `.../call/CallManager.kt`、`.../network/FileTransfer.kt` | 文件收发在 `web/server/files.js`（通话未实现） |
+| 群消息设备签名 | `windows/localchat/groupauth.py` | `.../groupauth/GroupAuth.kt` | `web/server/identity.js`（transcript/TOFU 同构） |
 
 - 任何协议改动（新增/修改字段、包类型、握手步骤、加密参数）必须**两端同步修改**，
   并用混合版本 E2E 验证（见第 7 节）。

@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LocalChat Web</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="authView" class="hidden">
+  <div class="authCard">
+    <h2 id="authTitle">LocalChat Web</h2>
+    <p class="dim" id="authHint"></p>
+    <label id="userLabel" class="hidden">用户名</label>
+    <input type="text" id="authUser" class="hidden" autocomplete="username">
+    <label id="passLabel" class="hidden">密码</label>
+    <input type="password" id="authPass" class="hidden" autocomplete="current-password">
+    <label id="pass2Label" class="hidden">确认密码</label>
+    <input type="password" id="authPass2" class="hidden" autocomplete="new-password">
+    <div class="formError" id="authError"></div>
+    <button id="authSubmit" class="primary hidden"></button>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <aside id="sidebar">
+    <div id="profile" title="点击打开账号与设置">
+      <div class="avatar" id="profileAvatar">W</div>
+      <div class="profileMeta">
+        <div class="profileName" id="profileName">…</div>
+        <div class="profileFp" id="profileFp"></div>
+      </div>
+    </div>
+    <div class="sideActions">
+      <button id="btnAddContact" class="ghost">＋成员</button>
+      <button id="btnCreateGroup" class="ghost">＋建群</button>
+      <button id="btnJoinGroup" class="ghost">＋入群</button>
+    </div>
+    <div class="sectionTitle">请求 <span id="requestBadge" class="badge hidden">0</span></div>
+    <div id="requestList"></div>
+    <div class="sectionTitle">成员</div>
+    <div id="contactList"></div>
+    <div class="sectionTitle">群组</div>
+    <div id="groupList"></div>
+  </aside>
+  <main id="chatPane">
+    <div id="emptyHint">
+      <div>
+        <h2>LocalChat Web</h2>
+        <p>局域网 P2P 聊天 · 与 Windows / Android 端互通</p>
+        <p class="dim">左侧添加成员或加入群组开始聊天</p>
+      </div>
+    </div>
+    <div id="chatView" class="hidden">
+      <header id="chatHeader">
+        <div>
+          <div id="chatTitle"></div>
+          <div id="chatSub" class="dim"></div>
+        </div>
+        <div id="chatActions">
+          <button id="btnGroupSettings" class="ghost hidden">群设置</button>
+        </div>
+      </header>
+      <div id="pinBanner" class="hidden"></div>
+      <div id="messages"></div>
+      <div id="typingBar" class="hidden"></div>
+      <div id="composer">
+        <button id="btnAttach" title="发送文件">📎</button>
+        <textarea id="input" rows="1" placeholder="输入消息…"></textarea>
+        <button id="btnSend" class="primary">发送</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="toasts"></div>
+
+<div class="modal hidden" id="modal">
+  <div class="modalCard" id="modalCard"></div>
+</div>
+
+<input type="file" id="fileInput" class="hidden">
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -25,3 +25,5 @@ android/app/release/
 .idea/
 .vscode/
 *.iml
+# Web server runtime data
+web/data/
