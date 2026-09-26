@@ -23,8 +23,9 @@ def aes_gcm_decrypt(key, blob):
     if not isinstance(blob, (bytes, bytearray)) or len(blob) <= GCM_NONCE_LEN + GCM_TAG_LEN:
         raise ValueError("ciphertext too short")
     nonce = bytes(blob[:GCM_NONCE_LEN])
-    ciphertext = bytes(blob[GCM_NONCE_LEN:-GCM_TAG_LEN])
-    return AESGCM(key).decrypt(nonce, ciphertext, None)
+    # cryptography's AESGCM expects ciphertext WITH the 16-byte tag appended
+    # (encrypt returns ct||tag), so the tag must NOT be stripped here.
+    return AESGCM(key).decrypt(nonce, bytes(blob[GCM_NONCE_LEN:]), None)
 
 
 def to_b64(data):

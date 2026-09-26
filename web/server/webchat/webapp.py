@@ -5,13 +5,17 @@ import os
 import socket
 import struct
 import threading
+import time
 from http import client as http_client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_WS_MESSAGE = 4 * 1024 * 1024
-MAX_WS_FRAME = 64 * 1024 * 1024
+# No inbound frame may exceed the message cap: a single unfragmented frame is
+# otherwise read (and handed to json.loads) up to this limit unchecked.
+MAX_WS_FRAME = MAX_WS_MESSAGE
+WS_PING_INTERVAL = 25.0
 
 PUBLIC_API_PATHS = ["/api/login", "/api/register", "/api/whoami"]
 
@@ -146,6 +150,9 @@ class WebSocketConn:
         if opcode == 0xA:
             return True
         if opcode in (0x1, 0x2):
+            if length > MAX_WS_MESSAGE:
+                self._protocol_close()
+                return False
             if fin:
                 self._deliver(payload)
             else:
@@ -174,6 +181,10 @@ class WebSocketConn:
             self.on_message(payload.decode("utf-8", "replace"))
         except Exception:
             pass
+
+    def ping(self):
+        if not self._closed:
+            self._send_frame(0x9, b"")
 
     def close(self):
         if self._closed:
@@ -274,7 +285,23 @@ class WebApp:
         self.port = self.httpd.socket.getsockname()[1]
         thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         thread.start()
+        threading.Thread(target=self._ping_loop, daemon=True, name="ws-ping").start()
         return self.port
+
+    def _ping_loop(self):
+        # Protocol-level pings keep the handler's socket timeout fed for
+        # healthy idle connections (browsers answer automatically): without
+        # them every quiet tab is killed after 5 minutes and its presence
+        # flickers while it reconnects.
+        while True:
+            time.sleep(WS_PING_INTERVAL)
+            with self._conns_lock:
+                conns = list(self.connections)
+            for conn in conns:
+                try:
+                    conn.ping()
+                except Exception:
+                    pass
 
     def stop(self):
         with self._conns_lock:

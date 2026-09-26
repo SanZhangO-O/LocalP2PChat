@@ -103,8 +103,11 @@ class AccountRegistry:
         return {"ok": True, "record": record}
 
     def find_by_username(self, username):
+        # duplicate registration is case-insensitive, so login must match
+        # names the same way ("Alice" logs into the "alice" account)
+        want = str(username or "").lower()
         for rec in self.accounts.values():
-            if rec["username"] == str(username or ""):
+            if rec["username"].lower() == want:
                 return rec
         return None
 
@@ -119,24 +122,27 @@ class AccountRegistry:
 
     def create_session(self, account_id):
         token = secrets.token_bytes(32).hex()
-        self.sessions[token] = {"accountId": account_id, "expires": U.now_ms() + SESSION_TTL_MS}
-        self._sweep_sessions()
+        with self._lock:
+            self.sessions[token] = {"accountId": account_id, "expires": U.now_ms() + SESSION_TTL_MS}
+            self._sweep_sessions()
         return token
 
     def session_account(self, token):
         if not token:
             return None
-        session = self.sessions.get(token)
-        if session is None:
-            return None
-        if U.now_ms() > session["expires"]:
-            del self.sessions[token]
-            return None
-        return self.accounts.get(session["accountId"])
+        with self._lock:
+            session = self.sessions.get(token)
+            if session is None:
+                return None
+            if U.now_ms() > session["expires"]:
+                del self.sessions[token]
+                return None
+            return self.accounts.get(session["accountId"])
 
     def drop_session(self, token):
         if token:
-            self.sessions.pop(token, None)
+            with self._lock:
+                self.sessions.pop(token, None)
 
     def _sweep_sessions(self):
         now = U.now_ms()

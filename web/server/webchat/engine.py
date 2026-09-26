@@ -9,6 +9,32 @@ from .store import Store
 UPLOAD_TTL_MS = 24 * 3600 * 1000
 SNAPSHOT_MESSAGE_WINDOW = 300
 
+# Known media extensions are served inline with a real Content-Type so
+# browsers preview images/audio/video (README promises inline image preview);
+# everything else downloads as attachment/octet-stream.
+MEDIA_CONTENT_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".heic": "image/heic",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".m4v": "video/x-m4v",
+    ".3gp": "video/3gpp",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+}
+
 
 class ChatError(Exception):
     pass
@@ -69,6 +95,8 @@ class Message:
             out["reactions"] = self.reactions
         if self.pinned:
             out["pinned"] = True
+            if self.pinned_by:
+                out["pinnedBy"] = self.pinned_by
         if self.readers and len(self.readers):
             out["readers"] = self.readers
         if self.read:
@@ -584,9 +612,18 @@ class ChatEngine:
             res.raw(404, [("Content-Type", "text/plain; charset=utf-8")], b"not found")
             return
         display_name = os.path.basename(match)[len(safe_id) + 1:]
+        ext = os.path.splitext(display_name)[1].lower()
+        content_type = MEDIA_CONTENT_TYPES.get(ext)
         headers = [
-            ("Content-Type", "application/octet-stream"),
-            ("Content-Disposition", "attachment; filename*=UTF-8''%s" % quote(display_name)),
+            (
+                "Content-Type",
+                content_type or "application/octet-stream",
+            ),
+            (
+                "Content-Disposition",
+                "%s; filename*=UTF-8''%s"
+                % ("inline" if content_type else "attachment", quote(display_name)),
+            ),
         ]
         try:
             headers.append(("Content-Length", str(os.path.getsize(match))))

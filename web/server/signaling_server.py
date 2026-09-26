@@ -383,11 +383,14 @@ class SignalingServer:
         # caller holds self._lock
         hosts = [c for c in self._hosts.get(group_id, []) if c.alive]
         waiting = [c for c in self._waiting.get(group_id, []) if c.alive]
-        self._hosts[group_id] = hosts
-        self._waiting[group_id] = waiting
         while waiting and hosts:
             member = waiting.pop(0)
-            host = hosts[-1]  # most recently armed host for this group
+            # One pairing per armed host registration: on `matched` the host
+            # closes its control link to punch from that local port, then the
+            # bridge reconnects and re-registers for the next member. Keeping
+            # the host listed here would hand a second member a `matched`
+            # against a link that is already closing.
+            host = hosts.pop()
             session = Session(group_id, host, member)
             self._sessions[session.token] = session
             self._send_matched(session, "host", member)
@@ -397,6 +400,14 @@ class SignalingServer:
                 "matched group=%s host=%s member=%s session=%s",
                 group_id, host.ip, member.ip, session.token,
             )
+        if hosts:
+            self._hosts[group_id] = hosts
+        else:
+            self._hosts.pop(group_id, None)
+        if waiting:
+            self._waiting[group_id] = waiting
+        else:
+            self._waiting.pop(group_id, None)
 
     def _peer_desc(self, conn: ClientConn, group_id: str) -> dict:
         meta = conn.group_meta.get(group_id, {"id": conn.client_id, "nick": conn.nick})
@@ -608,11 +619,15 @@ class SignalingServer:
                     lst = self._hosts.get(group_id, [])
                     if conn in lst:
                         lst.remove(conn)
+                    if not lst:
+                        self._hosts.pop(group_id, None)
             elif conn.role == "member":
                 for group_id in conn.groups:
                     lst = self._waiting.get(group_id, [])
                     if conn in lst:
                         lst.remove(conn)
+                    if not lst:
+                        self._waiting.pop(group_id, None)
             for session in list(self._sessions.values()):
                 for role, entry in session.roles.items():
                     if entry["conn"] is conn:

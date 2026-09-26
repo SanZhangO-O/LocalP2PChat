@@ -81,6 +81,10 @@ class WsClient:
         self.docs = []
         self.closed = False
         self._cond = threading.Condition()
+        # Frames may have arrived together with the 101 handshake (single TCP
+        # segment): parse the pre-buffered bytes now, because _read_loop only
+        # parses on newly recv'd data.
+        self._feed(b"")
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
 

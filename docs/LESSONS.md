@@ -651,3 +651,52 @@
     逐个重算 `parents[N]` 层数并核对目标（本次 `web/server/webchat/server.py`
     的 parents[2] 从仓库根变成 `web/`），conftest 的 `sys.path` 注入路径同理。
 
+## 2026-09-26 Web/信令服务器审查：信令 host 不弹出导致第二个成员配到正在关闭的连接
+
+- 现象: 审查 `web/server/signaling_server.py` 时发现：同一群组先后来两个成员时，
+  第二个成员会立刻收到 `matched`，但其对 host 映射地址的 punch 永远打不通
+  （host 侧正忙于上一个会话、控制连接已按设计关闭），最终超时/中继兜底失败。
+- 根因: `_try_match` 用 `hosts[-1]` 取 host 但**不弹出**——循环内同一 host conn
+  可以连续配对多个成员。而客户端约定（`windows/localchat/punch.py` 的
+  `SignalingHostBridge`）是 host 收到第一个 `matched` 就关闭控制连接、复用其
+  本地端口去 punch，然后重连再注册服务下一个成员；一份 host 注册只应服务
+  一次配对。服务器多发的第二个 `matched` 落在正在关闭/已关闭的连接上。
+- 修复: `web/server/signaling_server.py` `_try_match` 改为 `hosts.pop()`（每份
+  host 注册只配对一次），并在匹配/清理后丢弃空列表，`_cleanup` 同步清空
+  `_hosts`/`_waiting` 的空组条目。
+- 验证: 静态审查 + 修改后走读 host/member 两条客户端流程（punch.py 与
+  signaling_server.py 的状态机逐条对照）。pytest 套件按项目约定未自动运行。
+- 防再犯: 信令服务器的匹配语义必须以客户端桥的生命周期为准——**host 注册
+  一次 = 一次配对**，改匹配逻辑时对照 `punch.py` 注释（「on `matched` the
+  session thread closes it … reconnects and re-registers」）逐条核对。
+
+## 2026-09-26 Web 套件首次实跑：GCM 解密剥掉 tag 导致历史全部读不出 + WS 测试客户端不解析「随握手到达」的帧
+
+- 现象: `python -m pytest web\tests -q` 首次实跑 5 失败：AES-GCM roundtrip、
+  Node 固定向量、SecretBox/Store 落盘回读全部 `InvalidTag`/空串；
+  `test_server.py` 的 WS 登录偶发「timeout waiting for ws message; docs: []」
+  （且在测试间游走，隔离跑能过、全量跑挂）。
+- 根因:
+  1) `webchat/crypto.py` 的 `aes_gcm_decrypt` 把 blob 切成
+     `blob[12:-16]` 再交给 `AESGCM.decrypt`——但 `cryptography` 的 API 约定是
+     **decrypt 收到密文时 tag 必须拼在末尾**（`encrypt` 返回 `ct||tag`），
+     自己剥 tag 等于把 tag 丢掉，必然 `InvalidTag`。落盘路径 `unprotect`
+     吞掉异常返回 ""，表现为「重启后聊天历史全空」。上一节记录的
+     「pytest 按约定未自动运行」正是它没被拦住的原因。
+  2) `web/tests/helpers.py` 的 `WsClient` 只在 `_read_loop` 的 `recv` 里
+     解析帧；当 101 握手响应与首个服务器帧挤进**同一个 TCP 段**时，帧字节
+     存进 `initial` buffer 后永远没人解析（下一个 recv 无数据），
+     `docs` 恒空——纯测试辅助端的分段竞态，服务器确实发出去了
+     （用 sendlog + `len(ws.buffer)` 实测：504 字节躺在 buffer 里）。
+- 修复: `crypto.py` decrypt 直接传 `blob[12:]`（含 tag）；`helpers.py`
+  `WsClient.__init__` 在启动读线程前先 `self._feed(b"")` 解析预缓冲帧。
+- 验证: 自制 25 连接复现脚本（故障率 3/25 → 0/25）；全量
+  `python -m pytest web\tests -q` 连跑 4 次全绿（15 passed，约 5.3s，
+  不再有 5s 超时拖尾）。
+- 防再犯:
+  - 加解密对称性必须靠「roundtrip + 外部固定向量」双向断言，且**改完运行时
+    的第一件事就是实跑套件**（本项目约定「不自动跑测试」意味着人工节点必须跑，
+    不是可以不跑）。
+  - WS/HTTP 测试客户端若存在「initial buffer」路径，构造时就地解析一次，
+    否则同段到达的帧会被静默吞掉（表现为随机超时，隔离跑能过）。
+
