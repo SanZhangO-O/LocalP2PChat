@@ -13,7 +13,7 @@ from .webapp import WebApp
 MAX_JSON_BODY = 64 * 1024
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_WEB_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _port_arg(value, fallback, flag):
@@ -34,8 +34,8 @@ def parse_args(argv):
     args = {
         "http_port": 8090,
         "http_host": "127.0.0.1",
-        "data": os.path.join(_REPO_ROOT, "web", "data"),
-        "public_dir": os.path.join(_REPO_ROOT, "web", "public"),
+        "data": os.path.join(_WEB_DIR, "data"),
+        "public_dir": os.path.join(_WEB_DIR, "public"),
         "open_browser": False,
     }
     items = list(argv)

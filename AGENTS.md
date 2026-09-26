@@ -1,7 +1,7 @@
 # 修改代码注意点
 
 本仓库是同一套局域网协议的独立实现（Windows = PyQt6 + Python，Android = Kotlin + Compose），
-各端必须能在同一局域网内互通，且要兼容旧版本对端。另有 `server/localchat_server.py` =
+各端必须能在同一局域网内互通，且要兼容旧版本对端。另有 `web/server/localchat_server.py` =
 Python 一体化**服务器**（信令/打洞/中继 + Web 多用户聊天，HTTP+WS 中转与存储 + 浏览器 UI，
 范围见 `web/README.md`）：Web 聊天只提供网络服务器聊天，**不实现局域网协议、
 不与 Windows / Android 端互通**，不在协议同步范围内。
@@ -165,9 +165,9 @@ cd android; .\gradlew.bat testDebugUnitTest
 .\gradlew.bat assembleDebug   # 产物: app/build/outputs/apk/debug/app-debug.apk
 
 # 服务器（信令 + Web 聊天二合一；Web 不在局域网协议互通范围，细节见 web/README.md）
-python -m pytest server\tests -q                 # 全部：加密/存储单元 + 账号 + HTTP+WS 端到端
-python -m pytest server\tests\test_server.py -q  # 真实 ChatServer HTTP+WS 端到端
-# 运行：双击 web\start-server.bat（等价 python server\localchat_server.py --http-host 0.0.0.0 --open）；
+python -m pytest web\tests -q                 # 全部：加密/存储单元 + 账号 + HTTP+WS 端到端
+python -m pytest web\tests\test_server.py -q  # 真实 ChatServer HTTP+WS 端到端
+# 运行：双击 web\start-server.bat（等价 python web\server\localchat_server.py --http-host 0.0.0.0 --open）；
 # 普通用户只开浏览器访问，不装任何东西、不敲命令。Web 服务端依赖 `cryptography`（AES-GCM）。
 ```
 
@@ -183,11 +183,11 @@ python -m pytest server\tests\test_server.py -q  # 真实 ChatServer HTTP+WS 端
 **改协议两端必须同步改**（§2：未发布、无旧版本兼容兜底，不再做混合版本
 验证；两端跑各自全量单测 + 互通 E2E 即可）。
 
-**改 `server/webchat/`（Web 服务端）必须实际运行**：Python 与旧 Node 实现存在
+**改 `web/server/webchat/`（Web 服务端）必须实际运行**：Python 与旧 Node 实现存在
 运行时差异（如 Node `Buffer`/UTF-16 与 Python 码点、`os.startfile` 与 Node
 `spawn` 等），没跑过的复刻代码可能整条加密/WS 路径都不可用；改完先
-`python -m py_compile` 改动文件，再跑 `python -m pytest server\tests -q`（含真实
-`ChatServer` HTTP+WS 端到端）。`server/tests/test_unit.py` 里有旧 Node 实现生成的
+`python -m py_compile` 改动文件，再跑 `python -m pytest web\tests -q`（含真实
+`ChatServer` HTTP+WS 端到端）。`web/tests/test_unit.py` 里有旧 Node 实现生成的
 scrypt / AES-GCM 固定向量，改加密或存储格式时必须保持这些向量通过（老
 `web/data` 数据兼容）。详见 `docs/LESSONS.md` 2026-09-25、2026-09-26。
 

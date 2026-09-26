@@ -16,5 +16,5 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-python "..\server\localchat_server.py" --http-host 0.0.0.0 --open
+python "server\localchat_server.py" --http-host 0.0.0.0 --open
 pause

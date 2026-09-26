@@ -1,17 +1,21 @@
-# LocalChat Web 服务（多用户）
+# LocalChat 一体化服务器 + Web 版（多用户）
 
-**Python 多用户聊天服务器 + 浏览器界面**：一台服务器（家里主机 / NAS / VPS）
-承载多个账号，所有用户从浏览器登录，聊天消息经服务器中转与存储。
-Web 版**只提供网络服务器聊天**，不实现局域网 P2P 协议，也不与
-Windows / Android 端互通。
+**Python 一体化服务器**：信令/打洞/中继（供 Windows / Android 局域网客户端跨
+NAT 互联）+ **多用户浏览器聊天**（HTTP+WS），一个程序（`web/server/`）一次
+启动同时提供：
 
-从 2026-09-26 起，Web 服务端由 Node.js 重写为 Python，并与信令/打洞/中继
-服务器（`server/signaling_server.py`）**合并为一个程序**
-（`server/localchat_server.py`）：一次启动同时提供
-
-- Web 聊天（HTTP+WS，默认 `:8090`）；
-- 局域网协议的信标/中继服务（TCP，默认 `:25000`，供 Windows/Android 客户端
-  填入「设置 → 中继/打洞服务器」，见 `server/README.md`）。
+- **Web 聊天**（HTTP+WS，默认 `:8090`）：一台服务器（家里主机 / NAS / VPS）
+  承载多个账号，所有用户从浏览器登录，聊天消息经服务器中转与存储。Web 聊天
+  **只提供网络服务器聊天**，不实现局域网 P2P 协议，也不与 Windows / Android
+  端互通。
+- **信令/打洞/中继**（TCP，默认 `:25000`）：让处于不同 NAT 网段的
+  Windows / Android 设备凭**群组数字 ID** 互相加入——
+  - **牵线（信令）**：主机与成员各连上来注册同一个群组 ID，服务器互换双方的
+    公网映射地址；
+  - **打洞**：双方对对方的映射地址做 TCP 同时打开，成功后流量全程 P2P 直连，
+    服务器不再参与；
+  - **中继兜底**：打洞失败（典型如对称 NAT）时，这条控制连接自动变成原始字节
+    管道，转发端到端加密的 LocalChat 协议流——服务器只见密文。
 
 两个监听面互相独立，互不影响；只需要 Web 聊天时可用 `--no-signaling` 关闭。
 
@@ -24,7 +28,7 @@ Windows/Android 客户端 ── 信令/打洞/中继(:25000) ── P2P 加密�
 
 ## 运行
 
-使用者**只需要浏览器**，不需要安装任何东西、不需要命令行：
+Web 聊天的使用者**只需要浏览器**，不需要安装任何东西、不需要命令行：
 
 - **启动服务器**：在服务器机器上双击 `web\start-server.bat`
   （需 Python ≥ 3.9 与依赖包 `cryptography`，脚本缺失时会给出安装命令）。
@@ -36,7 +40,7 @@ Windows/Android 客户端 ── 信令/打洞/中继(:25000) ── P2P 加密�
 
 ```powershell
 python -m pip install cryptography        # 首次
-python server\localchat_server.py --http-host 0.0.0.0 --open
+python web\server\localchat_server.py --http-host 0.0.0.0 --open
 ```
 
 | 参数 | 默认 | 说明 |
@@ -49,10 +53,31 @@ python server\localchat_server.py --http-host 0.0.0.0 --open
 | `--signaling-port` | 25000 | 信令/中继监听端口 |
 | `--secret` | 随机生成（日志打印一次） | 信令访问密钥（与客户端「访问密钥」一致） |
 | `--no-signaling` | 关 | 只跑 Web 聊天 |
-| `--no-web` | 关 | 只跑信令/中继（等价于旧的 `signaling_server.py`） |
+| `--no-web` | 关 | 只跑信令/中继 |
 
-`server/signaling_server.py` 仍可独立运行（`python3 signaling_server.py
-[端口] --secret <密钥>`），行为不变。
+`web/server/signaling_server.py` 仍可独立运行
+（`python3 signaling_server.py [端口] --secret <密钥>`），行为不变。
+
+## 信令/中继的客户端配置（Windows / Android）
+
+信令面部署在任意一台有公网或跨网段可达的机器上即可。两端（创建者与加入者）
+都在 **设置 → 中继/打洞服务器** 填同一个地址和服务器启动时设定的**访问密钥**：
+
+```
+服务器IP或域名:端口      例如 relay.example.com:25000
+访问密钥                与 --secret 相同
+```
+
+- 创建者：照常创建群组（填了服务器即自动注册）；
+- 加入者：加入群组时**无需创建者 IP**，填中继服务器 + 群组数字 ID +
+  密码，点「直接加入」。
+
+访问认证（协议 v2）：每条控制连接先通过质询-应答认证
+（HMAC-SHA256(访问密钥, 服务器新鲜 nonce)），未通过者无法注册、配对或占用
+中继资源；证明一次性，密钥永不上线。群组数据的机密性由既有的密码绑定 ECDH
+握手 + AES-256-GCM 保证，服务器/中间人无法注入或解密。服务器仍可观察到连接
+源地址、群组数字 ID、配对时间等元数据；如需隐藏元数据，可在服务器前加 TLS
+（stunnel / nginx stream）。部署时务必设置强随机密钥并只分享给授权客户端。
 
 首次打开界面会要求**创建第一个账号**；之后**任何人都可以在登录页点「注册新账号」
 直接注册**（注册后自动登录），已登录用户也可以在「账号与设置 → ＋新建账号」里
@@ -60,8 +85,9 @@ python server\localchat_server.py --http-host 0.0.0.0 --open
 会话 Cookie），登录与注册接口都按来源 IP 限速。服务器重启后会话失效，需要
 重新登录。
 
-**数据完全兼容**：重写前后账号（scrypt）、群组/直聊索引、`enc1:`（AES-256-GCM）
-加密落盘的聊天记录与已上传文件格式一致，旧 `web/data` 目录可直接继续使用。
+**数据完全兼容**：从 Node.js 重写为 Python 后，账号（scrypt）、群组/直聊索引、
+`enc1:`（AES-256-GCM）加密落盘的聊天记录与已上传文件格式一致，旧 `web/data`
+目录可直接继续使用。
 
 ## 一台机器多个账号
 
@@ -103,10 +129,10 @@ python server\localchat_server.py --http-host 0.0.0.0 --open
 ## 测试
 
 ```powershell
-python -m pytest server\tests -q          # 全部：加密/存储单元 + 账号 + 服务器端到端
-python -m pytest server\tests\test_unit.py -q    # AES-GCM 向量、Node 数据兼容、静态加密存储、净化函数
-python -m pytest server\tests\test_auth.py -q    # 账号注册/口令哈希/会话
-python -m pytest server\tests\test_server.py -q  # 真实 ChatServer HTTP+WS 端到端
+python -m pytest web\tests -q          # 全部：加密/存储单元 + 账号 + 服务器端到端
+python -m pytest web\tests\test_unit.py -q    # AES-GCM 向量、Node 数据兼容、静态加密存储、净化函数
+python -m pytest web\tests\test_auth.py -q    # 账号注册/口令哈希/会话
+python -m pytest web\tests\test_server.py -q  # 真实 ChatServer HTTP+WS 端到端
 ```
 
 依赖：Python ≥ 3.9、`cryptography`、`pytest`。`test_unit.py` 内含用旧
