@@ -1,39 +1,67 @@
 # LocalChat Web 服务（多用户）
 
-**Node.js 多用户聊天服务器 + 浏览器界面**：一台服务器（家里主机 / NAS / VPS）
+**Python 多用户聊天服务器 + 浏览器界面**：一台服务器（家里主机 / NAS / VPS）
 承载多个账号，所有用户从浏览器登录，聊天消息经服务器中转与存储。
 Web 版**只提供网络服务器聊天**，不实现局域网 P2P 协议，也不与
 Windows / Android 端互通。
 
+从 2026-09-26 起，Web 服务端由 Node.js 重写为 Python，并与信令/打洞/中继
+服务器（`server/signaling_server.py`）**合并为一个程序**
+（`server/localchat_server.py`）：一次启动同时提供
+
+- Web 聊天（HTTP+WS，默认 `:8090`）；
+- 局域网协议的信标/中继服务（TCP，默认 `:25000`，供 Windows/Android 客户端
+  填入「设置 → 中继/打洞服务器」，见 `server/README.md`）。
+
+两个监听面互相独立，互不影响；只需要 Web 聊天时可用 `--no-signaling` 关闭。
+
 ```
 浏览器A(账号甲) ─┐
-浏览器B(账号乙) ─┼─ Web服务(Node, HTTP+WS) ─ 服务器统一存储账号/会话/文件
+浏览器B(账号乙) ─┼─ localchat_server.py(Web: HTTP+WS) ─ 服务器统一存储账号/会话/文件
 浏览器C(账号丙) ─┘
+Windows/Android 客户端 ── 信令/打洞/中继(:25000) ── P2P 加密直连
 ```
 
 ## 运行
 
 使用者**只需要浏览器**，不需要安装任何东西、不需要命令行：
 
-- **启动服务器**：在服务器机器上双击 `web\start-server.bat`（需装过 Node.js ≥ 18）。
+- **启动服务器**：在服务器机器上双击 `web\start-server.bat`
+  （需 Python ≥ 3.9 与依赖包 `cryptography`，脚本缺失时会给出安装命令）。
   服务器启动后会自动打开聊天页面，并在窗口里列出局域网内的访问地址。
 - **其他用户**：在浏览器地址栏输入窗口里显示的地址（例如 `http://192.168.1.10:8090`）
   即可使用。
 
-开发者等价命令：`node web\server\main.js --http-host 0.0.0.0 --open`。
+开发者等价命令（仓库根目录）：
+
+```powershell
+python -m pip install cryptography        # 首次
+python server\localchat_server.py --http-host 0.0.0.0 --open
+```
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `--http` | 8090 | Web 界面端口（所有用户共用） |
 | `--http-host` | 127.0.0.1 | 界面绑定地址；部署给他人访问用 `0.0.0.0`（`start-server.bat` 已默认） |
 | `--data` | `web/data` | 数据目录（账号、聊天记录、共享文件） |
+| `--public` | `web/public` | 静态界面目录 |
 | `--open` | 关 | 启动后自动用默认浏览器打开页面 |
+| `--signaling-port` | 25000 | 信令/中继监听端口 |
+| `--secret` | 随机生成（日志打印一次） | 信令访问密钥（与客户端「访问密钥」一致） |
+| `--no-signaling` | 关 | 只跑 Web 聊天 |
+| `--no-web` | 关 | 只跑信令/中继（等价于旧的 `signaling_server.py`） |
+
+`server/signaling_server.py` 仍可独立运行（`python3 signaling_server.py
+[端口] --secret <密钥>`），行为不变。
 
 首次打开界面会要求**创建第一个账号**；之后**任何人都可以在登录页点「注册新账号」
 直接注册**（注册后自动登录），已登录用户也可以在「账号与设置 → ＋新建账号」里
 添加账号（不打断当前登录）。登录基于用户名 + 密码（scrypt 哈希存储，HttpOnly
 会话 Cookie），登录与注册接口都按来源 IP 限速。服务器重启后会话失效，需要
 重新登录。
+
+**数据完全兼容**：重写前后账号（scrypt）、群组/直聊索引、`enc1:`（AES-256-GCM）
+加密落盘的聊天记录与已上传文件格式一致，旧 `web/data` 目录可直接继续使用。
 
 ## 一台机器多个账号
 
@@ -75,11 +103,17 @@ Windows / Android 端互通。
 ## 测试
 
 ```powershell
-node --test web\test\unit.test.js    # AES-GCM 向量、静态加密存储、净化函数
-node --test web\test\auth.test.js    # 账号注册/口令哈希/会话
-node --test web\test\server.test.js  # 真实 ChatServer HTTP+WS 端到端
+python -m pytest server\tests -q          # 全部：加密/存储单元 + 账号 + 服务器端到端
+python -m pytest server\tests\test_unit.py -q    # AES-GCM 向量、Node 数据兼容、静态加密存储、净化函数
+python -m pytest server\tests\test_auth.py -q    # 账号注册/口令哈希/会话
+python -m pytest server\tests\test_server.py -q  # 真实 ChatServer HTTP+WS 端到端
 ```
 
-server.test.js 覆盖：注册/登录鉴权、在线状态、直聊双向消息 + 已读回执 +
+依赖：Python ≥ 3.9、`cryptography`、`pytest`。`test_unit.py` 内含用旧
+Node.js 实现生成的 scrypt / AES-GCM 固定向量，防止运行时（Node ↔ Python）
+切换造成老数据不可读。
+
+test_server.py 覆盖：注册/登录鉴权、在线状态、直聊双向消息 + 已读回执 +
 编辑/删除/回应/置顶、昵称同步、建群/群设置权限/邀请/踢人、群已读、文件
-上传下载与鉴权、服务器重启后的会话/群组/聊天历史持久化、群解散语义。
+上传下载与鉴权、服务器重启后的会话/群组/聊天历史持久化、群解散语义、
+多账号令牌切换与注册限速。

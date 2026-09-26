@@ -1,14 +1,20 @@
 @echo off
-rem LocalChat Web server launcher.
-rem Double-click this file: the server starts and the chat page opens in
-rem your browser. Other users on the LAN open the http://<ip>:8090 address
-rem shown in this window.
+rem LocalChat unified server launcher (web chat + signaling/relay in one
+rem Python program). Double-click this file: the server starts and the chat
+rem page opens in your browser. Other users on the LAN open the
+rem http://<ip>:8090 address shown in this window.
 cd /d "%~dp0"
-where node >nul 2>nul
+where python >nul 2>nul
 if errorlevel 1 (
-  echo Node.js was not found. Please install Node.js 18 or newer from https://nodejs.org/ and run this file again.
+  echo Python 3.9+ was not found. Please install Python from https://www.python.org/ and run this file again.
   pause
   exit /b 1
 )
-node server\main.js --http-host 0.0.0.0 --open
+python -c "import cryptography" >nul 2>nul
+if errorlevel 1 (
+  echo Missing dependency "cryptography". Run:  python -m pip install cryptography
+  pause
+  exit /b 1
+)
+python "..\server\localchat_server.py" --http-host 0.0.0.0 --open
 pause

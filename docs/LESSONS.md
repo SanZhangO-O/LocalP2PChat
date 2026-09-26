@@ -609,4 +609,39 @@
   - 服务端拒绝请求（413/400）必须先写响应再处理剩余请求体（drain），
     直接 `req.destroy()` 会把响应一起掐掉，客户端只看到网络错误。
 
+## 2026-09-26 Web 服务端 Node.js 重写为 Python，并与信令服务器二合一
+
+- 现象/背景: `web/` 原为 Node.js 多用户聊天服务器（HTTP+WS），信令/打洞/中继是
+  另一个 Python 程序（`server/signaling_server.py`），部署要装两套运行时。
+  按需求把 Web 服务端整体重写为 Python（`server/webchat/` 包）并与信令服务器
+  合并为一个入口 `server/localchat_server.py`（一个进程、两个独立监听面）。
+- 根因/要点: 运行时切换最大的风险不是功能复刻，而是**老数据不可读**——
+  `accounts.json` 的 scrypt 口令哈希与 `enc1:`（AES-256-GCM）落盘聊天记录都是
+  Node（WebCrypto/`crypto.scryptSync`）写出来的字节，Python 侧必须逐字节复现：
+  scrypt 参数 N=16384/r=8/p=1/dklen=64（Node 默认值，Python 要显式传并给足
+  `maxmem`），GCM 布局 `nonce(12B)||ct||tag(16B)`，JSON 字段名 camelCase
+  （`passHash`/`groupId`/`senderName`…），`web/data` 目录布局不变。
+- 修复:
+  - 新增 `server/webchat/{util,crypto,store,accounts,engine,webapp,server}.py`，
+    与旧 JS 模块一一对应；WS 用标准库手写 RFC6455（mask 校验、分片 4MiB 上限、
+    协议错误 close 1002），AES-GCM 用 `cryptography`（Python 标准库无 AES，
+    「信令零依赖」性质在 Web 面不再成立）。
+  - 统一入口 `server/localchat_server.py`：`--no-signaling`/`--no-web` 可只跑
+    一面；`server/signaling_server.py` 独立运行保持不变。
+  - 测试移植为 `server/tests/`（pytest），`test_unit.py` 内嵌**用旧 Node 实现生成
+    的 scrypt/AES-GCM 固定向量**，把「运行时切换不得破坏老数据」变成可回归断言。
+  - 文档同步：`web/README.md`、根 `README.md`、`AGENTS.md` §7、
+    `web/start-server.bat`（Python 启动器，检查 `cryptography`）。
+- 验证: `python -m py_compile` 全部新文件通过；向量生成命令
+  （node -e scryptSync/AES-GCM）与 Python 复现值逐字节一致。**pytest 套件
+  （`python -m pytest server\tests -q`）按项目约定未自动运行，首次验证时
+  必须实际跑通**。
+- 防再犯:
+  - 跨运行时重写存储/加密格式时，先做固定向量互验（老运行时生成 → 新运行时
+    复现），再谈功能对齐；向量要作为测试常驻，防止日后参数被「顺手优化」。
+  - JS 与 Python 的字符串语义差异点：JS `String.length`/`slice` 按 UTF-16 码元，
+    Python 按码点（长度上限、表情截断处注意）；`bytearray(int)` 是零填充不是
+    整数字节化，大整数 XOR 解 mask 后要 `to_bytes(len, "big")`。
+  - 「二合一」只合并部署形态，不合并协议面：Web 聊天与局域网协议仍互不相通，
+    两端客户端与信令协议字节不变。
 

@@ -7,7 +7,8 @@
 ```
 ├── android/   # Android 版（Kotlin + Compose）
 ├── windows/   # Windows 版（PyQt6，已实现）
-└── web/       # Web 版（Node.js 服务器聊天 + 浏览器界面，见 web/README.md）
+├── server/    # 信令/打洞/中继 + Web 多用户聊天服务器（Python，见 server/README.md）
+└── web/       # Web 版浏览器界面与数据目录（服务器在 server/localchat_server.py，见 web/README.md）
 ```
 
 ## Android 版
@@ -28,8 +29,15 @@
 
 ## Web 版
 
-- Node.js **多用户服务器聊天** + 浏览器界面，位于 `web/`（仅依赖 Node 标准库，无需安装依赖）。一台服务器承载多个账号，消息经服务器中转与存储。**Web 版只提供网络服务器聊天，不实现局域网 P2P 协议，不与 Windows / Android 端互通**。
-- 使用方式：服务器机器上双击 `web\start-server.bat` 启动（需 Node.js ≥ 18），会自动打开聊天页面并列出局域网访问地址；其他用户**只需在浏览器打开该地址**，无需安装任何东西。详见 `web/README.md`。
+- Python **多用户服务器聊天** + 浏览器界面：服务端位于 `server/`（`webchat/` 包），
+  与信令/打洞/中继服务器**合并为同一个程序** `server/localchat_server.py`，一次
+  启动同时提供 Web 聊天（HTTP+WS，默认 `:8090`）与局域网协议的信标/中继
+  （默认 `:25000`）。一台服务器承载多个账号，消息经服务器中转与存储。
+  **Web 版只提供网络服务器聊天，不实现局域网 P2P 协议，不与 Windows / Android
+  端互通**。
+- 使用方式：服务器机器上双击 `web\start-server.bat` 启动（需 Python ≥ 3.9 与
+  `pip install cryptography`），会自动打开聊天页面并列出局域网访问地址；其他用户
+  **只需在浏览器打开该地址**，无需安装任何东西。详见 `web/README.md`。
 
 ## 本地功能（消息搜索 / 表情面板 / 通知快捷回复）
 
